@@ -94,6 +94,13 @@ pub trait VaultFacade: Send + Sync {
     ) -> std::result::Result<(), String>;
     /// Delete a file.
     fn delete_file(&self, container: &str, file_name: &str) -> std::result::Result<(), String>;
+    /// Create a new empty container with the given security mode.
+    fn create_container(
+        &self,
+        name: &str,
+        mode: &str,
+        description: Option<&str>,
+    ) -> std::result::Result<(), String>;
 }
 
 /// Shared, lockable, optional vault handle. `None` ⇒ vault is locked.
@@ -368,6 +375,16 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 h.delete_file(container, file_name)?;
                 Ok(json!({ "ok": true }))
             }
+            "vault.create_container" => {
+                let name = required_str(&args, "name")?;
+                let mode = args
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("DIRECT");
+                let description = args.get("description").and_then(|v| v.as_str());
+                h.create_container(name, mode, description)?;
+                Ok(json!({ "ok": true, "name": name, "mode": mode }))
+            }
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -498,6 +515,23 @@ fn tool_descriptors() -> Value {
                 },
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "vault.create_container",
+            "description":
+                "Create a new empty container (directory) at the vault root. \
+                 The mode determines the default security level inherited by files. \
+                 HITL approval will be required in v1.1.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name":        { "type": "string", "description": "Alphanumeric, hyphen, underscore. ≤64 chars." },
+                    "mode":        { "type": "string", "enum": ["DIRECT", "OTP", "APPROVAL", "ANONYMIZED", "ZKP", "NATIVE"], "default": "DIRECT" },
+                    "description": { "type": "string", "description": "Optional human-readable description." }
+                },
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -585,6 +619,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .remove(&(container.into(), file_name.into()));
+            Ok(())
+        }
+        fn create_container(
+            &self,
+            _name: &str,
+            _mode: &str,
+            _description: Option<&str>,
+        ) -> std::result::Result<(), String> {
             Ok(())
         }
     }
