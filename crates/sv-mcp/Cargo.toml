@@ -8,9 +8,15 @@ repository.workspace  = true
 description = "Model Context Protocol (MCP) server for Sovereign Vault. Stdio + WebSocket transports."
 
 [dependencies]
+sv-storage        = { workspace = true }
 serde             = { workspace = true }
 serde_json        = { workspace = true }
 thiserror         = { workspace = true }
 tokio             = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util      = { workspace = true }
+tracing           = { workspace = true }
+base64            = "0.22"
+
+[dev-dependencies]
+sv-crypto    = { workspace = true }

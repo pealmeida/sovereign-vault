@@ -16,8 +16,11 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 sv-core               = { workspace = true }
+sv-mcp                = { workspace = true }
+sv-http               = { workspace = true }
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
+tokio                 = { workspace = true }
 tauri                 = { version = "2", features = [] }
 tauri-plugin-dialog   = "2"
 tauri-plugin-fs       = "2"
