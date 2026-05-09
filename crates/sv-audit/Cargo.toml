@@ -1,0 +1,15 @@
+[package]
+name        = "sv-audit"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace= true
+license.workspace     = true
+repository.workspace  = true
+description = "Append-only JSONL audit log for Sovereign Vault."
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+chrono     = { workspace = true }
+tokio      = { workspace = true }

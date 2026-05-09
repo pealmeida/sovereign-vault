@@ -1,0 +1,12 @@
+[package]
+name        = "sv-crypto"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace= true
+license.workspace     = true
+repository.workspace  = true
+description = "Sovereign Vault cryptographic primitives: AEAD, KDF, key wrap, zeroization."
+
+[dependencies]
+thiserror = { workspace = true }
+zeroize   = { workspace = true }

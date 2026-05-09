@@ -1,0 +1,12 @@
+[package]
+name        = "sv-recovery"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace= true
+license.workspace     = true
+repository.workspace  = true
+description = "Pluggable master-key recovery providers for Sovereign Vault."
+
+[dependencies]
+thiserror = { workspace = true }
+zeroize   = { workspace = true }

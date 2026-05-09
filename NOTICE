@@ -1,0 +1,10 @@
+Sovereign Vault
+Copyright 2026 Sovereign Vault contributors
+
+This product includes software developed by the Sovereign Vault project
+(https://github.com/pealmeida/sovereign-vault).
+
+This codebase originated as a proof-of-concept inside agentic-sovereign-ecosystem
+(https://github.com/pealmeida/agentic-sovereign-ecosystem) and was extracted
+as a clean Rust-native rewrite. See the design spec in that repository under
+docs/superpowers/specs/2026-05-08-sovereign-vault-oss-extraction-design.md.

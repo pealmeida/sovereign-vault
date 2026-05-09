@@ -1,0 +1,54 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+
+# Node / npm
+node_modules/
+.npm/
+.pnpm-store/
+
+# Vite / Svelte build
+dist/
+.svelte-kit/
+.vite/
+
+# Tauri
+gen/
+src-tauri/gen/
+*.app
+
+# IDE
+.vscode/
+.idea/
+*.iml
+.DS_Store
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Env / secrets — never commit
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Test / coverage
+coverage/
+*.profraw
+*.profdata
+
+# Misc
+.cache/
+*.swp
+*.swo

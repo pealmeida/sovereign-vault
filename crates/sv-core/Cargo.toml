@@ -1,0 +1,21 @@
+[package]
+name        = "sv-core"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace= true
+license.workspace     = true
+repository.workspace  = true
+description = "High-level integration crate for Sovereign Vault. Re-exports public types from sv-* crates."
+
+[dependencies]
+sv-crypto    = { workspace = true }
+sv-storage   = { workspace = true }
+sv-keychain  = { workspace = true }
+sv-recovery  = { workspace = true }
+sv-audit     = { workspace = true }
+sv-mcp       = { workspace = true }
+sv-http      = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+tokio        = { workspace = true }

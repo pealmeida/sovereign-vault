@@ -1,0 +1,16 @@
+[package]
+name        = "sv-mcp"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace= true
+license.workspace     = true
+repository.workspace  = true
+description = "Model Context Protocol (MCP) server for Sovereign Vault. Stdio + WebSocket transports."
+
+[dependencies]
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+thiserror         = { workspace = true }
+tokio             = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util      = { workspace = true }
