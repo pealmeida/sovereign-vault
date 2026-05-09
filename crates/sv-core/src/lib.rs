@@ -241,6 +241,36 @@ impl VaultHandle {
     }
 }
 
+impl sv_mcp::VaultFacade for VaultHandle {
+    fn list_containers(&self) -> std::result::Result<Vec<ContainerInfo>, String> {
+        VaultHandle::list_containers(self).map_err(|e| e.to_string())
+    }
+    fn list_files(&self, container: &str) -> std::result::Result<Vec<FileInfo>, String> {
+        VaultHandle::list_files(self, container).map_err(|e| e.to_string())
+    }
+    fn read_file(&self, container: &str, file_name: &str) -> std::result::Result<Vec<u8>, String> {
+        VaultHandle::read_file(self, container, file_name).map_err(|e| e.to_string())
+    }
+    fn write_file(
+        &self,
+        container: &str,
+        file_name: &str,
+        plaintext: &[u8],
+    ) -> std::result::Result<(), String> {
+        VaultHandle::write_file(self, container, file_name, plaintext).map_err(|e| e.to_string())
+    }
+    fn delete_file(&self, container: &str, file_name: &str) -> std::result::Result<(), String> {
+        VaultHandle::delete_file(self, container, file_name).map_err(|e| e.to_string())
+    }
+}
+
+/// Generate a fresh URL-safe-base64 32-byte pairing secret using the OS RNG
+/// from `sv-crypto`. Use this from the desktop app on every unlock.
+pub fn fresh_pairing_secret() -> Result<String> {
+    let bytes = sv_crypto::random_bytes(32)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
 /// Inspect a vault root and report whether it has been initialised, and
 /// which custody mode artefact is present (if any).
 pub struct InitState {
