@@ -262,6 +262,16 @@ impl sv_mcp::VaultFacade for VaultHandle {
     fn delete_file(&self, container: &str, file_name: &str) -> std::result::Result<(), String> {
         VaultHandle::delete_file(self, container, file_name).map_err(|e| e.to_string())
     }
+    fn create_container(
+        &self,
+        name: &str,
+        mode: &str,
+        description: Option<&str>,
+    ) -> std::result::Result<(), String> {
+        let parsed = SecurityMode::parse(mode).map_err(|e| e.to_string())?;
+        VaultHandle::create_container(self, name, parsed, description.map(|s| s.to_string()))
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Generate a fresh URL-safe-base64 32-byte pairing secret using the OS RNG
