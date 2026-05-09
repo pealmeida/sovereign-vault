@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sv-crypto",
+    "crates/sv-storage",
+    "crates/sv-keychain",
+    "crates/sv-recovery",
+    "crates/sv-audit",
+    "crates/sv-mcp",
+    "crates/sv-http",
+    "crates/sv-core",
+    "apps/cli",
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.78"
+license = "Apache-2.0"
+repository = "https://github.com/pealmeida/sovereign-vault"
+homepage = "https://github.com/pealmeida/sovereign-vault"
+authors = ["Sovereign Vault contributors"]
+
+[workspace.dependencies]
+# Workspace-internal crates
+sv-crypto    = { path = "crates/sv-crypto",    version = "0.0.0" }
+sv-storage   = { path = "crates/sv-storage",   version = "0.0.0" }
+sv-keychain  = { path = "crates/sv-keychain",  version = "0.0.0" }
+sv-recovery  = { path = "crates/sv-recovery",  version = "0.0.0" }
+sv-audit     = { path = "crates/sv-audit",     version = "0.0.0" }
+sv-mcp       = { path = "crates/sv-mcp",       version = "0.0.0" }
+sv-http      = { path = "crates/sv-http",      version = "0.0.0" }
+sv-core      = { path = "crates/sv-core",      version = "0.0.0" }
+
+# External — single source of truth for versions
+serde        = { version = "1.0",  features = ["derive"] }
+serde_json   = "1.0"
+thiserror    = "1.0"
+anyhow       = "1.0"
+tokio        = { version = "1.41", features = ["macros", "rt-multi-thread", "fs", "io-util", "sync", "net", "time"] }
+chrono       = { version = "0.4",  features = ["serde"] }
+zeroize      = { version = "1.8",  features = ["derive"] }
+tracing      = "0.1"
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+hyper        = { version = "1.5", features = ["server", "http1"] }
+hyper-util   = { version = "0.1", features = ["tokio", "server", "server-auto"] }
+http-body-util = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.release-debug]
+inherits = "release"
+debug = true
+strip = false

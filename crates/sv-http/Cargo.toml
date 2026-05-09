@@ -1,0 +1,17 @@
+[package]
+name        = "sv-http"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace= true
+license.workspace     = true
+repository.workspace  = true
+description = "Read-only HTTP endpoints for Sovereign Vault: /health, agent card, MCP pairing."
+
+[dependencies]
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+thiserror      = { workspace = true }
+tokio          = { workspace = true }
+hyper          = { workspace = true }
+hyper-util     = { workspace = true }
+http-body-util = { workspace = true }

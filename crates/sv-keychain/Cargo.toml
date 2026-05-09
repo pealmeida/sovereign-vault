@@ -1,0 +1,12 @@
+[package]
+name        = "sv-keychain"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace= true
+license.workspace     = true
+repository.workspace  = true
+description = "OS keychain abstraction for Sovereign Vault master-key custody."
+
+[dependencies]
+thiserror = { workspace = true }
+zeroize   = { workspace = true }
