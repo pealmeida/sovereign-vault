@@ -52,7 +52,12 @@
   <SidebarNav />
   <main class="main-shell">
     <TopBar />
-    {#if !vaultStore.status?.unlocked}
+    {#if vaultStore.status === null}
+      <div class="boot-state">
+        <p class="eyebrow">Sovereign Vault</p>
+        <p>Loading vault status…</p>
+      </div>
+    {:else if !vaultStore.status.unlocked}
       <LockedCard />
     {:else}
       <Router {routes} />
@@ -60,3 +65,16 @@
   </main>
 </div>
 <Toast />
+
+<style>
+  .boot-state {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    color: var(--muted);
+  }
+  .boot-state p { margin: 0; }
+</style>
