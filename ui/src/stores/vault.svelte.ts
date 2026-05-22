@@ -51,4 +51,12 @@ export const vaultStore = {
     await invoke<void>('vault_lock');
     await this.refresh();
   },
+
+  async appVersion(): Promise<string> {
+    return invoke<string>('app_version');
+  },
+
+  async openAuditFolder(): Promise<void> {
+    await invoke<void>('open_audit_folder');
+  },
 };

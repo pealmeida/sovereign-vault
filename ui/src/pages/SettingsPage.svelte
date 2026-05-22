@@ -6,15 +6,13 @@
   import { mcpStore } from '../stores/mcp.svelte';
   import { approvalStore } from '../stores/approvals.svelte';
   import { toastStore } from '../stores/toast.svelte';
-  import { invoke } from '../lib/tauri';
-
   let appVersion = $state('…');
   let revealPhrase = $state(false);
   let recoveryData = $state<string | null>(null);
 
   onMount(async () => {
     try {
-      appVersion = await invoke<string>('app_version');
+      appVersion = await vaultStore.appVersion();
       await mcpStore.refresh();
     } catch (e) {
       toastStore.setError(e);
@@ -34,7 +32,7 @@
 
   async function openAuditFolder() {
     try {
-      await invoke<void>('open_audit_folder');
+      await vaultStore.openAuditFolder();
     } catch (e) {
       toastStore.setError(e);
     }
