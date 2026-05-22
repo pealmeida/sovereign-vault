@@ -42,7 +42,10 @@
         <input type="text" placeholder="123456" bind:value={otpInput} />
       </label>
       <div style="display:flex;gap:0.75rem;margin-top:1rem;justify-content:flex-end">
-        <button class="ghost-button" onclick={onClose}>Cancel</button>
+        <button class="ghost-button" onclick={async () => {
+          try { await approvalStore.respond(prompt.id, false); } catch (e) { toastStore.setError(e); }
+          onClose();
+        }}>Cancel</button>
         <button class="primary-button" onclick={submit}>Submit</button>
       </div>
     {/if}

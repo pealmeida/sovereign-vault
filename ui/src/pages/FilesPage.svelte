@@ -119,9 +119,27 @@
 {/if}
 
 {#if approvalModal}
-  <ApprovalModal prompt={approvalModal} onClose={() => approvalModal = null} />
+  <ApprovalModal
+    prompt={approvalModal}
+    onClose={async () => {
+      const p = approvalModal;
+      approvalModal = null;
+      if (p && approvalStore.queue.find(q => q.id === p.id)) {
+        try { await approvalStore.respond(p.id, false); } catch { /* ignore */ }
+      }
+    }}
+  />
 {/if}
 
 {#if otpModal}
-  <OtpModal prompt={otpModal} onClose={() => otpModal = null} />
+  <OtpModal
+    prompt={otpModal}
+    onClose={async () => {
+      const p = otpModal;
+      otpModal = null;
+      if (p && approvalStore.queue.find(q => q.id === p.id)) {
+        try { await approvalStore.respond(p.id, false); } catch { /* ignore */ }
+      }
+    }}
+  />
 {/if}
