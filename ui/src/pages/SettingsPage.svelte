@@ -138,7 +138,7 @@
       <div class="settings-stack">
         <div class="detail-row">
           <span>Status</span>
-          <span class="runtime-chip">
+          <span class="runtime-chip" class:status-running={mcpStore.status?.running} class:status-stopped={!mcpStore.status?.running}>
             {mcpStore.status?.running ? 'Running' : 'Stopped'}
           </span>
         </div>

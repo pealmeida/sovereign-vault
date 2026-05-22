@@ -131,7 +131,7 @@ pre {
 }
 
 .brand-panel h1,
-.topbar-copy h2,
+.topbar-title h2,
 .panel-header h3,
 .folder-card h4,
 .detail-row strong {
@@ -140,7 +140,10 @@ pre {
 }
 
 .brand-panel h1 {
-  font-size: 1rem;
+  font-size: 0.875rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .eyebrow {
@@ -154,6 +157,7 @@ pre {
 
 .runtime-chip,
 .mode-chip,
+.mode-pill,
 .timestamp-chip,
 .filter-chip {
   display: inline-flex;
@@ -169,11 +173,43 @@ pre {
   text-transform: uppercase;
 }
 
+/* Mode pill color variants */
+.mode-direct {
+  color: var(--purple);
+  border-color: rgba(152, 164, 255, 0.35);
+  background: rgba(152, 164, 255, 0.08);
+}
+
+.mode-otp {
+  color: var(--accent);
+  border-color: rgba(98, 242, 255, 0.35);
+  background: rgba(98, 242, 255, 0.08);
+}
+
+.mode-secure {
+  color: var(--green);
+  border-color: rgba(66, 211, 146, 0.35);
+  background: rgba(66, 211, 146, 0.08);
+}
+
+/* Status badges */
+.status-running {
+  color: var(--green);
+  border-color: rgba(66, 211, 146, 0.35);
+  background: rgba(66, 211, 146, 0.08);
+}
+
+.status-stopped {
+  color: var(--red);
+  border-color: rgba(255, 111, 124, 0.35);
+  background: rgba(255, 111, 124, 0.08);
+}
+
 .nav-list {
   display: flex;
   flex: 1;
   flex-direction: column;
-  gap: 0.7rem;
+  gap: 0.4rem;
 }
 
 .nav-button,
@@ -192,13 +228,28 @@ pre {
 
 .nav-button {
   justify-content: flex-start;
-  padding: 0.9rem 1rem;
+  padding: 0.75rem 1rem;
   background: transparent;
+  color: var(--muted);
+  font-size: 0.875rem;
+  border-left: 3px solid transparent;
+}
+
+.nav-button:hover {
+  border-color: var(--border);
+  border-left-color: rgba(98, 242, 255, 0.4);
+  background: var(--accent-soft);
   color: var(--text);
 }
 
-.nav-button.active,
-.nav-button:hover,
+.nav-button.active {
+  border-color: var(--border-strong);
+  border-left-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 500;
+}
+
 .import-button:hover,
 .ghost-button:hover,
 .filter-chip.active,
@@ -209,46 +260,64 @@ pre {
 
 .import-button,
 .primary-button {
-  padding: 0.95rem 1rem;
-  background: linear-gradient(135deg, rgba(98, 242, 255, 0.22), rgba(152, 164, 255, 0.18));
+  padding: 0.75rem 1.1rem;
+  background: linear-gradient(135deg, rgba(98, 242, 255, 0.28), rgba(152, 164, 255, 0.22));
   color: var(--text);
   font-family: var(--font-mono);
-  font-size: 0.8rem;
+  font-size: 0.78rem;
+  font-weight: 500;
   text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.primary-button:hover {
+  background: linear-gradient(135deg, rgba(98, 242, 255, 0.38), rgba(152, 164, 255, 0.3));
+  border-color: var(--border-strong);
 }
 
 .main-shell {
   display: flex;
   min-width: 0;
   flex-direction: column;
-  gap: 1.5rem;
+  gap: 1.25rem;
   padding: 1.5rem;
 }
 
 .topbar {
   display: grid;
-  gap: 1rem;
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 520px);
+  gap: 0.75rem 1rem;
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 360px) auto;
   align-items: center;
+}
+
+.topbar-title h2 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.2;
 }
 
 .topbar-actions {
   display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 0.75rem;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 .search-shell {
   display: flex;
   align-items: center;
   gap: 0.55rem;
-  min-width: min(100%, 360px);
-  padding: 0.9rem 1rem;
+  width: 100%;
+  padding: 0.7rem 1rem;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--muted);
+  transition: border-color 140ms ease;
+}
+
+.search-shell:focus-within {
+  border-color: var(--border-strong);
+  color: var(--text);
 }
 
 .search-shell input {
@@ -261,9 +330,15 @@ pre {
 
 .ghost-button,
 .icon-button {
-  padding: 0.82rem 1rem;
+  padding: 0.6rem 0.9rem;
   background: var(--surface-soft);
   color: var(--text);
+  font-size: 0.85rem;
+}
+
+.ghost-button:hover {
+  border-color: var(--border-strong);
+  background: var(--accent-soft);
 }
 
 .icon-button {
@@ -295,7 +370,11 @@ pre {
 
 .ops-primary,
 .panel-card {
-  padding: 1.3rem;
+  padding: 1.25rem 1.3rem;
+}
+
+.panel-card:hover {
+  border-color: rgba(111, 144, 191, 0.36);
 }
 
 .ops-primary {
@@ -352,10 +431,17 @@ pre {
 }
 
 .detail-row strong {
-  font-size: 1rem;
+  font-size: 0.9rem;
+  color: var(--text);
 }
 
-.folder-grid,
+.detail-row span:first-child {
+  color: var(--muted);
+  font-size: 0.8rem;
+  min-width: 9rem;
+}
+
+.folder-grid {
   display: grid;
   gap: 1rem;
 }
@@ -410,6 +496,65 @@ pre {
   font-size: 1rem;
 }
 
+/* ── Vault container rows ─────────────────────────────────── */
+.vault-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.vault-row {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+  transition: border-color 140ms ease, background-color 140ms ease;
+  overflow: hidden;
+}
+
+.vault-row:hover {
+  border-color: rgba(111, 144, 191, 0.36);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.vault-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.75rem 0.9rem;
+  cursor: pointer;
+  user-select: none;
+  color: var(--text);
+}
+
+.vault-summary:hover {
+  color: var(--text);
+}
+
+.vault-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  flex: 1;
+  min-width: 0;
+}
+
+.vault-meta strong {
+  font-family: var(--font-display);
+  font-size: 0.9rem;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vault-contents {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.6rem 0.9rem 0.75rem 2.5rem;
+  border-top: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.15);
+}
+
 .folder-grid {
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
 }
@@ -459,10 +604,22 @@ pre {
 
 .vault-table th,
 .vault-table td {
-  padding: 0.9rem 0.6rem;
+  padding: 0.7rem 0.6rem;
   border-bottom: 1px solid rgba(255, 255, 255, 0.05);
   text-align: left;
-  vertical-align: top;
+  vertical-align: middle;
+}
+
+.vault-table-row {
+  transition: background-color 120ms ease;
+}
+
+.vault-table-row:hover td {
+  background: rgba(98, 242, 255, 0.03);
+}
+
+.vault-table-row:last-child td {
+  border-bottom: none;
 }
 
 .vault-table th {
@@ -508,8 +665,16 @@ pre {
   border-radius: var(--radius-sm);
   background: rgba(6, 13, 24, 0.9);
   color: var(--text);
-  padding: 0.86rem 0.9rem;
+  padding: 0.75rem 0.9rem;
   outline: none;
+  transition: border-color 140ms ease;
+}
+
+.field input:focus,
+.field select:focus,
+.field textarea:focus {
+  border-color: var(--border-strong);
+  box-shadow: 0 0 0 3px rgba(98, 242, 255, 0.08);
 }
 
 .field textarea {
@@ -664,7 +829,7 @@ pre {
   border-style: solid;
 }
 
-@media (max-width: 1100px) {
+@media (max-width: 879px) {
   .app-shell {
     grid-template-columns: 1fr;
   }
