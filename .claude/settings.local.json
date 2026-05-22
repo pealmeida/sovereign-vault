@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+      "mcp__sovereign-vault-oss__vault_list",
+      "mcp__sovereign-vault-oss__vault_write",
+      "mcp__sovereign-vault-oss__vault_read",
+      "mcp__sovereign-vault-oss__vault_delete",
+      "mcp__plugin_context-mode_context-mode__ctx_execute",
+      "mcp__plugin_context-mode_context-mode__ctx_execute_file",
+      "Read(//c/Users/pealm/Code/agentic-sovereign-ecosystem/apps/sovereign-vault/src/components/**)",
+      "Read(//c/Users/pealm/Code/agentic-sovereign-ecosystem/apps/sovereign-vault/src/**)",
+      "mcp__plugin_context-mode_context-mode__ctx_search",
+      "Bash(git -C \"C:/Users/pealm/Code/sovereign-vault\" log --oneline -3)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ]
+  }
+}
