@@ -23,19 +23,19 @@ export const fileStore = {
   async write(container: string, name: string, content: Uint8Array) {
     await invoke<void>('vault_write_file', {
       container,
-      name,
+      fileName: name,
       content: Array.from(content),
     });
     if (activeContainer === container) await this.refresh(container);
   },
 
   async read(container: string, name: string): Promise<Uint8Array> {
-    const arr = await invoke<number[]>('vault_read_file', { container, name });
+    const arr = await invoke<number[]>('vault_read_file', { container, fileName: name });
     return new Uint8Array(arr);
   },
 
   async remove(container: string, name: string) {
-    await invoke<void>('vault_delete_file', { container, name });
+    await invoke<void>('vault_delete_file', { container, fileName: name });
     if (activeContainer === container) await this.refresh(container);
   },
 };
