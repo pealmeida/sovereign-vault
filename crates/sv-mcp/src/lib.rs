@@ -1,10 +1,8 @@
 //! Model Context Protocol (MCP) server for Sovereign Vault.
 //!
-//! Exposes the v1.0 vault tool surface (`vault.list`, `vault.read`,
-//! `vault.write`, `vault.delete`) over two transports:
+//! Exposes the v1.0 vault tool surface over two transports:
 //!
-//! * **Stdio** — for tools that spawn the vault as a subprocess
-//!   (rarely used directly; the CLI ships a stdio→WS proxy instead).
+//! * **Stdio** — for tools that spawn the vault as a subprocess.
 //! * **WebSocket** — for long-running agents that connect to a running
 //!   vault on `ws://127.0.0.1:9944`.
 //!
@@ -23,11 +21,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sv_storage::{ContainerInfo, FileInfo};
+use sv_audit::{AuditAction, AuditDecision, AuditEvent};
+use sv_storage::{ContainerInfo, FileInfo, SecurityMode};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{oneshot, Mutex};
@@ -68,10 +68,7 @@ pub type Result<T> = std::result::Result<T, McpError>;
 #[allow(dead_code)]
 mod codes {
     pub const PARSE_ERROR: i32 = -32700;
-    pub const INVALID_REQUEST: i32 = -32600;
     pub const METHOD_NOT_FOUND: i32 = -32601;
-    pub const INVALID_PARAMS: i32 = -32602;
-    pub const SERVER_ERROR: i32 = -32000;
     pub const UNPAIRED: i32 = -32001;
 }
 
@@ -101,15 +98,100 @@ pub trait VaultFacade: Send + Sync {
         mode: &str,
         description: Option<&str>,
     ) -> std::result::Result<(), String>;
+    /// Effective mode for a container.
+    fn container_mode(&self, container: &str) -> std::result::Result<SecurityMode, String>;
 }
 
-/// Shared, lockable, optional vault handle. `None` ⇒ vault is locked.
+/// Shared, lockable, optional vault handle. `None` means the vault is locked.
 pub type SharedVault<H> = Arc<Mutex<Option<H>>>;
+
+/// Transport on which a tool call arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccessTransport {
+    /// Stdio JSON-RPC server.
+    McpStdio,
+    /// WebSocket JSON-RPC server.
+    McpWs,
+}
+
+impl AccessTransport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::McpStdio => "mcp-stdio",
+            Self::McpWs => "mcp-ws",
+        }
+    }
+}
+
+/// Tool-level action subject to approval and audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessAction {
+    /// List all containers.
+    ListContainers,
+    /// List files in one container.
+    ListFiles,
+    /// Read a file.
+    ReadFile,
+    /// Write a file.
+    WriteFile,
+    /// Delete a file.
+    DeleteFile,
+    /// Create a container.
+    CreateContainer,
+}
+
+impl AccessAction {
+    fn audit_action(self) -> AuditAction {
+        match self {
+            Self::ListContainers => AuditAction::ListContainers,
+            Self::ListFiles => AuditAction::ListFiles,
+            Self::ReadFile => AuditAction::ReadFile,
+            Self::WriteFile => AuditAction::WriteFile,
+            Self::DeleteFile => AuditAction::DeleteFile,
+            Self::CreateContainer => AuditAction::CreateContainer,
+        }
+    }
+}
+
+/// Normalized access request produced from one tool call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessRequest {
+    /// Transport used for the request.
+    pub transport: AccessTransport,
+    /// Action being performed.
+    pub action: AccessAction,
+    /// Target container, when applicable.
+    pub container: Option<String>,
+    /// Target file, when applicable.
+    pub file_name: Option<String>,
+    /// Effective mode governing the action, when applicable.
+    pub mode: Option<SecurityMode>,
+    /// Byte size of the payload, when known.
+    pub byte_size: Option<usize>,
+}
+
+/// Hook used to enforce approval policy for MCP calls.
+#[async_trait]
+pub trait AccessController: Send + Sync {
+    /// Returns `Ok(())` when the request may proceed, or an error string
+    /// when it should be rejected.
+    async fn authorize(&self, request: AccessRequest) -> std::result::Result<(), String>;
+}
+
+/// Hook used to persist audit events.
+pub trait AuditSink: Send + Sync {
+    /// Record one audit event.
+    fn record(&self, event: AuditEvent) -> std::result::Result<(), String>;
+}
 
 /// MCP server. Holds a shared vault handle + the per-launch pairing secret.
 pub struct McpServer<H: VaultFacade + 'static> {
     handle: SharedVault<H>,
     pairing_secret: String,
+    access_controller: Option<Arc<dyn AccessController>>,
+    audit_sink: Option<Arc<dyn AuditSink>>,
 }
 
 impl<H: VaultFacade + 'static> McpServer<H> {
@@ -118,7 +200,21 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         Self {
             handle,
             pairing_secret: pairing_secret.into(),
+            access_controller: None,
+            audit_sink: None,
         }
+    }
+
+    /// Install an access controller used before each MCP tool call.
+    pub fn with_access_controller(mut self, controller: Arc<dyn AccessController>) -> Self {
+        self.access_controller = Some(controller);
+        self
+    }
+
+    /// Install an audit sink used for all MCP tool outcomes.
+    pub fn with_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        self.audit_sink = Some(sink);
+        self
     }
 
     /// Pairing secret in use.
@@ -128,15 +224,8 @@ impl<H: VaultFacade + 'static> McpServer<H> {
 
     /// Generate a fresh URL-safe-base64 32-byte pairing secret.
     pub fn fresh_pairing_secret() -> String {
-        // 32 bytes from OS RNG → URL-safe base64 (no padding).
         let mut buf = [0u8; 32];
-        // getrandom is already in the dep tree via sv-crypto, but we don't
-        // depend on it directly here — go through std for portability.
-        // Use a thread_local CSPRNG via getrandom-equivalent: tokio doesn't
-        // ship one, so we shell out to the OS through `getrandom` if present
-        // — fall back to a simple time-seeded XOR otherwise (dev only).
         if getrandom_fill(&mut buf).is_err() {
-            // Should never happen on supported platforms, but degrade gracefully.
             for (i, b) in buf.iter_mut().enumerate() {
                 *b = (i as u8).wrapping_mul(31);
             }
@@ -145,9 +234,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
     }
 
     /// Run an MCP server reading JSON-RPC line-delimited frames from `reader`,
-    /// writing responses to `writer`. Used for tests and embedded scenarios.
-    /// No pairing required on stdio (stdio is implicitly trusted because the
-    /// caller already had to spawn this process).
+    /// writing responses to `writer`.
     pub async fn serve_stdio<R, W>(&self, reader: R, mut writer: W) -> Result<()>
     where
         R: AsyncBufRead + Unpin,
@@ -159,7 +246,9 @@ impl<H: VaultFacade + 'static> McpServer<H> {
             if trimmed.is_empty() {
                 continue;
             }
-            let response = self.dispatch(trimmed, &mut PairState::AlreadyPaired).await;
+            let response = self
+                .dispatch(trimmed, &mut PairState::AlreadyPaired, AccessTransport::McpStdio)
+                .await;
             if let Some(resp) = response {
                 let bytes =
                     serde_json::to_vec(&resp).map_err(|e| McpError::Protocol(e.to_string()))?;
@@ -172,15 +261,27 @@ impl<H: VaultFacade + 'static> McpServer<H> {
     }
 
     /// Run a WebSocket server on `addr` until `shutdown` is signalled.
-    /// Each connection must send `vault.pair { secret }` first.
     pub async fn serve_ws(
         self: Arc<Self>,
         addr: SocketAddr,
-        mut shutdown: oneshot::Receiver<()>,
+        shutdown: oneshot::Receiver<()>,
     ) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| McpError::Transport(format!("bind {addr}: {e}")))?;
+        self.serve_ws_listener(listener, shutdown).await
+    }
+
+    /// Serve using a pre-bound listener. Used by the desktop app to fail fast
+    /// on bind errors before reporting the server as running.
+    pub async fn serve_ws_listener(
+        self: Arc<Self>,
+        listener: tokio::net::TcpListener,
+        mut shutdown: oneshot::Receiver<()>,
+    ) -> Result<()> {
+        let addr = listener
+            .local_addr()
+            .map_err(|e| McpError::Transport(e.to_string()))?;
         tracing::info!(%addr, "MCP WS listening");
         loop {
             tokio::select! {
@@ -236,15 +337,16 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 Message::Close(_) => break,
                 _ => continue,
             };
-            let response = self.dispatch(text.trim(), &mut pair_state).await;
+            let response = self
+                .dispatch(text.trim(), &mut pair_state, AccessTransport::McpWs)
+                .await;
             if let Some(resp) = response {
                 let bytes =
                     serde_json::to_string(&resp).map_err(|e| McpError::Protocol(e.to_string()))?;
-                sink.send(Message::Text(bytes))
+                sink.send(Message::Text(bytes.into()))
                     .await
                     .map_err(|e| McpError::Transport(e.to_string()))?;
             }
-            // If pairing failed, drop the connection.
             if matches!(pair_state, PairState::Failed) {
                 let _ = sink.send(Message::Close(None)).await;
                 break;
@@ -253,8 +355,12 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         Ok(())
     }
 
-    /// Parse, route, and produce a response Value (or None for notifications).
-    async fn dispatch(&self, raw: &str, pair: &mut PairState) -> Option<Value> {
+    async fn dispatch(
+        &self,
+        raw: &str,
+        pair: &mut PairState,
+        transport: AccessTransport,
+    ) -> Option<Value> {
         let req: Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => {
@@ -269,17 +375,15 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         let id = req.get("id").cloned();
         let method = match req.get("method").and_then(|m| m.as_str()) {
             Some(m) => m.to_string(),
-            None => return None, // not a request — ignore
+            None => return None,
         };
         let params = req.get("params").cloned().unwrap_or(Value::Null);
 
-        // Notifications (no id) are silently dropped.
         let id = match id {
             Some(v) if !v.is_null() => v,
             _ => return None,
         };
 
-        // Pairing handshake: WS connections must pair first.
         if matches!(pair, PairState::Unpaired) {
             if method == "vault.pair" {
                 let secret = params
@@ -315,13 +419,10 @@ impl<H: VaultFacade + 'static> McpServer<H> {
             "tools/call" => {
                 let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
-                let result = self.call_tool(name, arguments).await;
+                let result = self.call_tool(name, arguments, transport).await;
                 Some(ok_response(id, tool_result(result)))
             }
-            "vault.pair" => {
-                // Already paired — accept idempotently.
-                Some(ok_response(id, json!({ "paired": true })))
-            }
+            "vault.pair" => Some(ok_response(id, json!({ "paired": true }))),
             "ping" => Some(ok_response(id, json!({}))),
             other => Some(error_response(
                 id,
@@ -331,26 +432,145 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         }
     }
 
-    async fn call_tool(&self, name: &str, args: Value) -> std::result::Result<Value, String> {
-        let guard = self.handle.lock().await;
-        let h = guard
-            .as_ref()
-            .ok_or_else(|| "vault is locked".to_string())?;
+    async fn call_tool(
+        &self,
+        name: &str,
+        args: Value,
+        transport: AccessTransport,
+    ) -> std::result::Result<Value, String> {
+        let access = {
+            let guard = self.handle.lock().await;
+            let handle = guard
+                .as_ref()
+                .ok_or_else(|| "vault is locked".to_string())?;
+            self.build_access_request(handle, name, &args, transport)?
+        };
+
+        if let Some(controller) = &self.access_controller {
+            if let Err(error) = controller.authorize(access.clone()).await {
+                self.record_audit(&access, AuditDecision::Denied, None, Some(error.clone()));
+                return Err(error);
+            }
+        }
+
+        let result = {
+            let guard = self.handle.lock().await;
+            let handle = guard
+                .as_ref()
+                .ok_or_else(|| "vault is locked".to_string())?;
+            self.execute_tool(handle, name, &args)
+        };
+
+        match &result {
+            Ok(_) => self.record_audit(&access, AuditDecision::Allowed, None, None),
+            Err(error) => self.record_audit(&access, AuditDecision::Error, None, Some(error.clone())),
+        }
+
+        result
+    }
+
+    fn build_access_request(
+        &self,
+        handle: &H,
+        name: &str,
+        args: &Value,
+        transport: AccessTransport,
+    ) -> std::result::Result<AccessRequest, String> {
         match name {
             "vault.list" => {
                 let container = args.get("container").and_then(|v| v.as_str());
-                if let Some(c) = container {
-                    let files = h.list_files(c)?;
+                let mode = match container {
+                    Some(container) => Some(handle.container_mode(container)?),
+                    None => None,
+                };
+                Ok(AccessRequest {
+                    transport,
+                    action: if container.is_some() {
+                        AccessAction::ListFiles
+                    } else {
+                        AccessAction::ListContainers
+                    },
+                    container: container.map(|s| s.to_string()),
+                    file_name: None,
+                    mode,
+                    byte_size: None,
+                })
+            }
+            "vault.read" => {
+                let container = required_str(args, "container")?;
+                let file_name = required_str(args, "file_name")?;
+                Ok(AccessRequest {
+                    transport,
+                    action: AccessAction::ReadFile,
+                    container: Some(container.to_string()),
+                    file_name: Some(file_name.to_string()),
+                    mode: Some(handle.container_mode(container)?),
+                    byte_size: None,
+                })
+            }
+            "vault.write" => {
+                let container = required_str(args, "container")?;
+                let file_name = required_str(args, "file_name")?;
+                let content_b64 = required_str(args, "content_b64")?;
+                let bytes = B64
+                    .decode(content_b64.as_bytes())
+                    .map_err(|e| format!("invalid base64: {e}"))?;
+                Ok(AccessRequest {
+                    transport,
+                    action: AccessAction::WriteFile,
+                    container: Some(container.to_string()),
+                    file_name: Some(file_name.to_string()),
+                    mode: Some(handle.container_mode(container)?),
+                    byte_size: Some(bytes.len()),
+                })
+            }
+            "vault.delete" => {
+                let container = required_str(args, "container")?;
+                let file_name = required_str(args, "file_name")?;
+                Ok(AccessRequest {
+                    transport,
+                    action: AccessAction::DeleteFile,
+                    container: Some(container.to_string()),
+                    file_name: Some(file_name.to_string()),
+                    mode: Some(handle.container_mode(container)?),
+                    byte_size: None,
+                })
+            }
+            "vault.create_container" => {
+                let name = required_str(args, "name")?;
+                let mode = args
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("DIRECT");
+                Ok(AccessRequest {
+                    transport,
+                    action: AccessAction::CreateContainer,
+                    container: Some(name.to_string()),
+                    file_name: None,
+                    mode: Some(SecurityMode::parse(mode).map_err(|e| e.to_string())?),
+                    byte_size: None,
+                })
+            }
+            other => Err(format!("unknown tool: {other}")),
+        }
+    }
+
+    fn execute_tool(&self, handle: &H, name: &str, args: &Value) -> std::result::Result<Value, String> {
+        match name {
+            "vault.list" => {
+                let container = args.get("container").and_then(|v| v.as_str());
+                if let Some(container) = container {
+                    let files = handle.list_files(container)?;
                     Ok(serde_json::to_value(files).map_err(|e| e.to_string())?)
                 } else {
-                    let cs = h.list_containers()?;
-                    Ok(serde_json::to_value(cs).map_err(|e| e.to_string())?)
+                    let containers = handle.list_containers()?;
+                    Ok(serde_json::to_value(containers).map_err(|e| e.to_string())?)
                 }
             }
             "vault.read" => {
-                let container = required_str(&args, "container")?;
-                let file_name = required_str(&args, "file_name")?;
-                let bytes = h.read_file(container, file_name)?;
+                let container = required_str(args, "container")?;
+                let file_name = required_str(args, "file_name")?;
+                let bytes = handle.read_file(container, file_name)?;
                 Ok(json!({
                     "container": container,
                     "file_name": file_name,
@@ -359,39 +579,61 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 }))
             }
             "vault.write" => {
-                let container = required_str(&args, "container")?;
-                let file_name = required_str(&args, "file_name")?;
-                let content_b64 = required_str(&args, "content_b64")?;
+                let container = required_str(args, "container")?;
+                let file_name = required_str(args, "file_name")?;
+                let content_b64 = required_str(args, "content_b64")?;
                 let bytes = B64
                     .decode(content_b64.as_bytes())
                     .map_err(|e| format!("invalid base64: {e}"))?;
-                let n = bytes.len();
-                h.write_file(container, file_name, &bytes)?;
-                Ok(json!({ "ok": true, "byte_size": n }))
+                let byte_size = bytes.len();
+                handle.write_file(container, file_name, &bytes)?;
+                Ok(json!({ "ok": true, "byte_size": byte_size }))
             }
             "vault.delete" => {
-                let container = required_str(&args, "container")?;
-                let file_name = required_str(&args, "file_name")?;
-                h.delete_file(container, file_name)?;
+                let container = required_str(args, "container")?;
+                let file_name = required_str(args, "file_name")?;
+                handle.delete_file(container, file_name)?;
                 Ok(json!({ "ok": true }))
             }
             "vault.create_container" => {
-                let name = required_str(&args, "name")?;
+                let name = required_str(args, "name")?;
                 let mode = args
                     .get("mode")
                     .and_then(|v| v.as_str())
                     .unwrap_or("DIRECT");
                 let description = args.get("description").and_then(|v| v.as_str());
-                h.create_container(name, mode, description)?;
+                handle.create_container(name, mode, description)?;
                 Ok(json!({ "ok": true, "name": name, "mode": mode }))
             }
             other => Err(format!("unknown tool: {other}")),
         }
     }
+
+    fn record_audit(
+        &self,
+        request: &AccessRequest,
+        decision: AuditDecision,
+        detail: Option<String>,
+        error: Option<String>,
+    ) {
+        let Some(sink) = &self.audit_sink else {
+            return;
+        };
+
+        let mut event = AuditEvent::new(request.action.audit_action(), decision, request.transport.as_str());
+        event.container = request.container.clone();
+        event.file_name = request.file_name.clone();
+        event.mode = request.mode.map(|mode| mode.as_str().to_string());
+        event.byte_size = request.byte_size;
+        event.detail = detail;
+        event.error = error;
+        let _ = sink.record(event);
+    }
 }
 
-fn required_str<'a>(v: &'a Value, key: &str) -> std::result::Result<&'a str, String> {
-    v.get(key)
+fn required_str<'a>(value: &'a Value, key: &str) -> std::result::Result<&'a str, String> {
+    value
+        .get(key)
         .and_then(|x| x.as_str())
         .ok_or_else(|| format!("missing required string field: {key}"))
 }
@@ -444,12 +686,12 @@ fn error_response(id: Value, code: i32, message: &str) -> Value {
 
 fn tool_result(result: std::result::Result<Value, String>) -> Value {
     match result {
-        Ok(v) => json!({
-            "content": [{ "type": "text", "text": serde_json::to_string(&v).unwrap_or_default() }],
+        Ok(value) => json!({
+            "content": [{ "type": "text", "text": serde_json::to_string(&value).unwrap_or_default() }],
             "isError": false,
         }),
-        Err(e) => json!({
-            "content": [{ "type": "text", "text": e }],
+        Err(error) => json!({
+            "content": [{ "type": "text", "text": error }],
             "isError": true,
         }),
     }
@@ -461,7 +703,7 @@ fn tool_descriptors() -> Value {
             "name": "vault.list",
             "description":
                 "List containers in the vault, or files in a single container. \
-                 HITL approval will be required in v1.1; today every call goes through if the vault is unlocked.",
+                 Requests for protected containers may require desktop approval.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -473,8 +715,7 @@ fn tool_descriptors() -> Value {
         {
             "name": "vault.read",
             "description":
-                "Read and decrypt a single file from a container. Returns base64-encoded content. \
-                 HITL approval will be required in v1.1; today every call goes through if the vault is unlocked.",
+                "Read and decrypt a single file from a container. Returns base64-encoded content.",
             "inputSchema": {
                 "type": "object",
                 "required": ["container", "file_name"],
@@ -488,8 +729,7 @@ fn tool_descriptors() -> Value {
         {
             "name": "vault.write",
             "description":
-                "Encrypt and write a file into a container. content_b64 is base64-encoded plaintext. \
-                 HITL approval will be required in v1.1; today every call goes through if the vault is unlocked.",
+                "Encrypt and write a file into a container. content_b64 is base64-encoded plaintext.",
             "inputSchema": {
                 "type": "object",
                 "required": ["container", "file_name", "content_b64"],
@@ -503,9 +743,7 @@ fn tool_descriptors() -> Value {
         },
         {
             "name": "vault.delete",
-            "description":
-                "Delete a file from a container. \
-                 HITL approval will be required in v1.1; today every call goes through if the vault is unlocked.",
+            "description": "Delete a file from a container.",
             "inputSchema": {
                 "type": "object",
                 "required": ["container", "file_name"],
@@ -520,14 +758,13 @@ fn tool_descriptors() -> Value {
             "name": "vault.create_container",
             "description":
                 "Create a new empty container (directory) at the vault root. \
-                 The mode determines the default security level inherited by files. \
-                 HITL approval will be required in v1.1.",
+                 The mode determines the default security level inherited by files.",
             "inputSchema": {
                 "type": "object",
                 "required": ["name"],
                 "properties": {
-                    "name":        { "type": "string", "description": "Alphanumeric, hyphen, underscore. ≤64 chars." },
-                    "mode":        { "type": "string", "enum": ["DIRECT", "OTP", "APPROVAL", "ANONYMIZED", "ZKP", "NATIVE"], "default": "DIRECT" },
+                    "name":        { "type": "string", "description": "Alphanumeric, hyphen, underscore. <=64 chars." },
+                    "mode":        { "type": "string", "enum": ["DIRECT", "APPROVAL", "OTP", "ANONYMIZED", "ZKP", "NATIVE"], "default": "DIRECT" },
                     "description": { "type": "string", "description": "Optional human-readable description." }
                 },
                 "additionalProperties": false
@@ -536,34 +773,22 @@ fn tool_descriptors() -> Value {
     ])
 }
 
-// Tiny wrapper around getrandom so we don't take a direct dependency on it
-// (sv-crypto already does, and we want to keep the dep graph slim).
 fn getrandom_fill(buf: &mut [u8]) -> std::result::Result<(), ()> {
-    // Use the standard `getrandom` crate via std::env::var as a hint? No —
-    // simpler: use a tiny syscall path via std. On stable Rust there's no
-    // public OS RNG in std, so we fall back to a hash of process state.
-    // In practice, callers should use `McpServer::fresh_pairing_secret`
-    // only from the desktop crate which does have getrandom in its tree;
-    // but to keep this crate dep-light we accept the worst-case fallback.
-    //
-    // For the desktop app we override by passing a pre-generated secret
-    // into `McpServer::new`. The `fresh_pairing_secret` helper here is a
-    // convenience for tests.
     use std::time::{SystemTime, UNIX_EPOCH};
+
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ())?
         .as_nanos();
     let pid = std::process::id() as u128;
     let mut state = nanos ^ (pid.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    for b in buf.iter_mut() {
-        // splitmix64 step
+    for byte in buf.iter_mut() {
         state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^= z >> 31;
-        *b = (z & 0xFF) as u8;
+        *byte = (z & 0xFF) as u8;
     }
     Ok(())
 }
@@ -576,7 +801,6 @@ pub fn version() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sv_storage::SecurityMode;
 
     struct StubVault {
         containers: Vec<ContainerInfo>,
@@ -587,9 +811,11 @@ mod tests {
         fn list_containers(&self) -> std::result::Result<Vec<ContainerInfo>, String> {
             Ok(self.containers.clone())
         }
+
         fn list_files(&self, _container: &str) -> std::result::Result<Vec<FileInfo>, String> {
             Ok(vec![])
         }
+
         fn read_file(
             &self,
             container: &str,
@@ -602,6 +828,7 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| "not found".into())
         }
+
         fn write_file(
             &self,
             container: &str,
@@ -614,6 +841,7 @@ mod tests {
                 .insert((container.into(), file_name.into()), plaintext.to_vec());
             Ok(())
         }
+
         fn delete_file(&self, container: &str, file_name: &str) -> std::result::Result<(), String> {
             self.files
                 .lock()
@@ -621,6 +849,7 @@ mod tests {
                 .remove(&(container.into(), file_name.into()));
             Ok(())
         }
+
         fn create_container(
             &self,
             _name: &str,
@@ -629,13 +858,39 @@ mod tests {
         ) -> std::result::Result<(), String> {
             Ok(())
         }
+
+        fn container_mode(&self, container: &str) -> std::result::Result<SecurityMode, String> {
+            if self.containers.iter().any(|c| c.name == container) {
+                Ok(SecurityMode::Approval)
+            } else {
+                Err("missing container".into())
+            }
+        }
+    }
+
+    struct DenyController;
+
+    #[async_trait]
+    impl AccessController for DenyController {
+        async fn authorize(&self, request: AccessRequest) -> std::result::Result<(), String> {
+            Err(format!("denied {:?}", request.action))
+        }
+    }
+
+    struct MemoryAudit(std::sync::Mutex<Vec<AuditEvent>>);
+
+    impl AuditSink for MemoryAudit {
+        fn record(&self, event: AuditEvent) -> std::result::Result<(), String> {
+            self.0.lock().unwrap().push(event);
+            Ok(())
+        }
     }
 
     fn server() -> McpServer<StubVault> {
         let vault = StubVault {
             containers: vec![ContainerInfo {
                 name: "notes".into(),
-                mode: SecurityMode::Direct,
+                mode: SecurityMode::Approval,
                 file_count: 0,
                 description: None,
             }],
@@ -646,105 +901,152 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_returns_protocol_version() {
-        let s = server();
-        let mut p = PairState::AlreadyPaired;
-        let r = s
-            .dispatch(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#, &mut p)
+        let server = server();
+        let mut pair = PairState::AlreadyPaired;
+        let response = server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
             .await
             .unwrap();
-        assert_eq!(r["result"]["protocolVersion"], "2024-11-05");
-        assert_eq!(r["result"]["serverInfo"]["name"], "sovereign-vault");
+        assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(response["result"]["serverInfo"]["name"], "sovereign-vault");
     }
 
     #[tokio::test]
-    async fn tools_list_has_four() {
-        let s = server();
-        let mut p = PairState::AlreadyPaired;
-        let r = s
-            .dispatch(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &mut p)
+    async fn tools_list_has_five() {
+        let server = server();
+        let mut pair = PairState::AlreadyPaired;
+        let response = server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
             .await
             .unwrap();
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 4);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 5);
     }
 
     #[tokio::test]
     async fn unpaired_first_call_rejected() {
-        let s = server();
-        let mut p = PairState::Unpaired;
-        let r = s
-            .dispatch(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#, &mut p)
+        let server = server();
+        let mut pair = PairState::Unpaired;
+        let response = server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
             .await
             .unwrap();
-        assert_eq!(r["error"]["code"], codes::UNPAIRED);
-        assert!(matches!(p, PairState::Failed));
+        assert_eq!(response["error"]["code"], codes::UNPAIRED);
+        assert!(matches!(pair, PairState::Failed));
     }
 
     #[tokio::test]
     async fn pairing_with_correct_secret_succeeds() {
-        let s = server();
-        let mut p = PairState::Unpaired;
-        let r = s
+        let server = server();
+        let mut pair = PairState::Unpaired;
+        let response = server
             .dispatch(
                 r#"{"jsonrpc":"2.0","id":1,"method":"vault.pair","params":{"secret":"test-secret"}}"#,
-                &mut p,
+                &mut pair,
+                AccessTransport::McpWs,
             )
             .await
             .unwrap();
-        assert_eq!(r["result"]["paired"], true);
-        assert!(matches!(p, PairState::AlreadyPaired));
+        assert_eq!(response["result"]["paired"], true);
+        assert!(matches!(pair, PairState::AlreadyPaired));
     }
 
     #[tokio::test]
     async fn pairing_with_wrong_secret_fails() {
-        let s = server();
-        let mut p = PairState::Unpaired;
-        let r = s
+        let server = server();
+        let mut pair = PairState::Unpaired;
+        let response = server
             .dispatch(
                 r#"{"jsonrpc":"2.0","id":1,"method":"vault.pair","params":{"secret":"wrong"}}"#,
-                &mut p,
+                &mut pair,
+                AccessTransport::McpWs,
             )
             .await
             .unwrap();
-        assert_eq!(r["error"]["code"], codes::UNPAIRED);
-        assert!(matches!(p, PairState::Failed));
+        assert_eq!(response["error"]["code"], codes::UNPAIRED);
+        assert!(matches!(pair, PairState::Failed));
     }
 
     #[tokio::test]
     async fn write_then_read_roundtrip() {
-        let s = server();
-        let mut p = PairState::AlreadyPaired;
+        let server = server();
+        let mut pair = PairState::AlreadyPaired;
         let payload = B64.encode(b"hello vault");
-        let req = format!(
+        let write_request = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.write","arguments":{{"container":"notes","file_name":"a.txt","content_b64":"{payload}"}}}}}}"#
         );
-        let r = s.dispatch(&req, &mut p).await.unwrap();
-        assert_eq!(r["result"]["isError"], false);
+        let response = server
+            .dispatch(&write_request, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], false);
 
-        let req2 = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"vault.read","arguments":{"container":"notes","file_name":"a.txt"}}}"#;
-        let r2 = s.dispatch(req2, &mut p).await.unwrap();
-        let inner = r2["result"]["content"][0]["text"].as_str().unwrap();
-        let v: Value = serde_json::from_str(inner).unwrap();
-        assert_eq!(v["content_b64"], payload);
+        let read_request = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"vault.read","arguments":{"container":"notes","file_name":"a.txt"}}}"#;
+        let read_response = server
+            .dispatch(read_request, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let inner = read_response["result"]["content"][0]["text"].as_str().unwrap();
+        let value: Value = serde_json::from_str(inner).unwrap();
+        assert_eq!(value["content_b64"], payload);
     }
 
     #[tokio::test]
     async fn locked_vault_returns_error() {
-        let v: SharedVault<StubVault> = Arc::new(Mutex::new(None));
-        let s = McpServer::new(v, "x");
-        let mut p = PairState::AlreadyPaired;
-        let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vault.list","arguments":{}}}"#;
-        let r = s.dispatch(req, &mut p).await.unwrap();
-        assert_eq!(r["result"]["isError"], true);
+        let vault: SharedVault<StubVault> = Arc::new(Mutex::new(None));
+        let server = McpServer::new(vault, "x");
+        let mut pair = PairState::AlreadyPaired;
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vault.list","arguments":{}}}"#;
+        let response = server
+            .dispatch(request, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
     }
 
     #[tokio::test]
     async fn unknown_method_404() {
-        let s = server();
-        let mut p = PairState::AlreadyPaired;
-        let r = s
-            .dispatch(r#"{"jsonrpc":"2.0","id":1,"method":"frobnicate"}"#, &mut p)
+        let server = server();
+        let mut pair = PairState::AlreadyPaired;
+        let response = server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":1,"method":"frobnicate"}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
             .await
             .unwrap();
-        assert_eq!(r["error"]["code"], codes::METHOD_NOT_FOUND);
+        assert_eq!(response["error"]["code"], codes::METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn denied_request_is_reported_and_audited() {
+        let audit = Arc::new(MemoryAudit(Default::default()));
+        let server = server()
+            .with_access_controller(Arc::new(DenyController))
+            .with_audit_sink(audit.clone());
+        let mut pair = PairState::AlreadyPaired;
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vault.read","arguments":{"container":"notes","file_name":"a.txt"}}}"#;
+        let response = server
+            .dispatch(request, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+
+        let events = audit.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].decision, AuditDecision::Denied);
+        assert_eq!(events[0].action, AuditAction::ReadFile);
     }
 }

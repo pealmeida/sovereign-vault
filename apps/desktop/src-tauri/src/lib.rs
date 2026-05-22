@@ -5,25 +5,31 @@
 //!
 //! On unlock, also spins up:
 //!   * MCP WebSocket server on `127.0.0.1:9944` (paired)
-//!   * Read-only HTTP server on `127.0.0.1:9944` for `/health`,
-//!     `/.well-known/agent.json`, `/.well-known/mcp-pairing`.
+//!   * Read-only HTTP server on `127.0.0.1:9943` for `/health`,
+//!     `/.well-known/agent.json`, `/.well-known/mcp-pairing`
 //!
 //! Both share the live `VaultHandle` via `Arc<Mutex<Option<VaultHandle>>>`.
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sv_audit::{AuditAction, AuditDecision, AuditEvent, AuditLog};
 use sv_core::sv_storage::{ContainerInfo, FileInfo, SecurityMode};
-use sv_core::{CustodyMode, VaultHandle};
+use sv_core::{BootstrapResult, CustodyMode, VaultHandle};
 use tauri::async_runtime::{spawn, JoinHandle};
-use tauri::{Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{oneshot, Mutex};
 
 const RPC_PORT: u16 = 9944;
+const APPROVAL_EVENT: &str = "vault://approval-request";
 
 type SharedHandle = Arc<Mutex<Option<VaultHandle>>>;
 
@@ -37,16 +43,112 @@ struct ServersShutdown {
     running: bool,
 }
 
+struct PendingApproval {
+    tx: oneshot::Sender<bool>,
+    otp_code: Option<String>,
+}
+
+enum ApprovalPromptKind {
+    NotRequired,
+    Click,
+    Otp(String),
+}
+
+struct ApprovalState {
+    app: AppHandle,
+    next_id: AtomicU64,
+    pending: Mutex<HashMap<u64, PendingApproval>>,
+}
+
+impl ApprovalState {
+    fn new(app: AppHandle) -> Self {
+        Self {
+            app,
+            next_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn request(&self, request: sv_mcp::AccessRequest) -> Result<(), String> {
+        let otp_code = match approval_requirement(&request)? {
+            ApprovalPromptKind::NotRequired => return Ok(()),
+            ApprovalPromptKind::Click => None,
+            ApprovalPromptKind::Otp(code) => Some(code),
+        };
+
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            pending.insert(
+                id,
+                PendingApproval {
+                    tx,
+                    otp_code: otp_code.clone(),
+                },
+            );
+        }
+
+        let payload = ApprovalPrompt {
+            id,
+            action: format!("{:?}", request.action),
+            container: request.container.clone(),
+            file_name: request.file_name.clone(),
+            mode: request.mode.map(|m| m.as_str().to_string()),
+            byte_size: request.byte_size,
+            otp_code,
+        };
+        self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
+
+        match tokio::time::timeout(Duration::from_secs(300), rx).await {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => Err("access denied by user".into()),
+            Ok(Err(_)) => Err("approval channel closed".into()),
+            Err(_) => {
+                let mut pending = self.pending.lock().await;
+                pending.remove(&id);
+                Err("approval timed out".into())
+            }
+        }
+    }
+
+    async fn respond(&self, id: u64, approved: bool, otp: Option<String>) -> Result<(), String> {
+        let mut pending = self.pending.lock().await;
+        if approved {
+            if let Some(existing) = pending.get(&id) {
+                if let Some(expected) = &existing.otp_code {
+                    if otp.as_deref() != Some(expected.as_str()) {
+                        return Err("incorrect confirmation code".into());
+                    }
+                }
+            }
+        }
+
+        let Some(pending_request) = pending.remove(&id) else {
+            return Err(format!("unknown approval request: {id}"));
+        };
+        pending_request
+            .tx
+            .send(approved)
+            .map_err(|_| "approval request already closed".to_string())
+    }
+}
+
 /// In-memory vault state held inside Tauri's managed state.
 struct VaultState {
+    app: AppHandle,
     handle: SharedHandle,
+    approvals: Arc<ApprovalState>,
     servers: Mutex<Option<ServersShutdown>>,
 }
 
-impl Default for VaultState {
-    fn default() -> Self {
+impl VaultState {
+    fn new(app: AppHandle) -> Self {
+        let approvals = Arc::new(ApprovalState::new(app.clone()));
         Self {
+            app,
             handle: Arc::new(Mutex::new(None)),
+            approvals,
             servers: Mutex::new(None),
         }
     }
@@ -60,6 +162,12 @@ struct VaultStatus {
     custody: Option<String>,
     has_keychain_entry: bool,
     has_passphrase_salt: bool,
+    has_recovery_bundle: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct VaultInitResponse {
+    recovery_phrase: String,
 }
 
 /// MCP integration status returned by [`mcp_status`].
@@ -71,6 +179,44 @@ struct McpStatus {
     http_url: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApprovalPrompt {
+    id: u64,
+    action: String,
+    container: Option<String>,
+    file_name: Option<String>,
+    mode: Option<String>,
+    byte_size: Option<usize>,
+    otp_code: Option<String>,
+}
+
+struct DesktopAuditSink {
+    root: PathBuf,
+}
+
+impl DesktopAuditSink {
+    fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+impl sv_mcp::AuditSink for DesktopAuditSink {
+    fn record(&self, event: AuditEvent) -> Result<(), String> {
+        AuditLog::new(&self.root).record(&event).map_err(estr)
+    }
+}
+
+struct DesktopAccessController {
+    approvals: Arc<ApprovalState>,
+}
+
+#[async_trait]
+impl sv_mcp::AccessController for DesktopAccessController {
+    async fn authorize(&self, request: sv_mcp::AccessRequest) -> Result<(), String> {
+        self.approvals.request(request).await
+    }
+}
+
 fn estr<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
@@ -79,13 +225,86 @@ fn parse_custody(s: &str) -> Result<CustodyMode, String> {
     match s.to_ascii_uppercase().as_str() {
         "OSKEYCHAIN" | "OS_KEYCHAIN" | "KEYCHAIN" => Ok(CustodyMode::OsKeychain),
         "PASSPHRASE" => Ok(CustodyMode::Passphrase),
+        "RECOVERY" => Ok(CustodyMode::Recovery),
         other => Err(format!("unknown custody mode: {other}")),
     }
 }
 
-fn vault_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+fn vault_root(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(estr)?;
     Ok(dir.join("sovereign-vault"))
+}
+
+fn audit_root(state: &VaultState) -> Result<PathBuf, String> {
+    vault_root(&state.app)
+}
+
+fn desktop_event(
+    action: AuditAction,
+    decision: AuditDecision,
+    container: Option<String>,
+    file_name: Option<String>,
+    mode: Option<SecurityMode>,
+    byte_size: Option<usize>,
+    error: Option<String>,
+) -> AuditEvent {
+    let mut event = AuditEvent::new(action, decision, "desktop-ui");
+    event.container = container;
+    event.file_name = file_name;
+    event.mode = mode.map(|m| m.as_str().to_string());
+    event.byte_size = byte_size;
+    event.error = error;
+    event
+}
+
+fn record_desktop_event(state: &VaultState, event: AuditEvent) {
+    let Ok(root) = audit_root(state) else {
+        return;
+    };
+    let _ = AuditLog::new(&root).record(&event);
+}
+
+fn approval_requirement(request: &sv_mcp::AccessRequest) -> Result<ApprovalPromptKind, String> {
+    match request.mode {
+        Some(SecurityMode::Direct) | None => match request.action {
+            sv_mcp::AccessAction::ListContainers | sv_mcp::AccessAction::CreateContainer => {
+                Ok(ApprovalPromptKind::Click)
+            }
+            _ => Ok(ApprovalPromptKind::NotRequired),
+        },
+        Some(SecurityMode::Approval) => Ok(ApprovalPromptKind::Click),
+        Some(SecurityMode::Otp) => Ok(ApprovalPromptKind::Otp(generate_otp_code()?)),
+        Some(SecurityMode::Anonymized) => {
+            Err("ANONYMIZED mode is not implemented for live MCP access".into())
+        }
+        Some(SecurityMode::Zkp) => Err("ZKP mode is not implemented for live MCP access".into()),
+        Some(SecurityMode::Native) => {
+            Err("NATIVE mode is not implemented for live MCP access".into())
+        }
+    }
+}
+
+fn generate_otp_code() -> Result<String, String> {
+    let bytes = sv_core::sv_crypto::random_bytes(4).map_err(estr)?;
+    let n = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 1_000_000;
+    Ok(format!("{n:06}"))
+}
+
+async fn with_handle<R, F>(state: &State<'_, VaultState>, f: F) -> Result<R, String>
+where
+    F: FnOnce(&VaultHandle) -> Result<R, String>,
+{
+    let guard = state.handle.lock().await;
+    let handle = guard
+        .as_ref()
+        .ok_or_else(|| "vault is locked".to_string())?;
+    f(handle)
+}
+
+async fn container_mode(state: &State<'_, VaultState>, container: &str) -> Option<SecurityMode> {
+    with_handle(state, |handle| handle.container_mode(container).map_err(estr))
+        .await
+        .ok()
 }
 
 #[tauri::command]
@@ -95,15 +314,16 @@ fn app_version() -> String {
 
 #[tauri::command]
 async fn vault_status(
-    app: tauri::AppHandle,
+    app: AppHandle,
     state: State<'_, VaultState>,
 ) -> Result<VaultStatus, String> {
     let root = vault_root(&app)?;
     let probe = sv_core::probe(&root).map_err(estr)?;
     let guard = state.handle.lock().await;
-    let custody = guard.as_ref().map(|h| match h.custody() {
+    let custody = guard.as_ref().map(|handle| match handle.custody() {
         CustodyMode::OsKeychain => "OsKeychain".to_string(),
         CustodyMode::Passphrase => "Passphrase".to_string(),
+        CustodyMode::Recovery => "Recovery".to_string(),
     });
     Ok(VaultStatus {
         initialized: probe.initialized,
@@ -111,46 +331,217 @@ async fn vault_status(
         custody,
         has_keychain_entry: probe.has_keychain_entry,
         has_passphrase_salt: probe.has_passphrase_salt,
+        has_recovery_bundle: probe.has_recovery_bundle,
     })
 }
 
 #[tauri::command]
 async fn vault_init(
-    app: tauri::AppHandle,
+    app: AppHandle,
     state: State<'_, VaultState>,
     custody: String,
     passphrase: Option<String>,
-) -> Result<(), String> {
+) -> Result<VaultInitResponse, String> {
     let mode = parse_custody(&custody)?;
     let root = vault_root(&app)?;
     let probe = sv_core::probe(&root).map_err(estr)?;
     if probe.initialized {
         return Err("vault already initialised".into());
     }
-    let handle = VaultHandle::bootstrap(&root, mode, passphrase.as_deref()).map_err(estr)?;
+
+    let BootstrapResult {
+        handle,
+        recovery_phrase,
+    } = match VaultHandle::bootstrap(&root, mode, passphrase.as_deref()) {
+        Ok(result) => result,
+        Err(error) => {
+            record_desktop_event(
+                &state,
+                desktop_event(
+                    AuditAction::VaultInit,
+                    AuditDecision::Error,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(error.to_string()),
+                ),
+            );
+            return Err(error.to_string());
+        }
+    };
+
     {
         let mut guard = state.handle.lock().await;
         *guard = Some(handle);
     }
-    start_servers(&state).await;
-    Ok(())
+
+    if let Err(error) = start_servers(&state).await {
+        let mut guard = state.handle.lock().await;
+        *guard = None;
+        record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::VaultInit,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.clone()),
+            ),
+        );
+        return Err(error);
+    }
+
+    record_desktop_event(
+        &state,
+        desktop_event(
+            AuditAction::VaultInit,
+            AuditDecision::Allowed,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    );
+    record_desktop_event(
+        &state,
+        desktop_event(
+            AuditAction::RecoveryIssued,
+            AuditDecision::Allowed,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    );
+    Ok(VaultInitResponse { recovery_phrase })
 }
 
 #[tauri::command]
 async fn vault_unlock(
-    app: tauri::AppHandle,
+    app: AppHandle,
     state: State<'_, VaultState>,
     custody: String,
     passphrase: Option<String>,
 ) -> Result<(), String> {
     let mode = parse_custody(&custody)?;
     let root = vault_root(&app)?;
-    let handle = VaultHandle::unlock(&root, mode, passphrase.as_deref()).map_err(estr)?;
+    let handle = match VaultHandle::unlock(&root, mode, passphrase.as_deref()) {
+        Ok(handle) => handle,
+        Err(error) => {
+            record_desktop_event(
+                &state,
+                desktop_event(
+                    AuditAction::VaultUnlock,
+                    AuditDecision::Error,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(error.to_string()),
+                ),
+            );
+            return Err(error.to_string());
+        }
+    };
     {
         let mut guard = state.handle.lock().await;
         *guard = Some(handle);
     }
-    start_servers(&state).await;
+    if let Err(error) = start_servers(&state).await {
+        let mut guard = state.handle.lock().await;
+        *guard = None;
+        record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::VaultUnlock,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.clone()),
+            ),
+        );
+        return Err(error);
+    }
+    record_desktop_event(
+        &state,
+        desktop_event(
+            AuditAction::VaultUnlock,
+            AuditDecision::Allowed,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+async fn vault_unlock_recovery(
+    app: AppHandle,
+    state: State<'_, VaultState>,
+    phrase: String,
+) -> Result<(), String> {
+    let root = vault_root(&app)?;
+    let handle = match VaultHandle::unlock_with_recovery(&root, &phrase) {
+        Ok(handle) => handle,
+        Err(error) => {
+            record_desktop_event(
+                &state,
+                desktop_event(
+                    AuditAction::VaultUnlockRecovery,
+                    AuditDecision::Error,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(error.to_string()),
+                ),
+            );
+            return Err(error.to_string());
+        }
+    };
+    {
+        let mut guard = state.handle.lock().await;
+        *guard = Some(handle);
+    }
+    if let Err(error) = start_servers(&state).await {
+        let mut guard = state.handle.lock().await;
+        *guard = None;
+        record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::VaultUnlockRecovery,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.clone()),
+            ),
+        );
+        return Err(error);
+    }
+    record_desktop_event(
+        &state,
+        desktop_event(
+            AuditAction::VaultUnlockRecovery,
+            AuditDecision::Allowed,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    );
     Ok(())
 }
 
@@ -159,23 +550,51 @@ async fn vault_lock(state: State<'_, VaultState>) -> Result<(), String> {
     stop_servers(&state).await;
     let mut guard = state.handle.lock().await;
     *guard = None;
+    record_desktop_event(
+        &state,
+        desktop_event(
+            AuditAction::VaultLock,
+            AuditDecision::Allowed,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    );
     Ok(())
-}
-
-async fn with_handle<R, F>(state: &State<'_, VaultState>, f: F) -> Result<R, String>
-where
-    F: FnOnce(&VaultHandle) -> Result<R, String>,
-{
-    let guard = state.handle.lock().await;
-    let h = guard
-        .as_ref()
-        .ok_or_else(|| "vault is locked".to_string())?;
-    f(h)
 }
 
 #[tauri::command]
 async fn vault_list_containers(state: State<'_, VaultState>) -> Result<Vec<ContainerInfo>, String> {
-    with_handle(&state, |h| h.list_containers().map_err(estr)).await
+    let result = with_handle(&state, |handle| handle.list_containers().map_err(estr)).await;
+    match &result {
+        Ok(_) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::ListContainers,
+                AuditDecision::Allowed,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::ListContainers,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -185,16 +604,73 @@ async fn vault_create_container(
     mode: String,
     description: Option<String>,
 ) -> Result<(), String> {
-    let mode = SecurityMode::parse(&mode).map_err(estr)?;
-    with_handle(&state, |h| {
-        h.create_container(&name, mode, description).map_err(estr)
+    let parsed_mode = SecurityMode::parse(&mode).map_err(estr)?;
+    let result = with_handle(&state, |handle| {
+        handle
+            .create_container(&name, parsed_mode, description.clone())
+            .map_err(estr)
     })
-    .await
+    .await;
+    match &result {
+        Ok(_) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::CreateContainer,
+                AuditDecision::Allowed,
+                Some(name.clone()),
+                None,
+                Some(parsed_mode),
+                None,
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::CreateContainer,
+                AuditDecision::Error,
+                Some(name),
+                None,
+                Some(parsed_mode),
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
 async fn vault_delete_container(state: State<'_, VaultState>, name: String) -> Result<(), String> {
-    with_handle(&state, |h| h.delete_container(&name).map_err(estr)).await
+    let mode = container_mode(&state, &name).await;
+    let result = with_handle(&state, |handle| handle.delete_container(&name).map_err(estr)).await;
+    match &result {
+        Ok(_) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::DeleteContainer,
+                AuditDecision::Allowed,
+                Some(name.clone()),
+                None,
+                mode,
+                None,
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::DeleteContainer,
+                AuditDecision::Error,
+                Some(name),
+                None,
+                mode,
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -202,7 +678,35 @@ async fn vault_list_files(
     state: State<'_, VaultState>,
     container: String,
 ) -> Result<Vec<FileInfo>, String> {
-    with_handle(&state, |h| h.list_files(&container).map_err(estr)).await
+    let mode = container_mode(&state, &container).await;
+    let result = with_handle(&state, |handle| handle.list_files(&container).map_err(estr)).await;
+    match &result {
+        Ok(_) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::ListFiles,
+                AuditDecision::Allowed,
+                Some(container.clone()),
+                None,
+                mode,
+                None,
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::ListFiles,
+                AuditDecision::Error,
+                Some(container),
+                None,
+                mode,
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -212,10 +716,41 @@ async fn vault_write_file(
     file_name: String,
     content: Vec<u8>,
 ) -> Result<(), String> {
-    with_handle(&state, |h| {
-        h.write_file(&container, &file_name, &content).map_err(estr)
+    let mode = container_mode(&state, &container).await;
+    let byte_size = content.len();
+    let result = with_handle(&state, |handle| {
+        handle
+            .write_file(&container, &file_name, &content)
+            .map_err(estr)
     })
-    .await
+    .await;
+    match &result {
+        Ok(_) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::WriteFile,
+                AuditDecision::Allowed,
+                Some(container.clone()),
+                Some(file_name.clone()),
+                mode,
+                Some(byte_size),
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::WriteFile,
+                AuditDecision::Error,
+                Some(container),
+                Some(file_name),
+                mode,
+                Some(byte_size),
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -224,10 +759,35 @@ async fn vault_read_file(
     container: String,
     file_name: String,
 ) -> Result<Vec<u8>, String> {
-    with_handle(&state, |h| {
-        h.read_file(&container, &file_name).map_err(estr)
-    })
-    .await
+    let mode = container_mode(&state, &container).await;
+    let result = with_handle(&state, |handle| handle.read_file(&container, &file_name).map_err(estr)).await;
+    match &result {
+        Ok(bytes) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::ReadFile,
+                AuditDecision::Allowed,
+                Some(container.clone()),
+                Some(file_name.clone()),
+                mode,
+                Some(bytes.len()),
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::ReadFile,
+                AuditDecision::Error,
+                Some(container),
+                Some(file_name),
+                mode,
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -236,17 +796,55 @@ async fn vault_delete_file(
     container: String,
     file_name: String,
 ) -> Result<(), String> {
-    with_handle(&state, |h| {
-        h.delete_file(&container, &file_name).map_err(estr)
+    let mode = container_mode(&state, &container).await;
+    let result = with_handle(&state, |handle| {
+        handle.delete_file(&container, &file_name).map_err(estr)
     })
-    .await
+    .await;
+    match &result {
+        Ok(_) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::DeleteFile,
+                AuditDecision::Allowed,
+                Some(container.clone()),
+                Some(file_name.clone()),
+                mode,
+                None,
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::DeleteFile,
+                AuditDecision::Error,
+                Some(container),
+                Some(file_name),
+                mode,
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
+}
+
+#[tauri::command]
+async fn approval_respond(
+    state: State<'_, VaultState>,
+    id: u64,
+    approved: bool,
+    otp: Option<String>,
+) -> Result<(), String> {
+    state.approvals.respond(id, approved, otp).await
 }
 
 #[tauri::command]
 async fn mcp_status(state: State<'_, VaultState>) -> Result<McpStatus, String> {
     let guard = state.servers.lock().await;
     let (running, pairing_secret) = match guard.as_ref() {
-        Some(s) if s.running => (true, Some(s.pairing_secret.clone())),
+        Some(server) if server.running => (true, Some(server.pairing_secret.clone())),
         _ => (false, None),
     };
     Ok(McpStatus {
@@ -259,17 +857,13 @@ async fn mcp_status(state: State<'_, VaultState>) -> Result<McpStatus, String> {
 
 #[tauri::command]
 fn cli_binary_path() -> Result<String, String> {
-    // For v0, resolve based on the running exe location:
-    //   <target>/<profile>/sovereign-vault-desktop[.exe]  (current exe)
-    //   <target>/<profile>/sovereign-vault[.exe]          (CLI binary, sibling)
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let me = std::env::current_exe().map_err(estr)?;
     let dir = me.parent().ok_or_else(|| "no parent dir".to_string())?;
     let exe_suffix = if cfg!(windows) { ".exe" } else { "" };
     let candidate = dir.join(format!("sovereign-vault{exe_suffix}"));
     if candidate.exists() {
         Ok(candidate.to_string_lossy().to_string())
     } else {
-        // Fall back to the workspace target/debug location relative to CWD.
         Err(format!(
             "sovereign-vault binary not found next to {}",
             me.display()
@@ -277,54 +871,39 @@ fn cli_binary_path() -> Result<String, String> {
     }
 }
 
-async fn start_servers(state: &State<'_, VaultState>) {
-    // Stop any previous instance first (idempotent on re-unlock).
+async fn start_servers(state: &State<'_, VaultState>) -> Result<(), String> {
     stop_servers(state).await;
 
-    let secret = match sv_core::fresh_pairing_secret() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[mcp] failed to generate pairing secret: {e}");
-            return;
-        }
-    };
+    let secret = sv_core::fresh_pairing_secret().map_err(estr)?;
+    let ws_addr: SocketAddr = format!("127.0.0.1:{RPC_PORT}").parse().map_err(estr)?;
+    let http_addr: SocketAddr = format!("127.0.0.1:{}", RPC_PORT - 1).parse().map_err(estr)?;
+    let ws_listener = tokio::net::TcpListener::bind(ws_addr).await.map_err(estr)?;
+    let http_listener = tokio::net::TcpListener::bind(http_addr).await.map_err(estr)?;
 
-    let addr: SocketAddr = match format!("127.0.0.1:{RPC_PORT}").parse() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("[mcp] bad addr: {e}");
-            return;
-        }
-    };
+    let audit_root = audit_root(&state)?;
+    let controller = Arc::new(DesktopAccessController {
+        approvals: state.approvals.clone(),
+    });
+    let sink = Arc::new(DesktopAuditSink::new(audit_root));
 
-    // MCP WS.
     let (ws_tx, ws_rx) = oneshot::channel::<()>();
-    let ws_server = Arc::new(sv_mcp::McpServer::new(
-        state.handle.clone() as sv_mcp::SharedVault<VaultHandle>,
-        secret.clone(),
-    ));
+    let ws_server = Arc::new(
+        sv_mcp::McpServer::new(state.handle.clone() as sv_mcp::SharedVault<VaultHandle>, secret.clone())
+            .with_access_controller(controller)
+            .with_audit_sink(sink),
+    );
     let ws_task = spawn(async move {
-        if let Err(e) = ws_server.serve_ws(addr, ws_rx).await {
-            eprintln!("[mcp] WS server stopped: {e}");
+        if let Err(error) = ws_server.serve_ws_listener(ws_listener, ws_rx).await {
+            eprintln!("[mcp] WS server stopped: {error}");
         }
     });
 
-    // HTTP.
-    let http_addr = addr; // same port, but HTTP server uses a separate listener.
-                          // To avoid port collision (only one listener can bind 9944), we put HTTP
-                          // on RPC_PORT+1 and document this. The architecture diagram says both on
-                          // 9944 — that requires multiplexing. For v1.0 we keep it simple: WS on
-                          // 9944, HTTP on 9943 (one below). Update the well-known doc accordingly.
-    let http_addr: SocketAddr = match format!("127.0.0.1:{}", RPC_PORT - 1).parse() {
-        Ok(a) => a,
-        Err(_) => http_addr,
-    };
     let (http_tx, http_rx) = oneshot::channel::<()>();
     let http_secret = secret.clone();
     let http_task = spawn(async move {
         let server = sv_http::HttpServer::new(http_secret);
-        if let Err(e) = server.serve(http_addr, http_rx).await {
-            eprintln!("[http] server stopped: {e}");
+        if let Err(error) = server.serve_listener(http_listener, http_rx).await {
+            eprintln!("[http] server stopped: {error}");
         }
     });
 
@@ -337,22 +916,23 @@ async fn start_servers(state: &State<'_, VaultState>) {
         pairing_secret: secret,
         running: true,
     });
+    Ok(())
 }
 
 async fn stop_servers(state: &State<'_, VaultState>) {
     let mut guard = state.servers.lock().await;
-    if let Some(mut s) = guard.take() {
-        if let Some(tx) = s.ws_tx.take() {
+    if let Some(mut servers) = guard.take() {
+        if let Some(tx) = servers.ws_tx.take() {
             let _ = tx.send(());
         }
-        if let Some(tx) = s.http_tx.take() {
+        if let Some(tx) = servers.http_tx.take() {
             let _ = tx.send(());
         }
-        if let Some(t) = s.ws_task.take() {
-            let _ = t.await;
+        if let Some(task) = servers.ws_task.take() {
+            let _ = task.await;
         }
-        if let Some(t) = s.http_task.take() {
-            let _ = t.await;
+        if let Some(task) = servers.http_task.take() {
+            let _ = task.await;
         }
     }
 }
@@ -364,7 +944,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            app.manage(VaultState::default());
+            app.manage(VaultState::new(app.handle().clone()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -372,6 +952,7 @@ pub fn run() {
             vault_status,
             vault_init,
             vault_unlock,
+            vault_unlock_recovery,
             vault_lock,
             vault_list_containers,
             vault_create_container,
@@ -380,6 +961,7 @@ pub fn run() {
             vault_write_file,
             vault_read_file,
             vault_delete_file,
+            approval_respond,
             mcp_status,
             cli_binary_path,
         ])

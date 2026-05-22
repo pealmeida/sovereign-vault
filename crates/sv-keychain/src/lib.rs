@@ -57,6 +57,8 @@ pub enum CustodyMode {
     OsKeychain,
     /// Wrapped by an Argon2id KEK derived from a user passphrase.
     Passphrase,
+    /// Restored from the recovery bundle for the current session.
+    Recovery,
 }
 
 fn entry() -> Result<keyring::Entry> {

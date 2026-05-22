@@ -91,6 +91,14 @@ pub struct VaultHandle {
     custody: CustodyMode,
 }
 
+/// Result of bootstrapping a brand-new vault.
+pub struct BootstrapResult {
+    /// Live unlocked handle.
+    pub handle: VaultHandle,
+    /// Recovery phrase issued during bootstrap.
+    pub recovery_phrase: String,
+}
+
 impl VaultHandle {
     /// Bootstrap a brand-new vault at `root`.
     ///
@@ -101,7 +109,11 @@ impl VaultHandle {
     ///
     /// Returns an error if the vault already appears initialised (manifest
     /// exists, or the appropriate custody artefact is already present).
-    pub fn bootstrap(root: &Path, custody: CustodyMode, passphrase: Option<&str>) -> Result<Self> {
+    pub fn bootstrap(
+        root: &Path,
+        custody: CustodyMode,
+        passphrase: Option<&str>,
+    ) -> Result<BootstrapResult> {
         if !root.exists() {
             fs::create_dir_all(root)?;
         }
@@ -116,8 +128,13 @@ impl VaultHandle {
                 let key = MasterKey::generate();
                 let b64 = B64.encode(key.as_bytes());
                 sv_keychain::store_master_key(&b64)?;
+                let recovery_key = key.clone();
                 let vault = Vault::open_or_init(root, key)?;
-                Ok(Self { vault, custody })
+                let recovery_phrase = sv_recovery::issue_recovery_phrase(root, &recovery_key)?;
+                Ok(BootstrapResult {
+                    handle: Self { vault, custody },
+                    recovery_phrase,
+                })
             }
             CustodyMode::Passphrase => {
                 let pass = passphrase.ok_or_else(|| {
@@ -133,9 +150,17 @@ impl VaultHandle {
                 let salt = sv_crypto::random_salt()?;
                 fs::write(&salt_path, salt)?;
                 let key = MasterKey::from_passphrase(pass, &salt)?;
+                let recovery_key = key.clone();
                 let vault = Vault::open_or_init(root, key)?;
-                Ok(Self { vault, custody })
+                let recovery_phrase = sv_recovery::issue_recovery_phrase(root, &recovery_key)?;
+                Ok(BootstrapResult {
+                    handle: Self { vault, custody },
+                    recovery_phrase,
+                })
             }
+            CustodyMode::Recovery => Err(CoreError::Misuse(
+                "recovery custody cannot be used for bootstrap".into(),
+            )),
         }
     }
 
@@ -160,7 +185,7 @@ impl VaultHandle {
                 let mut bytes = [0u8; MASTER_KEY_LEN];
                 bytes.copy_from_slice(&raw);
                 let key = MasterKey::from_bytes(bytes);
-                let vault = Vault::open_or_init(root, key)?;
+                let vault = Vault::open_existing(root, key)?;
                 Ok(Self { vault, custody })
             }
             CustodyMode::Passphrase => {
@@ -182,10 +207,23 @@ impl VaultHandle {
                 let mut salt = [0u8; SALT_LEN];
                 salt.copy_from_slice(&salt_raw);
                 let key = MasterKey::from_passphrase(pass, &salt)?;
-                let vault = Vault::open_or_init(root, key)?;
+                let vault = Vault::open_existing(root, key)?;
                 Ok(Self { vault, custody })
             }
+            CustodyMode::Recovery => Err(CoreError::Misuse(
+                "use unlock_with_recovery for recovery custody".into(),
+            )),
         }
+    }
+
+    /// Unlock an existing vault using its persisted recovery bundle.
+    pub fn unlock_with_recovery(root: &Path, phrase: &str) -> Result<Self> {
+        let key = sv_recovery::restore_master_key(root, phrase)?;
+        let vault = Vault::open_existing(root, key)?;
+        Ok(Self {
+            vault,
+            custody: CustodyMode::Recovery,
+        })
     }
 
     /// Custody mode in use for this handle.
@@ -239,6 +277,11 @@ impl VaultHandle {
     pub fn delete_file(&self, container: &str, file_name: &str) -> Result<()> {
         Ok(self.vault.delete_file(container, file_name)?)
     }
+
+    /// Effective mode for a container.
+    pub fn container_mode(&self, container: &str) -> Result<SecurityMode> {
+        Ok(self.vault.container_mode(container)?)
+    }
 }
 
 impl sv_mcp::VaultFacade for VaultHandle {
@@ -272,6 +315,9 @@ impl sv_mcp::VaultFacade for VaultHandle {
         VaultHandle::create_container(self, name, parsed, description.map(|s| s.to_string()))
             .map_err(|e| e.to_string())
     }
+    fn container_mode(&self, container: &str) -> std::result::Result<SecurityMode, String> {
+        VaultHandle::container_mode(self, container).map_err(|e| e.to_string())
+    }
 }
 
 /// Generate a fresh URL-safe-base64 32-byte pairing secret using the OS RNG
@@ -290,6 +336,8 @@ pub struct InitState {
     pub has_passphrase_salt: bool,
     /// True if the OS keychain has a master-key entry.
     pub has_keychain_entry: bool,
+    /// True if the recovery bundle exists.
+    pub has_recovery_bundle: bool,
 }
 
 /// Probe the on-disk + keychain state of a vault root.
@@ -300,6 +348,7 @@ pub fn probe(root: &Path) -> Result<InitState> {
         initialized: manifest.exists(),
         has_passphrase_salt: salt.exists(),
         has_keychain_entry: sv_keychain::load_master_key()?.is_some(),
+        has_recovery_bundle: sv_recovery::has_recovery_bundle(root),
     })
 }
 
