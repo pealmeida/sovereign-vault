@@ -24,7 +24,10 @@
   "dependencies": {
     "@fontsource/fira-mono": "^5.2.7",
     "@fontsource/space-grotesk": "^5.2.10",
+    "dompurify": "^3.4.5",
+    "highlight.js": "^11.11.1",
     "lucide-svelte": "^1.0.1",
+    "marked": "^18.0.4",
     "svelte-spa-router": "^5.1.0"
   }
 }

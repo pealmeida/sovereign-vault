@@ -360,12 +360,39 @@ pre {
 
 .ops-primary,
 .panel-card,
-.folder-card,
-.modal-shell {
+.folder-card {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface);
   backdrop-filter: blur(18px);
+}
+
+.modal-shell {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: rgba(4, 8, 16, 0.72);
+  backdrop-filter: blur(6px);
+  animation: modal-fade-in 140ms ease-out;
+}
+
+.modal-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-strong);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
+  max-width: 100%;
+  max-height: 100%;
+  overflow: auto;
+}
+
+@keyframes modal-fade-in {
+  from { opacity: 0; transform: scale(0.98); }
+  to { opacity: 1; transform: scale(1); }
 }
 
 .ops-primary,
@@ -699,24 +726,6 @@ pre {
   border: 1px solid rgba(255, 255, 255, 0.04);
   border-radius: var(--radius-sm);
   background: rgba(255, 255, 255, 0.02);
-}
-
-.modal-backdrop {
-  position: fixed;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 1.25rem;
-  background: rgba(3, 7, 15, 0.72);
-  backdrop-filter: blur(12px);
-  z-index: 40;
-}
-
-.modal-shell {
-  width: min(100%, 1100px);
-  padding: 1.25rem;
-  background: var(--surface-strong);
 }
 
 .import-shell {
