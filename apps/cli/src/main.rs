@@ -7,7 +7,7 @@
 //!
 //! The proxy is the binary that Claude Desktop, Cursor, Continue.dev, etc.
 //! spawn as a subprocess. It fetches the per-launch pairing secret from
-//! `http://127.0.0.1:9944/.well-known/mcp-pairing`, opens the WS connection,
+//! `http://127.0.0.1:9943/.well-known/mcp-pairing`, opens the WS connection,
 //! sends `vault.pair { secret }`, and then forwards line-delimited JSON-RPC
 //! frames in both directions.
 

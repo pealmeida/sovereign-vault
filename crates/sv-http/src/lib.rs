@@ -61,13 +61,28 @@ impl HttpServer {
     }
 
     /// Bind on `addr` (must be loopback) and serve until `shutdown` is signalled.
-    pub async fn serve(&self, addr: SocketAddr, mut shutdown: oneshot::Receiver<()>) -> Result<()> {
+    pub async fn serve(&self, addr: SocketAddr, shutdown: oneshot::Receiver<()>) -> Result<()> {
         if !addr.ip().is_loopback() {
             return Err(HttpError::Forbidden);
         }
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| HttpError::Transport(format!("bind {addr}: {e}")))?;
+        self.serve_listener(listener, shutdown).await
+    }
+
+    /// Serve using a pre-bound listener.
+    pub async fn serve_listener(
+        &self,
+        listener: tokio::net::TcpListener,
+        mut shutdown: oneshot::Receiver<()>,
+    ) -> Result<()> {
+        let addr = listener
+            .local_addr()
+            .map_err(|e| HttpError::Transport(e.to_string()))?;
+        if !addr.ip().is_loopback() {
+            return Err(HttpError::Forbidden);
+        }
         tracing::info!(%addr, "HTTP listening");
         let secret = self.pairing_secret.clone();
         loop {

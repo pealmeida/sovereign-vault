@@ -100,6 +100,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub enum SecurityMode {
     /// Direct access (no HITL).
     Direct,
+    /// Human approval required.
+    Approval,
     /// One-time-password approval required.
     Otp,
     /// Anonymized access (PII scrubbed).
@@ -115,6 +117,7 @@ impl SecurityMode {
     pub fn parse(s: &str) -> Result<Self> {
         match s.to_ascii_uppercase().as_str() {
             "DIRECT" => Ok(Self::Direct),
+            "APPROVAL" => Ok(Self::Approval),
             "OTP" => Ok(Self::Otp),
             "ANONYMIZED" => Ok(Self::Anonymized),
             "ZKP" => Ok(Self::Zkp),
@@ -129,6 +132,7 @@ impl SecurityMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Direct => "DIRECT",
+            Self::Approval => "APPROVAL",
             Self::Otp => "OTP",
             Self::Anonymized => "ANONYMIZED",
             Self::Zkp => "ZKP",
@@ -235,6 +239,38 @@ impl Vault {
         })
     }
 
+    /// Open an existing vault at `root`.
+    ///
+    /// Refuses to create missing directories or manifests. Use this when a
+    /// caller expects existing data and wants missing state treated as an
+    /// error instead of silently bootstrapping a new vault.
+    pub fn open_existing(root: &Path, master: MasterKey) -> Result<Self> {
+        if !root.exists() {
+            return Err(StorageError::State(format!(
+                "vault root does not exist: {}",
+                root.display()
+            )));
+        }
+        if !root.is_dir() {
+            return Err(StorageError::State(format!(
+                "vault root is not a directory: {}",
+                root.display()
+            )));
+        }
+        let manifest_path = root.join(MANIFEST_FILE);
+        if !manifest_path.exists() {
+            return Err(StorageError::State(format!(
+                "vault manifest missing: {}",
+                manifest_path.display()
+            )));
+        }
+        let _ = read_manifest(root)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            master,
+        })
+    }
+
     /// Path to the vault root directory.
     pub fn root(&self) -> &Path {
         &self.root
@@ -243,6 +279,23 @@ impl Vault {
     /// Read the manifest from disk.
     pub fn manifest(&self) -> Result<Manifest> {
         read_manifest(&self.root)
+    }
+
+    /// Resolve the effective security mode of a container.
+    pub fn container_mode(&self, container: &str) -> Result<SecurityMode> {
+        validate_container_name(container)?;
+        let dir = self.root.join(container);
+        if !dir.exists() {
+            return Err(StorageError::State(format!(
+                "container does not exist: {container}"
+            )));
+        }
+        let manifest = self.manifest()?;
+        let rule_index = container_rule_index(&manifest);
+        Ok(rule_index
+            .get(container)
+            .map(|r| r.mode)
+            .unwrap_or(manifest.default_mode))
     }
 
     /// List containers inside the vault.
@@ -327,12 +380,7 @@ impl Vault {
                 "container does not exist: {container}"
             )));
         }
-        let manifest = self.manifest()?;
-        let rule_index = container_rule_index(&manifest);
-        let mode = rule_index
-            .get(container)
-            .map(|r| r.mode)
-            .unwrap_or(manifest.default_mode);
+        let mode = self.container_mode(container)?;
         let mut out = Vec::new();
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
@@ -615,5 +663,21 @@ mod tests {
             .unwrap();
         assert!(v.write_file("ok", "../escape", b"x").is_err());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_existing_rejects_missing_manifest() {
+        let root = tmp_dir("existing");
+        fs::create_dir_all(&root).unwrap();
+        let key = MasterKey::generate();
+
+        assert!(Vault::open_existing(&root, key).is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parses_approval_mode() {
+        assert_eq!(SecurityMode::parse("APPROVAL").unwrap(), SecurityMode::Approval);
     }
 }
