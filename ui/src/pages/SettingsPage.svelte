@@ -10,6 +10,35 @@
   let revealPhrase = $state(false);
   let recoveryData = $state<string | null>(null);
 
+  let currentPass = $state('');
+  let newPass = $state('');
+  let rotatePass = $state('');
+
+  const isPassphrase = $derived(vaultStore.status?.custody === 'Passphrase');
+
+  async function changePassphrase() {
+    try {
+      await vaultStore.changePassphrase(currentPass, newPass);
+      currentPass = '';
+      newPass = '';
+      toastStore.setNotice('Passphrase changed. Recovery phrase is unaffected.');
+    } catch (e) {
+      toastStore.setError(e);
+    }
+  }
+
+  async function rotateKey() {
+    try {
+      const phrase = await vaultStore.rotateKey(isPassphrase ? rotatePass : null);
+      rotatePass = '';
+      recoveryData = phrase;
+      revealPhrase = true;
+      toastStore.setNotice('Key rotated. A new recovery phrase was issued — save it.');
+    } catch (e) {
+      toastStore.setError(e);
+    }
+  }
+
   onMount(async () => {
     try {
       appVersion = await vaultStore.appVersion();
@@ -79,6 +108,10 @@
           <span>Recovery bundle</span>
           <strong>{vaultStore.status?.has_recovery_bundle ? 'Present' : 'None'}</strong>
         </div>
+        <div class="detail-row">
+          <span>Key hierarchy</span>
+          <strong>{vaultStore.status?.has_keyring ? 'Keyring (rotatable)' : 'Legacy (migrates on unlock)'}</strong>
+        </div>
       </div>
 
       <div style="display:flex;gap:0.75rem;margin-top:1rem;flex-wrap:wrap">
@@ -96,6 +129,67 @@
           color:var(--accent);white-space:pre-wrap;word-break:break-all
         ">{recoveryData}</pre>
         <CopyButton value={recoveryData} label="Copy phrase" />
+      {/if}
+    </article>
+
+    <!-- Key management -->
+    <article class="panel-card">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Key management</p>
+          <h3>Passphrase &amp; rotation</h3>
+        </div>
+      </div>
+
+      {#if !vaultStore.status?.unlocked}
+        <div class="empty-state">Unlock the vault to manage keys.</div>
+      {:else}
+        <div class="settings-stack">
+          {#if isPassphrase}
+            <p class="eyebrow">Change passphrase</p>
+            <input
+              class="text-input"
+              type="password"
+              placeholder="Current passphrase"
+              bind:value={currentPass}
+              autocomplete="current-password"
+            />
+            <input
+              class="text-input"
+              type="password"
+              placeholder="New passphrase"
+              bind:value={newPass}
+              autocomplete="new-password"
+            />
+            <button
+              class="primary-button"
+              disabled={vaultStore.loading || !currentPass || !newPass}
+              onclick={changePassphrase}
+            >
+              Change passphrase
+            </button>
+            <p style="font-size:0.8rem;opacity:0.7;margin:0.25rem 0 0">Re-wraps the data key under the new passphrase. Files are not re-encrypted; the recovery phrase still works.</p>
+          {/if}
+
+          <p class="eyebrow" style="margin-top:0.5rem">Rotate data-encryption key</p>
+          {#if isPassphrase}
+            <input
+              class="text-input"
+              type="password"
+              placeholder="Confirm passphrase to rotate"
+              bind:value={rotatePass}
+              autocomplete="current-password"
+            />
+          {/if}
+          <button
+            class="ghost-button"
+            disabled={vaultStore.loading || (isPassphrase && !rotatePass)}
+            onclick={rotateKey}
+          >
+            Rotate key
+          </button>
+          <p style="font-size:0.8rem;opacity:0.7;margin:0.25rem 0 0">Generates a new key, re-encrypts every file, and issues a new recovery phrase. The old recovery phrase stops working.</p>
+        </div>
       {/if}
     </article>
 

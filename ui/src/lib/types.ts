@@ -23,6 +23,7 @@ export interface VaultStatus {
   has_keychain_entry: boolean;
   has_passphrase_salt: boolean;
   has_recovery_bundle: boolean;
+  has_keyring: boolean;
 }
 
 export interface VaultInitResponse {

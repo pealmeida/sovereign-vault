@@ -163,6 +163,7 @@ struct VaultStatus {
     has_keychain_entry: bool,
     has_passphrase_salt: bool,
     has_recovery_bundle: bool,
+    has_keyring: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -332,6 +333,7 @@ async fn vault_status(
         has_keychain_entry: probe.has_keychain_entry,
         has_passphrase_salt: probe.has_passphrase_salt,
         has_recovery_bundle: probe.has_recovery_bundle,
+        has_keyring: probe.has_keyring,
     })
 }
 
@@ -563,6 +565,69 @@ async fn vault_lock(state: State<'_, VaultState>) -> Result<(), String> {
         ),
     );
     Ok(())
+}
+
+#[tauri::command]
+async fn vault_change_passphrase(
+    app: AppHandle,
+    state: State<'_, VaultState>,
+    current: String,
+    new: String,
+) -> Result<(), String> {
+    let root = vault_root(&app)?;
+    let result =
+        with_handle(&state, |handle| handle.change_passphrase(&root, &current, &new).map_err(estr))
+            .await;
+    record_desktop_event(
+        &state,
+        desktop_event(
+            AuditAction::PassphraseChanged,
+            if result.is_ok() {
+                AuditDecision::Allowed
+            } else {
+                AuditDecision::Error
+            },
+            None,
+            None,
+            None,
+            None,
+            result.as_ref().err().cloned(),
+        ),
+    );
+    result
+}
+
+#[tauri::command]
+async fn vault_rotate_key(
+    app: AppHandle,
+    state: State<'_, VaultState>,
+    passphrase: Option<String>,
+) -> Result<VaultInitResponse, String> {
+    let root = vault_root(&app)?;
+    let result = {
+        let mut guard = state.handle.lock().await;
+        match guard.as_mut() {
+            Some(handle) => handle.rotate_key(&root, passphrase.as_deref()).map_err(estr),
+            None => Err("vault is locked".to_string()),
+        }
+    };
+    record_desktop_event(
+        &state,
+        desktop_event(
+            AuditAction::KeyRotated,
+            if result.is_ok() {
+                AuditDecision::Allowed
+            } else {
+                AuditDecision::Error
+            },
+            None,
+            None,
+            None,
+            None,
+            result.as_ref().err().cloned(),
+        ),
+    );
+    result.map(|recovery_phrase| VaultInitResponse { recovery_phrase })
 }
 
 #[tauri::command]
@@ -954,6 +1019,8 @@ pub fn run() {
             vault_unlock,
             vault_unlock_recovery,
             vault_lock,
+            vault_change_passphrase,
+            vault_rotate_key,
             vault_list_containers,
             vault_create_container,
             vault_delete_container,
