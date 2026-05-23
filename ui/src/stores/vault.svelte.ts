@@ -52,6 +52,27 @@ export const vaultStore = {
     await this.refresh();
   },
 
+  async changePassphrase(current: string, next: string) {
+    loading = true;
+    try {
+      await invoke<void>('vault_change_passphrase', { current, new: next });
+    } finally {
+      loading = false;
+    }
+  },
+
+  async rotateKey(passphrase: string | null) {
+    loading = true;
+    try {
+      const res = await invoke<VaultInitResponse>('vault_rotate_key', { passphrase });
+      recoveryPhrase = res.recovery_phrase;
+      await this.refresh();
+      return res.recovery_phrase;
+    } finally {
+      loading = false;
+    }
+  },
+
   async appVersion(): Promise<string> {
     return invoke<string>('app_version');
   },

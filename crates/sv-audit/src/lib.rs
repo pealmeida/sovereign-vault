@@ -74,6 +74,10 @@ pub enum AuditAction {
     VaultLock,
     /// Recovery phrase issued.
     RecoveryIssued,
+    /// Vault passphrase changed (KEK re-derived, DEK re-wrapped).
+    PassphraseChanged,
+    /// Data-encryption key rotated.
+    KeyRotated,
     /// List all containers.
     ListContainers,
     /// List files inside a container.
