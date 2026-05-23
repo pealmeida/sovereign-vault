@@ -1,6 +1,5 @@
 <script lang="ts">
   import { X, Download, FileWarning, FileText } from 'lucide-svelte';
-  import { onDestroy } from 'svelte';
   import { marked } from 'marked';
   import DOMPurify from 'dompurify';
   import hljs from 'highlight.js/lib/common';
@@ -36,13 +35,6 @@
   let htmlContent = $state<string | null>(null);
   let objectUrl = $state<string | null>(null);
 
-  function revokeUrl() {
-    if (objectUrl) {
-      URL.revokeObjectURL(objectUrl);
-      objectUrl = null;
-    }
-  }
-
   function buildObjectUrl(bytes: Uint8Array, mime: string): string {
     // Copy into a fresh ArrayBuffer so Blob accepts it cleanly across all envs.
     const blob = new Blob([new Uint8Array(bytes).buffer], { type: mime });
@@ -76,21 +68,26 @@
   }
 
   $effect(() => {
-    // Re-run when file changes
+    // Read file.name & container; everything else stays untracked to avoid
+    // re-entry loops when we later write to objectUrl/rawBytes/etc.
+    const currentName = file.name;
+    const currentContainer = container;
+    const currentInfo = detectFileType(currentName);
+
+    let cancelled = false;
+    let createdUrl: string | null = null;
+
     loading = true;
     tooLarge = false;
     textContent = null;
     htmlContent = null;
-    revokeUrl();
+    objectUrl = null;
     rawBytes = null;
 
-    const currentName = file.name;
-
     fileStore
-      .read(container, currentName)
+      .read(currentContainer, currentName)
       .then((bytes) => {
-        // Bail if effect re-ran for a different file mid-flight
-        if (file.name !== currentName) return;
+        if (cancelled) return;
 
         rawBytes = bytes;
 
@@ -100,15 +97,12 @@
           return;
         }
 
-        const kind = info.kind;
+        const kind = currentInfo.kind;
 
         if (kind === 'pdf' || kind === 'image' || kind === 'video' || kind === 'audio') {
-          objectUrl = buildObjectUrl(bytes, info.mime);
-        } else if (
-          kind === 'markdown' ||
-          kind === 'code' ||
-          kind === 'text'
-        ) {
+          createdUrl = buildObjectUrl(bytes, currentInfo.mime);
+          objectUrl = createdUrl;
+        } else if (kind === 'markdown' || kind === 'code' || kind === 'text') {
           if (bytes.length > MAX_TEXT_BYTES) {
             tooLarge = true;
           } else {
@@ -117,7 +111,7 @@
             if (kind === 'markdown') {
               htmlContent = renderMarkdown(text);
             } else if (kind === 'code') {
-              htmlContent = renderCode(text, info.language);
+              htmlContent = renderCode(text, currentInfo.language);
             }
           }
         }
@@ -125,13 +119,16 @@
         loading = false;
       })
       .catch((e) => {
-        if (file.name !== currentName) return;
+        if (cancelled) return;
         toastStore.setError(e);
         loading = false;
       });
-  });
 
-  onDestroy(revokeUrl);
+    return () => {
+      cancelled = true;
+      if (createdUrl) URL.revokeObjectURL(createdUrl);
+    };
+  });
 
   async function doDownload() {
     if (!rawBytes) return;
