@@ -19,6 +19,7 @@ futures-util      = { workspace = true }
 tracing           = { workspace = true }
 base64            = "0.22"
 async-trait       = "0.1"
+getrandom         = "0.2"
 
 [dev-dependencies]
 sv-crypto    = { workspace = true }
