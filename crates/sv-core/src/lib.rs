@@ -232,6 +232,15 @@ impl VaultHandle {
         self.vault.root()
     }
 
+    /// Derive the keyed HMAC key used to hash sensitive audit-log fields.
+    ///
+    /// Limitation: this key is derived from the ACTIVE DEK, so after a key
+    /// rotation it changes and `hmac_value` only matches entries written
+    /// under the current key.
+    pub fn audit_hmac_key(&self) -> [u8; 32] {
+        self.vault.derive_subkey(b"sv-audit-hmac-v1")
+    }
+
     // ---- storage facade --------------------------------------------------
 
     /// List all containers.

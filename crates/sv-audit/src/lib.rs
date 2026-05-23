@@ -27,9 +27,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Audit filename inside the vault root.
 pub const AUDIT_FILE: &str = "audit.jsonl";
@@ -190,6 +193,17 @@ fn hash_record(prev: &str, event: &AuditEvent) -> Result<String> {
     Ok(hex_sha256(&bytes))
 }
 
+fn hmac_hex(key: &[u8; 32], plaintext: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(plaintext.as_bytes());
+    let tag = mac.finalize().into_bytes();
+    let mut out = String::with_capacity(64);
+    for b in tag {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 fn hex_sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
@@ -242,6 +256,7 @@ pub struct AuditLog {
     path: PathBuf,
     max_bytes: u64,
     head: Mutex<String>,
+    hmac_key: Option<[u8; 32]>,
 }
 
 impl AuditLog {
@@ -260,12 +275,41 @@ impl AuditLog {
             path,
             max_bytes,
             head: Mutex::new(head),
+            hmac_key: None,
         }
+    }
+
+    /// Build an audit log that HMAC-SHA256s the sensitive `container` and
+    /// `file_name` field values (keyed by `hmac_key`) before persisting, so
+    /// the log does not leak plaintext container/file names. All other fields
+    /// and the hash chain are unchanged.
+    pub fn with_hmac_key(root: &Path, hmac_key: [u8; 32]) -> Self {
+        let mut log = Self::with_max_bytes(root, DEFAULT_MAX_BYTES);
+        log.hmac_key = Some(hmac_key);
+        log
     }
 
     /// Path to the active log file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Keyed HMAC-SHA256 (hex) of `plaintext`, or `None` when no key is set.
+    ///
+    /// Used to match a known container/file name against hashed log entries.
+    pub fn hmac_value(&self, plaintext: &str) -> Option<String> {
+        self.hmac_key.map(|key| hmac_hex(&key, plaintext))
+    }
+
+    /// Apply the HMAC transform to an event's sensitive fields, if keyed.
+    fn redact(&self, event: &AuditEvent) -> AuditEvent {
+        let Some(key) = self.hmac_key else {
+            return event.clone();
+        };
+        let mut event = event.clone();
+        event.container = event.container.as_deref().map(|v| hmac_hex(&key, v));
+        event.file_name = event.file_name.as_deref().map(|v| hmac_hex(&key, v));
+        event
     }
 
     /// Append one event and flush it durably, chaining it to the prior line.
@@ -285,7 +329,7 @@ impl AuditLog {
 
         let rec = AuditRecord {
             prev_sha256: head.clone(),
-            event: event.clone(),
+            event: self.redact(event),
         };
         let bytes = serde_json::to_vec(&rec)?;
         let this = hex_sha256(&bytes);
@@ -551,6 +595,51 @@ mod tests {
         let raw = std::fs::read_to_string(log.path()).unwrap();
         let first: AuditRecord = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
         assert_eq!(first.prev_sha256, GENESIS_PREV);
+        assert!(log.verify_chain().unwrap().ok);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn sensitive_ev() -> AuditEvent {
+        let mut e = AuditEvent::new(AuditAction::ReadFile, AuditDecision::Allowed, "test");
+        e.container = Some("secret-container".into());
+        e.file_name = Some("passwords.txt".into());
+        e.byte_size = Some(42);
+        e
+    }
+
+    #[test]
+    fn hmac_key_hashes_sensitive_fields() {
+        let root = tmp_dir("hmac");
+        std::fs::create_dir_all(&root).unwrap();
+        let log = AuditLog::with_hmac_key(&root, [5u8; 32]);
+        log.record(&sensitive_ev()).unwrap();
+
+        let raw = std::fs::read_to_string(log.path()).unwrap();
+        let rec: AuditRecord = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(rec.event.container, log.hmac_value("secret-container"));
+        assert_eq!(rec.event.file_name, log.hmac_value("passwords.txt"));
+        assert_ne!(rec.event.container.as_deref(), Some("secret-container"));
+        assert_ne!(rec.event.file_name.as_deref(), Some("passwords.txt"));
+        // Untouched fields survive.
+        assert_eq!(rec.event.byte_size, Some(42));
+        assert!(log.verify_chain().unwrap().ok);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_key_leaves_fields_plaintext() {
+        let root = tmp_dir("nohmac");
+        std::fs::create_dir_all(&root).unwrap();
+        let log = AuditLog::new(&root);
+        assert!(log.hmac_value("x").is_none());
+        log.record(&sensitive_ev()).unwrap();
+
+        let raw = std::fs::read_to_string(log.path()).unwrap();
+        let rec: AuditRecord = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(rec.event.container.as_deref(), Some("secret-container"));
+        assert_eq!(rec.event.file_name.as_deref(), Some("passwords.txt"));
         assert!(log.verify_chain().unwrap().ok);
 
         let _ = std::fs::remove_dir_all(&root);

@@ -24,7 +24,9 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
+use hkdf::Hkdf;
 use rand::RngCore;
+use sha2::Sha256;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -102,6 +104,19 @@ impl std::fmt::Debug for MasterKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("MasterKey(REDACTED)")
     }
+}
+
+/// Derive a 32-byte subkey from `key` using HKDF-SHA256.
+///
+/// The input keying material is `key.as_bytes()`, no salt is used, and
+/// `context` is passed as the HKDF `info` parameter so callers can derive
+/// independent subkeys for distinct purposes from the same master key.
+pub fn derive_subkey(key: &MasterKey, context: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, key.as_bytes());
+    let mut out = [0u8; 32];
+    hk.expand(context, &mut out)
+        .expect("32 is a valid HKDF-SHA256 output length");
+    out
 }
 
 /// Generate `n` cryptographically secure random bytes.
@@ -196,6 +211,16 @@ mod tests {
     fn open_rejects_truncated_buffer() {
         let key = MasterKey::generate();
         assert!(open(&key, &[0u8; 4], b"x").is_err());
+    }
+
+    #[test]
+    fn derive_subkey_is_deterministic_and_context_separated() {
+        let key = MasterKey::from_bytes([3u8; MASTER_KEY_LEN]);
+        let a = derive_subkey(&key, b"sv-audit-hmac-v1");
+        let b = derive_subkey(&key, b"sv-audit-hmac-v1");
+        assert_eq!(a, b);
+        let c = derive_subkey(&key, b"some-other-context");
+        assert_ne!(a, c);
     }
 
     #[test]

@@ -20,6 +20,19 @@ fn tmp_dir(label: &str) -> PathBuf {
 }
 
 #[test]
+fn audit_hmac_key_stable_across_unlocks() {
+    let root = tmp_dir("audithmac");
+    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    let k1 = boot.handle.audit_hmac_key();
+    drop(boot.handle);
+
+    let h = VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    let k2 = h.audit_hmac_key();
+    assert_eq!(k1, k2);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn passphrase_bootstrap_then_unlock_roundtrip() {
     let root = tmp_dir("bootstrap");
     let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();

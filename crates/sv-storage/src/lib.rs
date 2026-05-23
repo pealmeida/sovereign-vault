@@ -519,6 +519,18 @@ impl Vault {
         self.active_version
     }
 
+    /// Derive a 32-byte subkey from the active DEK for a given context.
+    ///
+    /// Does not expose the DEK itself; callers receive only the derived
+    /// subkey (HKDF-SHA256, see [`sv_crypto::derive_subkey`]).
+    pub fn derive_subkey(&self, context: &[u8]) -> [u8; 32] {
+        let active_key = self
+            .keys
+            .get(&self.active_version)
+            .expect("active key version is always present (checked at open)");
+        sv_crypto::derive_subkey(active_key, context)
+    }
+
     /// Re-seal a file under the active DEK if it is sealed under an older
     /// version. Returns `true` if the file was rewrapped, `false` if it was
     /// already at the active version. Used to migrate files forward after a
@@ -773,6 +785,25 @@ mod tests {
         assert!(!v.rewrap_file("c", "old.txt").unwrap());
         assert_eq!(v.read_file("c", "old.txt").unwrap(), b"v1-data");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn derive_subkey_matches_for_same_active_key() {
+        let root_a = tmp_dir("subkey-a");
+        let root_b = tmp_dir("subkey-b");
+        let key = MasterKey::from_bytes([9u8; 32]);
+        let va = Vault::open_or_init(&root_a, key.clone()).unwrap();
+        let vb = Vault::open_or_init(&root_b, key).unwrap();
+        assert_eq!(
+            va.derive_subkey(b"sv-audit-hmac-v1"),
+            vb.derive_subkey(b"sv-audit-hmac-v1")
+        );
+        assert_ne!(
+            va.derive_subkey(b"sv-audit-hmac-v1"),
+            va.derive_subkey(b"other")
+        );
+        let _ = fs::remove_dir_all(&root_a);
+        let _ = fs::remove_dir_all(&root_b);
     }
 
     #[test]
