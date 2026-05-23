@@ -193,17 +193,20 @@ struct ApprovalPrompt {
 
 struct DesktopAuditSink {
     root: PathBuf,
+    hmac_key: [u8; 32],
 }
 
 impl DesktopAuditSink {
-    fn new(root: PathBuf) -> Self {
-        Self { root }
+    fn new(root: PathBuf, hmac_key: [u8; 32]) -> Self {
+        Self { root, hmac_key }
     }
 }
 
 impl sv_mcp::AuditSink for DesktopAuditSink {
     fn record(&self, event: AuditEvent) -> Result<(), String> {
-        AuditLog::new(&self.root).record(&event).map_err(estr)
+        AuditLog::with_hmac_key(&self.root, self.hmac_key)
+            .record(&event)
+            .map_err(estr)
     }
 }
 
@@ -946,10 +949,17 @@ async fn start_servers(state: &State<'_, VaultState>) -> Result<(), String> {
     let http_listener = tokio::net::TcpListener::bind(http_addr).await.map_err(estr)?;
 
     let audit_root = audit_root(&state)?;
+    let audit_hmac_key = {
+        let guard = state.handle.lock().await;
+        let handle = guard
+            .as_ref()
+            .ok_or_else(|| "vault is locked".to_string())?;
+        handle.audit_hmac_key()
+    };
     let controller = Arc::new(DesktopAccessController {
         approvals: state.approvals.clone(),
     });
-    let sink = Arc::new(DesktopAuditSink::new(audit_root));
+    let sink = Arc::new(DesktopAuditSink::new(audit_root, audit_hmac_key));
 
     let (ws_tx, ws_rx) = oneshot::channel::<()>();
     let ws_server = Arc::new(
