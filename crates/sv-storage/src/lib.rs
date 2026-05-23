@@ -209,19 +209,23 @@ pub struct FileInfo {
 
 /// Open vault handle.
 ///
-/// Owns the in-memory master key and the path to the vault root. Drop the
-/// handle to zeroize the key.
+/// Owns one or more in-memory data-encryption keys (DEKs) keyed by version,
+/// plus the path to the vault root. Files are sealed with the *active* DEK
+/// and recorded with that version in the envelope header; reads select the
+/// DEK matching the file's recorded version, so files written before a key
+/// rotation keep decrypting. Drop the handle to zeroize the keys.
 pub struct Vault {
     root: PathBuf,
-    master: MasterKey,
+    keys: BTreeMap<u32, MasterKey>,
+    active_version: u32,
 }
 
 impl Vault {
     /// Open an existing vault or initialise an empty one at `root`.
     ///
     /// Creates the directory and an empty `manifest.json` if needed. Does
-    /// **not** generate or persist a master key — that is the caller's job
-    /// (see `sv-core`).
+    /// **not** generate or persist a key — that is the caller's job (see
+    /// `sv-core`). The supplied key becomes the active DEK at [`KEY_VERSION`].
     pub fn open_or_init(root: &Path, master: MasterKey) -> Result<Self> {
         if !root.exists() {
             fs::create_dir_all(root)?;
@@ -235,7 +239,8 @@ impl Vault {
         }
         Ok(Self {
             root: root.to_path_buf(),
-            master,
+            keys: single_key_map(master),
+            active_version: KEY_VERSION,
         })
     }
 
@@ -243,8 +248,20 @@ impl Vault {
     ///
     /// Refuses to create missing directories or manifests. Use this when a
     /// caller expects existing data and wants missing state treated as an
-    /// error instead of silently bootstrapping a new vault.
+    /// error instead of silently bootstrapping a new vault. The supplied key
+    /// becomes the active DEK at [`KEY_VERSION`].
     pub fn open_existing(root: &Path, master: MasterKey) -> Result<Self> {
+        Self::open_existing_with_keys(root, single_key_map(master), KEY_VERSION)
+    }
+
+    /// Open an existing vault with an explicit version→DEK map and active
+    /// version. Used after key rotation, where multiple DEK versions must be
+    /// available so files sealed under older versions remain readable.
+    pub fn open_existing_with_keys(
+        root: &Path,
+        keys: BTreeMap<u32, MasterKey>,
+        active_version: u32,
+    ) -> Result<Self> {
         if !root.exists() {
             return Err(StorageError::State(format!(
                 "vault root does not exist: {}",
@@ -264,10 +281,16 @@ impl Vault {
                 manifest_path.display()
             )));
         }
+        if !keys.contains_key(&active_version) {
+            return Err(StorageError::State(format!(
+                "active key version {active_version} not present in key map"
+            )));
+        }
         let _ = read_manifest(root)?;
         Ok(Self {
             root: root.to_path_buf(),
-            master,
+            keys,
+            active_version,
         })
     }
 
@@ -422,11 +445,17 @@ impl Vault {
         }
         let final_path = dir.join(format!("{file_name}{FILE_SUFFIX}"));
         let aad = aad_for(container, file_name);
-        let sealed = aead_seal(&self.master, plaintext, aad.as_bytes())?;
+        let active_key = self.keys.get(&self.active_version).ok_or_else(|| {
+            StorageError::State(format!(
+                "active key version {} not present",
+                self.active_version
+            ))
+        })?;
+        let sealed = aead_seal(active_key, plaintext, aad.as_bytes())?;
 
         let mut envelope = Vec::with_capacity(1 + 4 + sealed.len());
         envelope.push(FORMAT_VERSION);
-        envelope.extend_from_slice(&KEY_VERSION.to_be_bytes());
+        envelope.extend_from_slice(&self.active_version.to_be_bytes());
         envelope.extend_from_slice(&sealed);
 
         let tmp_path = dir.join(format!(".{file_name}{FILE_SUFFIX}.tmp"));
@@ -460,14 +489,14 @@ impl Vault {
         let mut kv = [0u8; 4];
         kv.copy_from_slice(&raw[1..5]);
         let key_version = u32::from_be_bytes(kv);
-        if key_version != KEY_VERSION {
-            return Err(StorageError::State(format!(
-                "unsupported key_version: {key_version}"
-            )));
-        }
+        let key = self.keys.get(&key_version).ok_or_else(|| {
+            StorageError::State(format!(
+                "no key available for key_version {key_version}"
+            ))
+        })?;
         let sealed = &raw[5..];
         let aad = aad_for(container, file_name);
-        let pt = aead_open(&self.master, sealed, aad.as_bytes())?;
+        let pt = aead_open(key, sealed, aad.as_bytes())?;
         Ok(pt)
     }
 
@@ -484,6 +513,41 @@ impl Vault {
         }
         Ok(())
     }
+
+    /// The active DEK version files are currently sealed under.
+    pub fn active_version(&self) -> u32 {
+        self.active_version
+    }
+
+    /// Re-seal a file under the active DEK if it is sealed under an older
+    /// version. Returns `true` if the file was rewrapped, `false` if it was
+    /// already at the active version. Used to migrate files forward after a
+    /// key rotation without forcing a bulk rewrite up front.
+    pub fn rewrap_file(&self, container: &str, file_name: &str) -> Result<bool> {
+        validate_container_name(container)?;
+        validate_file_name(file_name)?;
+        let path = self
+            .root
+            .join(container)
+            .join(format!("{file_name}{FILE_SUFFIX}"));
+        let raw = fs::read(&path)?;
+        if raw.len() >= 5 {
+            let mut kv = [0u8; 4];
+            kv.copy_from_slice(&raw[1..5]);
+            if u32::from_be_bytes(kv) == self.active_version {
+                return Ok(false);
+            }
+        }
+        let plaintext = self.read_file(container, file_name)?;
+        self.write_file(container, file_name, &plaintext)?;
+        Ok(true)
+    }
+}
+
+fn single_key_map(master: MasterKey) -> BTreeMap<u32, MasterKey> {
+    let mut m = BTreeMap::new();
+    m.insert(KEY_VERSION, master);
+    m
 }
 
 fn aad_for(container: &str, file_name: &str) -> String {
@@ -679,5 +743,52 @@ mod tests {
     #[test]
     fn parses_approval_mode() {
         assert_eq!(SecurityMode::parse("APPROVAL").unwrap(), SecurityMode::Approval);
+    }
+
+    #[test]
+    fn rotated_vault_reads_old_and_writes_new_version() {
+        let root = tmp_dir("rotate");
+        let dek_v1 = MasterKey::generate();
+        // Write a file under v1.
+        {
+            let v = Vault::open_or_init(&root, dek_v1.clone()).unwrap();
+            v.create_container("c", SecurityMode::Direct, None).unwrap();
+            v.write_file("c", "old.txt", b"v1-data").unwrap();
+        }
+        // Reopen with v1 + v2, active = v2.
+        let dek_v2 = MasterKey::generate();
+        let mut keys = BTreeMap::new();
+        keys.insert(1u32, dek_v1);
+        keys.insert(2u32, dek_v2);
+        let v = Vault::open_existing_with_keys(&root, keys, 2).unwrap();
+        assert_eq!(v.active_version(), 2);
+        // Old file (sealed under v1) still decrypts.
+        assert_eq!(v.read_file("c", "old.txt").unwrap(), b"v1-data");
+        // New file is sealed under v2.
+        v.write_file("c", "new.txt", b"v2-data").unwrap();
+        let raw = fs::read(root.join("c").join(format!("new.txt{FILE_SUFFIX}"))).unwrap();
+        assert_eq!(u32::from_be_bytes([raw[1], raw[2], raw[3], raw[4]]), 2);
+        // rewrap migrates the old file forward to v2; reading still works.
+        assert!(v.rewrap_file("c", "old.txt").unwrap());
+        assert!(!v.rewrap_file("c", "old.txt").unwrap());
+        assert_eq!(v.read_file("c", "old.txt").unwrap(), b"v1-data");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_key_version_is_rejected() {
+        let root = tmp_dir("missingver");
+        let dek_v1 = MasterKey::generate();
+        {
+            let v = Vault::open_or_init(&root, dek_v1).unwrap();
+            v.create_container("c", SecurityMode::Direct, None).unwrap();
+            v.write_file("c", "f.txt", b"data").unwrap();
+        }
+        // Reopen with only v2 — the v1 file has no available key.
+        let mut keys = BTreeMap::new();
+        keys.insert(2u32, MasterKey::generate());
+        let v = Vault::open_existing_with_keys(&root, keys, 2).unwrap();
+        assert!(v.read_file("c", "f.txt").is_err());
+        let _ = fs::remove_dir_all(&root);
     }
 }

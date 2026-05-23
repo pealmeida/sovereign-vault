@@ -23,6 +23,8 @@ pub use sv_mcp;
 pub use sv_recovery;
 pub use sv_storage;
 
+pub mod keyring;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -122,14 +124,17 @@ impl VaultHandle {
             CustodyMode::OsKeychain => {
                 if sv_keychain::load_master_key()?.is_some() {
                     return Err(CoreError::Misuse(
-                        "OS keychain already holds a master key — call unlock instead".into(),
+                        "OS keychain already holds a key — call unlock instead".into(),
                     ));
                 }
-                let key = MasterKey::generate();
-                let b64 = B64.encode(key.as_bytes());
-                sv_keychain::store_master_key(&b64)?;
-                let recovery_key = key.clone();
-                let vault = Vault::open_or_init(root, key)?;
+                // Keychain holds the KEK; a fresh random DEK seals the data and
+                // is wrapped under the KEK in the keyring.
+                let kek = MasterKey::generate();
+                let dek = MasterKey::generate();
+                sv_keychain::store_master_key(&B64.encode(kek.as_bytes()))?;
+                keyring::create(root, &kek, &dek)?;
+                let recovery_key = dek.clone();
+                let vault = Vault::open_or_init(root, dek)?;
                 let recovery_phrase = sv_recovery::issue_recovery_phrase(root, &recovery_key)?;
                 Ok(BootstrapResult {
                     handle: Self { vault, custody },
@@ -147,11 +152,14 @@ impl VaultHandle {
                             .into(),
                     ));
                 }
+                // Passphrase derives the KEK; a fresh random DEK seals the data.
                 let salt = sv_crypto::random_salt()?;
                 fs::write(&salt_path, salt)?;
-                let key = MasterKey::from_passphrase(pass, &salt)?;
-                let recovery_key = key.clone();
-                let vault = Vault::open_or_init(root, key)?;
+                let kek = MasterKey::from_passphrase(pass, &salt)?;
+                let dek = MasterKey::generate();
+                keyring::create(root, &kek, &dek)?;
+                let recovery_key = dek.clone();
+                let vault = Vault::open_or_init(root, dek)?;
                 let recovery_phrase = sv_recovery::issue_recovery_phrase(root, &recovery_key)?;
                 Ok(BootstrapResult {
                     handle: Self { vault, custody },
@@ -165,61 +173,49 @@ impl VaultHandle {
     }
 
     /// Unlock an existing vault using the previously-chosen custody mode.
+    ///
+    /// Derives the KEK from the custody source, transparently migrating a
+    /// legacy (pre-keyring) vault on first unlock, then unwraps the DEK(s)
+    /// from the keyring and opens the vault.
     pub fn unlock(root: &Path, custody: CustodyMode, passphrase: Option<&str>) -> Result<Self> {
-        match custody {
-            CustodyMode::OsKeychain => {
-                let b64 = sv_keychain::load_master_key()?.ok_or_else(|| {
-                    CoreError::Misuse(
-                        "no master key in OS keychain — bootstrap the vault first".into(),
-                    )
-                })?;
-                let raw = B64
-                    .decode(b64.as_bytes())
-                    .map_err(|e| CoreError::Base64(e.to_string()))?;
-                if raw.len() != MASTER_KEY_LEN {
-                    return Err(CoreError::Misuse(format!(
-                        "keychain entry has wrong length: {}",
-                        raw.len()
-                    )));
-                }
-                let mut bytes = [0u8; MASTER_KEY_LEN];
-                bytes.copy_from_slice(&raw);
-                let key = MasterKey::from_bytes(bytes);
-                let vault = Vault::open_existing(root, key)?;
-                Ok(Self { vault, custody })
-            }
+        let kek = match custody {
+            CustodyMode::OsKeychain => load_keychain_kek()?,
             CustodyMode::Passphrase => {
                 let pass = passphrase.ok_or_else(|| {
                     CoreError::Misuse("passphrase custody requires a passphrase".into())
                 })?;
-                let salt_path = root.join(SALT_FILENAME);
-                let salt_raw = fs::read(&salt_path).map_err(|_| {
-                    CoreError::Misuse(
-                        "no master.salt — bootstrap the vault with passphrase custody first".into(),
-                    )
-                })?;
-                if salt_raw.len() != SALT_LEN {
-                    return Err(CoreError::Misuse(format!(
-                        "master.salt has wrong length: {}",
-                        salt_raw.len()
-                    )));
-                }
-                let mut salt = [0u8; SALT_LEN];
-                salt.copy_from_slice(&salt_raw);
-                let key = MasterKey::from_passphrase(pass, &salt)?;
-                let vault = Vault::open_existing(root, key)?;
-                Ok(Self { vault, custody })
+                derive_passphrase_kek(root, pass)?
             }
-            CustodyMode::Recovery => Err(CoreError::Misuse(
-                "use unlock_with_recovery for recovery custody".into(),
-            )),
-        }
+            CustodyMode::Recovery => {
+                return Err(CoreError::Misuse(
+                    "use unlock_with_recovery for recovery custody".into(),
+                ))
+            }
+        };
+        // Legacy vaults sealed files directly with this key; promote it to
+        // DEK v1 wrapped under itself so the keyring path works uniformly.
+        keyring::migrate_legacy(root, &kek)?;
+        let unwrapped = keyring::load(root, &kek)?;
+        let vault =
+            Vault::open_existing_with_keys(root, unwrapped.keys, unwrapped.active_version)?;
+        Ok(Self { vault, custody })
     }
 
     /// Unlock an existing vault using its persisted recovery bundle.
+    ///
+    /// The recovery phrase restores the active DEK directly (independent of
+    /// the KEK), so it works even if the passphrase/keychain KEK is lost.
     pub fn unlock_with_recovery(root: &Path, phrase: &str) -> Result<Self> {
-        let key = sv_recovery::restore_master_key(root, phrase)?;
-        let vault = Vault::open_existing(root, key)?;
+        let dek = sv_recovery::restore_master_key(root, phrase)?;
+        let vault = if keyring::exists(root) {
+            let active = keyring::active_version(root)?;
+            let mut keys = std::collections::BTreeMap::new();
+            keys.insert(active, dek);
+            Vault::open_existing_with_keys(root, keys, active)?
+        } else {
+            // Legacy vault: the recovery key is DEK v1.
+            Vault::open_existing(root, dek)?
+        };
         Ok(Self {
             vault,
             custody: CustodyMode::Recovery,
@@ -282,6 +278,112 @@ impl VaultHandle {
     pub fn container_mode(&self, container: &str) -> Result<SecurityMode> {
         Ok(self.vault.container_mode(container)?)
     }
+
+    /// Change the passphrase for a passphrase-custody vault.
+    ///
+    /// O(1) in file data: re-derives the KEK under a new salt and re-wraps the
+    /// DEK(s) in the keyring. No file is re-encrypted. Only valid for
+    /// `Passphrase` custody.
+    pub fn change_passphrase(&self, root: &Path, current: &str, new: &str) -> Result<()> {
+        if self.custody != CustodyMode::Passphrase {
+            return Err(CoreError::Misuse(
+                "change_passphrase is only valid for passphrase custody".into(),
+            ));
+        }
+        let old_kek = derive_passphrase_kek(root, current)?;
+        // Verify the current passphrase actually unwraps the keyring before
+        // we overwrite the salt.
+        keyring::load(root, &old_kek)?;
+        let new_salt = sv_crypto::random_salt()?;
+        let new_kek = MasterKey::from_passphrase(new, &new_salt)?;
+        keyring::rewrap_under_new_kek(root, &old_kek, &new_kek)?;
+        fs::write(root.join(SALT_FILENAME), new_salt)?;
+        Ok(())
+    }
+
+    /// Rotate the data-encryption key.
+    ///
+    /// Generates a new DEK, re-seals every file forward to it, retires the old
+    /// versions, and re-issues the recovery phrase (the old phrase no longer
+    /// decrypts the vault). Requires the KEK, so pass the passphrase for
+    /// passphrase custody (ignored for keychain custody). Returns the new
+    /// recovery phrase.
+    pub fn rotate_key(&mut self, root: &Path, passphrase: Option<&str>) -> Result<String> {
+        let kek = match self.custody {
+            CustodyMode::OsKeychain => load_keychain_kek()?,
+            CustodyMode::Passphrase => {
+                let pass = passphrase.ok_or_else(|| {
+                    CoreError::Misuse("passphrase custody requires a passphrase to rotate".into())
+                })?;
+                derive_passphrase_kek(root, pass)?
+            }
+            CustodyMode::Recovery => {
+                return Err(CoreError::Misuse(
+                    "cannot rotate from a recovery-unlocked session".into(),
+                ))
+            }
+        };
+
+        let new_dek = MasterKey::generate();
+        let new_version = keyring::add_active_dek(root, &kek, &new_dek)?;
+
+        // Reopen with all versions so old files stay readable while we migrate.
+        let unwrapped = keyring::load(root, &kek)?;
+        let vault =
+            Vault::open_existing_with_keys(root, unwrapped.keys, unwrapped.active_version)?;
+
+        // Re-seal every file forward to the new active version.
+        for container in vault.list_containers()? {
+            for file in vault.list_files(&container.name)? {
+                vault.rewrap_file(&container.name, &file.name)?;
+            }
+        }
+
+        // Drop superseded DEK versions, then reopen with only the active key.
+        keyring::retire_below(root, new_version)?;
+        let unwrapped = keyring::load(root, &kek)?;
+        self.vault =
+            Vault::open_existing_with_keys(root, unwrapped.keys, unwrapped.active_version)?;
+
+        // The old recovery phrase wrapped the old DEK; re-issue for the new one.
+        let recovery_phrase = sv_recovery::issue_recovery_phrase(root, &new_dek)?;
+        Ok(recovery_phrase)
+    }
+}
+
+fn load_keychain_kek() -> Result<MasterKey> {
+    let b64 = sv_keychain::load_master_key()?.ok_or_else(|| {
+        CoreError::Misuse("no key in OS keychain — bootstrap the vault first".into())
+    })?;
+    let raw = B64
+        .decode(b64.as_bytes())
+        .map_err(|e| CoreError::Base64(e.to_string()))?;
+    if raw.len() != MASTER_KEY_LEN {
+        return Err(CoreError::Misuse(format!(
+            "keychain entry has wrong length: {}",
+            raw.len()
+        )));
+    }
+    let mut bytes = [0u8; MASTER_KEY_LEN];
+    bytes.copy_from_slice(&raw);
+    Ok(MasterKey::from_bytes(bytes))
+}
+
+fn derive_passphrase_kek(root: &Path, passphrase: &str) -> Result<MasterKey> {
+    let salt_raw = fs::read(root.join(SALT_FILENAME)).map_err(|_| {
+        CoreError::Misuse(
+            "no master.salt — bootstrap the vault with passphrase custody first".into(),
+        )
+    })?;
+    if salt_raw.len() != SALT_LEN {
+        return Err(CoreError::Misuse(format!(
+            "master.salt has wrong length: {}",
+            salt_raw.len()
+        )));
+    }
+    let mut salt = [0u8; SALT_LEN];
+    salt.copy_from_slice(&salt_raw);
+    MasterKey::from_passphrase(passphrase, &salt).map_err(CoreError::from)
 }
 
 impl sv_mcp::VaultFacade for VaultHandle {
@@ -334,10 +436,13 @@ pub struct InitState {
     pub initialized: bool,
     /// True if `master.salt` is present (passphrase custody).
     pub has_passphrase_salt: bool,
-    /// True if the OS keychain has a master-key entry.
+    /// True if the OS keychain has a key entry (the KEK).
     pub has_keychain_entry: bool,
     /// True if the recovery bundle exists.
     pub has_recovery_bundle: bool,
+    /// True if the keyring (`keyring.svault`) is present. False for legacy
+    /// vaults that have not yet been migrated on first unlock.
+    pub has_keyring: bool,
 }
 
 /// Probe the on-disk + keychain state of a vault root.
@@ -349,6 +454,7 @@ pub fn probe(root: &Path) -> Result<InitState> {
         has_passphrase_salt: salt.exists(),
         has_keychain_entry: sv_keychain::load_master_key()?.is_some(),
         has_recovery_bundle: sv_recovery::has_recovery_bundle(root),
+        has_keyring: keyring::exists(root),
     })
 }
 
