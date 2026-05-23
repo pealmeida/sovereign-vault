@@ -222,15 +222,15 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         &self.pairing_secret
     }
 
-    /// Generate a fresh URL-safe-base64 32-byte pairing secret.
-    pub fn fresh_pairing_secret() -> String {
+    /// Generate a fresh URL-safe-base64 32-byte pairing secret from the OS
+    /// CSPRNG. Fails closed: if the OS entropy source is unavailable this
+    /// returns an error rather than emitting guessable bytes.
+    pub fn fresh_pairing_secret() -> Result<String> {
         let mut buf = [0u8; 32];
-        if getrandom_fill(&mut buf).is_err() {
-            for (i, b) in buf.iter_mut().enumerate() {
-                *b = (i as u8).wrapping_mul(31);
-            }
-        }
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+        getrandom_fill(&mut buf).map_err(|e| {
+            McpError::Protocol(format!("OS RNG unavailable, refusing to generate secret: {e}"))
+        })?;
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf))
     }
 
     /// Run an MCP server reading JSON-RPC line-delimited frames from `reader`,
@@ -773,24 +773,15 @@ fn tool_descriptors() -> Value {
     ])
 }
 
-fn getrandom_fill(buf: &mut [u8]) -> std::result::Result<(), ()> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ())?
-        .as_nanos();
-    let pid = std::process::id() as u128;
-    let mut state = nanos ^ (pid.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    for byte in buf.iter_mut() {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        *byte = (z & 0xFF) as u8;
-    }
-    Ok(())
+/// Fill `buf` with cryptographically secure bytes from the operating system's
+/// CSPRNG. Returns an error if the OS entropy source is unavailable.
+///
+/// This MUST fail closed: there is deliberately no software fallback. A
+/// predictable fallback (e.g. seeded from time/pid) would let an attacker guess
+/// secret material such as pairing secrets, so on RNG failure we surface the
+/// error to the caller rather than emitting guessable bytes.
+fn getrandom_fill(buf: &mut [u8]) -> std::result::Result<(), getrandom::Error> {
+    getrandom::getrandom(buf)
 }
 
 /// Crate version string.
