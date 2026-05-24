@@ -39,6 +39,15 @@ pub const NONCE_LEN: usize = 24;
 /// Length of the salt used for [`MasterKey::from_passphrase`] in bytes.
 pub const SALT_LEN: usize = 16;
 
+/// Length of an Ed25519 secret (signing) key in bytes.
+pub const ED25519_SECRET_LEN: usize = 32;
+
+/// Length of an Ed25519 public (verifying) key in bytes.
+pub const ED25519_PUBLIC_LEN: usize = 32;
+
+/// Length of an Ed25519 signature in bytes.
+pub const ED25519_SIGNATURE_LEN: usize = 64;
+
 /// Crate-wide error type.
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -57,6 +66,10 @@ pub enum CryptoError {
     /// Random number generation failed.
     #[error("Random number generation failed: {0}")]
     Random(String),
+
+    /// Signing-key material had the wrong length or was otherwise malformed.
+    #[error("Invalid signing key: {0}")]
+    SigningKey(String),
 }
 
 /// Convenience result type.
@@ -176,6 +189,58 @@ pub fn open(key: &MasterKey, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| CryptoError::Aead(e.to_string()))
 }
 
+/// Generate a fresh Ed25519 signing keypair from the OS CSPRNG.
+///
+/// Returns `(secret_bytes, public_bytes)`. The secret half is the 32-byte
+/// seed and must be wrapped before storage; the public half is exportable.
+pub fn ed25519_generate() -> Result<([u8; ED25519_SECRET_LEN], [u8; ED25519_PUBLIC_LEN])> {
+    let mut seed = [0u8; ED25519_SECRET_LEN];
+    getrandom::getrandom(&mut seed).map_err(|e| CryptoError::Random(e.to_string()))?;
+    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let public = signing.verifying_key().to_bytes();
+    Ok((seed, public))
+}
+
+/// Derive the public key for an Ed25519 secret seed.
+pub fn ed25519_public(secret: &[u8]) -> Result<[u8; ED25519_PUBLIC_LEN]> {
+    let seed = ed25519_seed(secret)?;
+    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    Ok(signing.verifying_key().to_bytes())
+}
+
+/// Sign `msg` with the Ed25519 secret seed, returning a 64-byte signature.
+pub fn ed25519_sign(secret: &[u8], msg: &[u8]) -> Result<[u8; ED25519_SIGNATURE_LEN]> {
+    use ed25519_dalek::Signer as _;
+    let seed = ed25519_seed(secret)?;
+    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    Ok(signing.sign(msg).to_bytes())
+}
+
+/// Verify an Ed25519 `signature` over `msg` against the 32-byte public key.
+///
+/// Returns `false` on any malformed input or tag mismatch (never errors on a
+/// bad signature; only on a structurally invalid public key).
+pub fn ed25519_verify(public: &[u8], msg: &[u8], signature: &[u8]) -> Result<bool> {
+    use ed25519_dalek::Verifier as _;
+    let pk: [u8; ED25519_PUBLIC_LEN] = public
+        .try_into()
+        .map_err(|_| CryptoError::SigningKey(format!("public key len {}", public.len())))?;
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(&pk)
+        .map_err(|e| CryptoError::SigningKey(e.to_string()))?;
+    let sig: [u8; ED25519_SIGNATURE_LEN] = match signature.try_into() {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    let sig = ed25519_dalek::Signature::from_bytes(&sig);
+    Ok(verifying.verify(msg, &sig).is_ok())
+}
+
+fn ed25519_seed(secret: &[u8]) -> Result<[u8; ED25519_SECRET_LEN]> {
+    secret
+        .try_into()
+        .map_err(|_| CryptoError::SigningKey(format!("secret key len {}", secret.len())))
+}
+
 /// Crate version string.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -221,6 +286,33 @@ mod tests {
         assert_eq!(a, b);
         let c = derive_subkey(&key, b"some-other-context");
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn ed25519_sign_then_verify_true() {
+        let (secret, public) = ed25519_generate().unwrap();
+        let msg = b"sovereign vault payload";
+        let sig = ed25519_sign(&secret, msg).unwrap();
+        assert!(ed25519_verify(&public, msg, &sig).unwrap());
+    }
+
+    #[test]
+    fn ed25519_tampered_payload_verify_false() {
+        let (secret, public) = ed25519_generate().unwrap();
+        let sig = ed25519_sign(&secret, b"original").unwrap();
+        assert!(!ed25519_verify(&public, b"tampered", &sig).unwrap());
+    }
+
+    #[test]
+    fn ed25519_public_is_deterministic_from_seed() {
+        let (secret, public) = ed25519_generate().unwrap();
+        assert_eq!(ed25519_public(&secret).unwrap(), public);
+    }
+
+    #[test]
+    fn ed25519_malformed_signature_is_false_not_error() {
+        let (_secret, public) = ed25519_generate().unwrap();
+        assert!(!ed25519_verify(&public, b"x", &[0u8; 10]).unwrap());
     }
 
     #[test]

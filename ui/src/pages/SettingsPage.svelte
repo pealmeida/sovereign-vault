@@ -5,6 +5,7 @@
   import { vaultStore } from '../stores/vault.svelte';
   import { mcpStore } from '../stores/mcp.svelte';
   import { agentsStore } from '../stores/agents.svelte';
+  import { brokerStore } from '../stores/broker.svelte';
   import { approvalStore } from '../stores/approvals.svelte';
   import { toastStore } from '../stores/toast.svelte';
   let appVersion = $state('…');
@@ -37,6 +38,55 @@
     } catch (e) {
       toastStore.setError(e);
     }
+  }
+
+  let newTransitName = $state('');
+  let newSigningName = $state('');
+  let newBrokerName = $state('');
+  let newBrokerSecret = $state('');
+  let newBrokerHost = $state('');
+  let newBrokerPathPrefix = $state('/');
+  let newBrokerMethods = $state('GET');
+
+  async function createTransitKey() {
+    const name = newTransitName.trim();
+    if (!name) { toastStore.setError('Enter a transit key name.'); return; }
+    try {
+      await brokerStore.createTransitKey(name);
+      newTransitName = '';
+      toastStore.setNotice('Transit key created.');
+    } catch (e) { toastStore.setError(e); }
+  }
+
+  async function createSigningKey() {
+    const name = newSigningName.trim();
+    if (!name) { toastStore.setError('Enter a signing key name.'); return; }
+    try {
+      await brokerStore.createSigningKey(name);
+      newSigningName = '';
+      toastStore.setNotice('Signing key created.');
+    } catch (e) { toastStore.setError(e); }
+  }
+
+  async function createBrokerSecret() {
+    const name = newBrokerName.trim();
+    const host = newBrokerHost.trim().toLowerCase();
+    if (!name || !newBrokerSecret || !host) {
+      toastStore.setError('Name, secret, and host are required.');
+      return;
+    }
+    const methods = newBrokerMethods.split(',').map((m) => m.trim().toUpperCase()).filter(Boolean);
+    try {
+      await brokerStore.createBrokerSecret(name, newBrokerSecret, [
+        { host, path_prefix: newBrokerPathPrefix.trim() || '/', methods },
+      ]);
+      newBrokerName = '';
+      newBrokerSecret = '';
+      newBrokerHost = '';
+      newBrokerPathPrefix = '/';
+      newBrokerMethods = 'GET';
+      toastStore.setNotice('Brokered secret created.');
+    } catch (e) { toastStore.setError(e); }
   }
 
   let currentPass = $state('');
@@ -74,6 +124,7 @@
       await mcpStore.refresh();
       if (vaultStore.status?.unlocked) {
         await agentsStore.refresh();
+        await brokerStore.refresh();
       }
     } catch (e) {
       toastStore.setError(e);
@@ -105,6 +156,10 @@
     'vault.write',
     'vault.delete',
     'vault.create_container',
+    'vault.encrypt',
+    'vault.decrypt',
+    'vault.sign',
+    'vault.verify',
   ];
 </script>
 
@@ -221,6 +276,103 @@
             Rotate key
           </button>
           <p style="font-size:0.8rem;opacity:0.7;margin:0.25rem 0 0">Generates a new key, re-encrypts every file, and issues a new recovery phrase. The old recovery phrase stops working.</p>
+        </div>
+      {/if}
+    </article>
+
+    <!-- Transit & signing keys -->
+    <article class="panel-card">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Use secrets without exposing them</p>
+          <h3>Transit &amp; signing keys</h3>
+        </div>
+        <button class="ghost-button" onclick={() => brokerStore.refresh().catch((e) => toastStore.setError(e))}>
+          Refresh
+        </button>
+      </div>
+
+      {#if !vaultStore.status?.unlocked}
+        <div class="empty-state">Unlock the vault to manage keys.</div>
+      {:else}
+        <div class="settings-stack">
+          <p class="eyebrow">Transit keys (encrypt / decrypt)</p>
+          {#if brokerStore.transitKeys.length === 0}
+            <div class="empty-state">No transit keys.</div>
+          {:else}
+            {#each brokerStore.transitKeys as k (k.name)}
+              <div class="detail-row">
+                <strong>{k.name}</strong>
+                <code style="font-family:var(--font-mono);font-size:0.75rem;opacity:0.7">v{k.version}</code>
+              </div>
+            {/each}
+          {/if}
+          <div style="display:flex;gap:0.5rem">
+            <input class="text-input" placeholder="New transit key name" bind:value={newTransitName} style="flex:1" />
+            <button class="primary-button" onclick={createTransitKey}>Create</button>
+          </div>
+
+          <p class="eyebrow" style="margin-top:0.75rem">Signing keys (sign / verify)</p>
+          {#if brokerStore.signingKeys.length === 0}
+            <div class="empty-state">No signing keys.</div>
+          {:else}
+            {#each brokerStore.signingKeys as k (k.name)}
+              <div class="detail-row">
+                <div style="display:flex;flex-direction:column;min-width:0">
+                  <strong>{k.name}</strong>
+                  <code style="font-family:var(--font-mono);font-size:0.7rem;opacity:0.7;word-break:break-all">{k.public_b64}</code>
+                </div>
+                <CopyButton value={k.public_b64} label="Copy public key" />
+              </div>
+            {/each}
+          {/if}
+          <div style="display:flex;gap:0.5rem">
+            <input class="text-input" placeholder="New signing key name" bind:value={newSigningName} style="flex:1" />
+            <button class="primary-button" onclick={createSigningKey}>Create</button>
+          </div>
+        </div>
+      {/if}
+    </article>
+
+    <!-- Brokered secrets -->
+    <article class="panel-card">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Brokered outbound requests</p>
+          <h3>Brokered secrets</h3>
+        </div>
+      </div>
+
+      {#if !vaultStore.status?.unlocked}
+        <div class="empty-state">Unlock the vault to manage brokered secrets.</div>
+      {:else if !brokerStore.brokerEnabled}
+        <div class="empty-state">
+          Brokering is disabled. Set the <code>SV_ENABLE_BROKER</code> environment variable and restart to enable
+          <code>vault.broker_request</code>.
+        </div>
+      {:else}
+        <div class="settings-stack">
+          {#if brokerStore.brokerSecrets.length === 0}
+            <div class="empty-state">No brokered secrets.</div>
+          {:else}
+            {#each brokerStore.brokerSecrets as s (s.name)}
+              <div class="detail-row">
+                <div style="display:flex;flex-direction:column;min-width:0">
+                  <strong>{s.name}</strong>
+                  {#each s.allow as a}
+                    <code style="font-family:var(--font-mono);font-size:0.7rem;opacity:0.7">{a.methods.join('/')} {a.host}{a.path_prefix}</code>
+                  {/each}
+                </div>
+              </div>
+            {/each}
+          {/if}
+          <p class="eyebrow" style="margin-top:0.5rem">New brokered secret (Bearer auth)</p>
+          <input class="text-input" placeholder="Name" bind:value={newBrokerName} />
+          <input class="text-input" type="password" placeholder="Secret value" bind:value={newBrokerSecret} autocomplete="off" />
+          <input class="text-input" placeholder="Allowed host (e.g. api.stripe.com)" bind:value={newBrokerHost} />
+          <input class="text-input" placeholder="Path prefix (e.g. /v1)" bind:value={newBrokerPathPrefix} />
+          <input class="text-input" placeholder="Methods (comma-separated, e.g. GET,POST)" bind:value={newBrokerMethods} />
+          <button class="primary-button" onclick={createBrokerSecret}>Create brokered secret</button>
         </div>
       {/if}
     </article>
