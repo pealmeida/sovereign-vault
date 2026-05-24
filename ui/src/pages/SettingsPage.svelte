@@ -4,11 +4,40 @@
   import CopyButton from '../components/CopyButton.svelte';
   import { vaultStore } from '../stores/vault.svelte';
   import { mcpStore } from '../stores/mcp.svelte';
+  import { agentsStore } from '../stores/agents.svelte';
   import { approvalStore } from '../stores/approvals.svelte';
   import { toastStore } from '../stores/toast.svelte';
   let appVersion = $state('…');
   let revealPhrase = $state(false);
   let recoveryData = $state<string | null>(null);
+
+  let newAgentName = $state('');
+  let newAgentToken = $state<string | null>(null);
+
+  async function createAgent() {
+    const name = newAgentName.trim();
+    if (!name) {
+      toastStore.setError('Enter a name for the agent.');
+      return;
+    }
+    try {
+      const created = await agentsStore.create(name);
+      newAgentName = '';
+      newAgentToken = created.token;
+      toastStore.setNotice('Agent created. Copy its token now — it is shown only once.');
+    } catch (e) {
+      toastStore.setError(e);
+    }
+  }
+
+  async function revokeAgent(agentId: string) {
+    try {
+      await agentsStore.revoke(agentId);
+      toastStore.setNotice('Agent revoked.');
+    } catch (e) {
+      toastStore.setError(e);
+    }
+  }
 
   let currentPass = $state('');
   let newPass = $state('');
@@ -43,6 +72,9 @@
     try {
       appVersion = await vaultStore.appVersion();
       await mcpStore.refresh();
+      if (vaultStore.status?.unlocked) {
+        await agentsStore.refresh();
+      }
     } catch (e) {
       toastStore.setError(e);
     }
@@ -258,6 +290,68 @@
         <CopyButton value={mcpStore.cursorConfig} label="Copy Cursor config" />
         <CopyButton value={mcpStore.continueConfig} label="Copy Continue.dev config" />
       </div>
+    </article>
+
+    <!-- Agents -->
+    <article class="panel-card">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">MCP identity</p>
+          <h3>Agents</h3>
+        </div>
+        <button class="ghost-button" onclick={() => agentsStore.refresh().catch((e) => toastStore.setError(e))}>
+          Refresh
+        </button>
+      </div>
+
+      {#if !vaultStore.status?.unlocked}
+        <div class="empty-state">Unlock the vault to manage agents.</div>
+      {:else}
+        <div class="settings-stack">
+          {#if agentsStore.agents.length === 0}
+            <div class="empty-state">No agents registered.</div>
+          {:else}
+            {#each agentsStore.agents as agent (agent.agent_id)}
+              <div class="detail-row">
+                <div style="display:flex;flex-direction:column;min-width:0">
+                  <strong>{agent.name}</strong>
+                  <code style="font-family:var(--font-mono);font-size:0.75rem;opacity:0.7">{agent.agent_id}</code>
+                </div>
+                <div style="display:flex;align-items:center;gap:0.5rem">
+                  {#if agent.revoked}
+                    <span class="filter-chip">Revoked</span>
+                  {:else}
+                    <button class="ghost-button" onclick={() => revokeAgent(agent.agent_id)}>Revoke</button>
+                  {/if}
+                </div>
+              </div>
+            {/each}
+          {/if}
+        </div>
+
+        <div style="display:flex;gap:0.5rem;margin-top:0.75rem">
+          <input
+            class="text-input"
+            placeholder="New agent name"
+            bind:value={newAgentName}
+            style="flex:1"
+          />
+          <button class="primary-button" onclick={createAgent}>New agent</button>
+        </div>
+
+        {#if newAgentToken}
+          <div style="margin-top:0.75rem">
+            <p class="eyebrow" style="margin-bottom:0.5rem">One-time token (shown only once)</p>
+            <pre style="
+              white-space:pre-wrap;word-break:break-all;font-family:var(--font-mono);
+              font-size:0.8rem;background:var(--surface-2,#1112);padding:0.5rem;border-radius:0.5rem;margin:0
+            ">{newAgentToken}</pre>
+            <div style="margin-top:0.5rem">
+              <CopyButton value={newAgentToken} label="Copy token" />
+            </div>
+          </div>
+        {/if}
+      {/if}
     </article>
 
     <!-- Approvals -->

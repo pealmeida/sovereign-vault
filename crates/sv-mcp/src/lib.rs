@@ -170,6 +170,45 @@ pub struct AccessRequest {
     pub mode: Option<SecurityMode>,
     /// Byte size of the payload, when known.
     pub byte_size: Option<usize>,
+    /// Identity of the agent that originated the request, when bound.
+    pub agent_id: Option<String>,
+}
+
+/// A scope grant resolved for an authenticated agent. Scopes can only narrow
+/// access, never widen it.
+#[derive(Debug, Clone)]
+pub struct ResolvedScope {
+    /// Glob matched against the container name.
+    pub container_glob: String,
+    /// Actions the agent may perform on matching containers.
+    pub actions: Vec<AccessAction>,
+    /// Maximum security mode the agent may exercise, if any.
+    pub mode_ceiling: Option<SecurityMode>,
+}
+
+/// The outcome of authenticating an agent: its id plus resolved scopes. An
+/// empty `scopes` list means unscoped (full surface, still subject to the
+/// per-container mode flow).
+#[derive(Debug, Clone)]
+pub struct ResolvedAgent {
+    /// Stable agent identifier.
+    pub agent_id: String,
+    /// Resolved scope grants.
+    pub scopes: Vec<ResolvedScope>,
+}
+
+/// Hook used to resolve an agent identity from a presented credential during
+/// the WS handshake.
+pub trait AgentAuthenticator: Send + Sync {
+    /// Resolve `agent_id` + `token` to a [`ResolvedAgent`], or return an error
+    /// string when the credential is unknown/expired/revoked/invalid. When
+    /// `agent_id` is `None` the implementation should fall back to the
+    /// built-in shared-secret "Default" agent gated by `token`.
+    fn authenticate(
+        &self,
+        agent_id: Option<&str>,
+        token: &str,
+    ) -> std::result::Result<ResolvedAgent, String>;
 }
 
 /// Hook used to enforce approval policy for MCP calls.
@@ -192,6 +231,7 @@ pub struct McpServer<H: VaultFacade + 'static> {
     pairing_secret: String,
     access_controller: Option<Arc<dyn AccessController>>,
     audit_sink: Option<Arc<dyn AuditSink>>,
+    agent_authenticator: Option<Arc<dyn AgentAuthenticator>>,
 }
 
 impl<H: VaultFacade + 'static> McpServer<H> {
@@ -202,6 +242,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
             pairing_secret: pairing_secret.into(),
             access_controller: None,
             audit_sink: None,
+            agent_authenticator: None,
         }
     }
 
@@ -214,6 +255,14 @@ impl<H: VaultFacade + 'static> McpServer<H> {
     /// Install an audit sink used for all MCP tool outcomes.
     pub fn with_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
         self.audit_sink = Some(sink);
+        self
+    }
+
+    /// Install an agent authenticator used to resolve per-agent identity on
+    /// the WS handshake. When unset, only the shared pairing secret is
+    /// accepted and requests carry no `agent_id`.
+    pub fn with_agent_authenticator(mut self, authenticator: Arc<dyn AgentAuthenticator>) -> Self {
+        self.agent_authenticator = Some(authenticator);
         self
     }
 
@@ -247,7 +296,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 continue;
             }
             let response = self
-                .dispatch(trimmed, &mut PairState::AlreadyPaired, AccessTransport::McpStdio)
+                .dispatch(trimmed, &mut PairState::AlreadyPaired(None), AccessTransport::McpStdio)
                 .await;
             if let Some(resp) = response {
                 let bytes =
@@ -386,16 +435,26 @@ impl<H: VaultFacade + 'static> McpServer<H> {
 
         if matches!(pair, PairState::Unpaired) {
             if method == "vault.pair" {
-                let secret = params
-                    .get("secret")
+                let agent_id = params.get("agent_id").and_then(|v| v.as_str());
+                // Per-agent clients send `token`; legacy clients send `secret`.
+                let token = params
+                    .get("token")
                     .and_then(|v| v.as_str())
+                    .or_else(|| params.get("secret").and_then(|v| v.as_str()))
                     .unwrap_or_default();
-                if secret == self.pairing_secret {
-                    *pair = PairState::AlreadyPaired;
-                    return Some(ok_response(id, json!({ "paired": true })));
-                } else {
-                    *pair = PairState::Failed;
-                    return Some(error_response(id, codes::UNPAIRED, "Unpaired connection"));
+                match self.resolve_pairing(agent_id, token) {
+                    Ok(agent) => {
+                        let bound = agent.as_ref().map(|a| a.agent_id.clone());
+                        *pair = PairState::AlreadyPaired(agent);
+                        return Some(ok_response(
+                            id,
+                            json!({ "paired": true, "agent_id": bound }),
+                        ));
+                    }
+                    Err(_) => {
+                        *pair = PairState::Failed;
+                        return Some(error_response(id, codes::UNPAIRED, "Unpaired connection"));
+                    }
                 }
             } else {
                 *pair = PairState::Failed;
@@ -419,7 +478,9 @@ impl<H: VaultFacade + 'static> McpServer<H> {
             "tools/call" => {
                 let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
-                let result = self.call_tool(name, arguments, transport).await;
+                let result = self
+                    .call_tool(name, arguments, transport, pair.agent())
+                    .await;
                 Some(ok_response(id, tool_result(result)))
             }
             "vault.pair" => Some(ok_response(id, json!({ "paired": true }))),
@@ -432,19 +493,48 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         }
     }
 
+    /// Resolve a pairing attempt to a bound agent (if any). With an
+    /// authenticator installed, delegate to it (it owns the shared-secret
+    /// "Default" fallback). Without one, accept only the shared secret and
+    /// bind no agent identity (legacy behaviour).
+    fn resolve_pairing(
+        &self,
+        agent_id: Option<&str>,
+        token: &str,
+    ) -> std::result::Result<Option<ResolvedAgent>, String> {
+        if let Some(authenticator) = &self.agent_authenticator {
+            return authenticator.authenticate(agent_id, token).map(Some);
+        }
+        if agent_id.is_none() && token == self.pairing_secret {
+            Ok(None)
+        } else {
+            Err("Unpaired connection".into())
+        }
+    }
+
     async fn call_tool(
         &self,
         name: &str,
         args: Value,
         transport: AccessTransport,
+        agent: Option<&ResolvedAgent>,
     ) -> std::result::Result<Value, String> {
-        let access = {
+        let mut access = {
             let guard = self.handle.lock().await;
             let handle = guard
                 .as_ref()
                 .ok_or_else(|| "vault is locked".to_string())?;
             self.build_access_request(handle, name, &args, transport)?
         };
+        access.agent_id = agent.map(|a| a.agent_id.clone());
+
+        // Scope enforcement: scopes may only narrow, never widen, access.
+        if let Some(agent) = agent {
+            if let Err(error) = enforce_scopes(agent, &access) {
+                self.record_audit(&access, AuditDecision::Denied, None, Some(error.clone()));
+                return Err(error);
+            }
+        }
 
         if let Some(controller) = &self.access_controller {
             if let Err(error) = controller.authorize(access.clone()).await {
@@ -494,6 +584,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     file_name: None,
                     mode,
                     byte_size: None,
+                    agent_id: None,
                 })
             }
             "vault.read" => {
@@ -506,6 +597,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     file_name: Some(file_name.to_string()),
                     mode: Some(handle.container_mode(container)?),
                     byte_size: None,
+                    agent_id: None,
                 })
             }
             "vault.write" => {
@@ -522,6 +614,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     file_name: Some(file_name.to_string()),
                     mode: Some(handle.container_mode(container)?),
                     byte_size: Some(bytes.len()),
+                    agent_id: None,
                 })
             }
             "vault.delete" => {
@@ -534,6 +627,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     file_name: Some(file_name.to_string()),
                     mode: Some(handle.container_mode(container)?),
                     byte_size: None,
+                    agent_id: None,
                 })
             }
             "vault.create_container" => {
@@ -549,6 +643,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     file_name: None,
                     mode: Some(SecurityMode::parse(mode).map_err(|e| e.to_string())?),
                     byte_size: None,
+                    agent_id: None,
                 })
             }
             other => Err(format!("unknown tool: {other}")),
@@ -627,8 +722,102 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         event.byte_size = request.byte_size;
         event.detail = detail;
         event.error = error;
+        event.agent_id = request.agent_id.clone();
         let _ = sink.record(event);
     }
+}
+
+/// Enforce an authenticated agent's scopes against a request. Scopes can only
+/// narrow access: at least one scope must match the container, allow the
+/// action, and (if it sets a ceiling) not be widened by the container mode.
+fn enforce_scopes(
+    agent: &ResolvedAgent,
+    request: &AccessRequest,
+) -> std::result::Result<(), String> {
+    // No scopes means unscoped: full surface, still subject to the mode flow.
+    if agent.scopes.is_empty() {
+        return Ok(());
+    }
+    // Requests without a container (e.g. list all containers) are always
+    // allowed for scoped agents; per-container reads/writes are gated below.
+    let Some(container) = request.container.as_deref() else {
+        return Ok(());
+    };
+    for scope in &agent.scopes {
+        if !glob_match(&scope.container_glob, container) {
+            continue;
+        }
+        if !scope.actions.contains(&request.action) {
+            continue;
+        }
+        if let (Some(ceiling), Some(mode)) = (scope.mode_ceiling, request.mode) {
+            // The ceiling must not be weaker than the container's effective
+            // mode — a scope may only require equal-or-stronger handling.
+            if mode_rank(mode) > mode_rank(ceiling) {
+                return Err(format!(
+                    "agent scope mode_ceiling {} cannot widen container mode {}",
+                    ceiling.as_str(),
+                    mode.as_str()
+                ));
+            }
+        }
+        return Ok(());
+    }
+    Err(format!(
+        "agent {} is not scoped for {:?} on container {container}",
+        agent.agent_id, request.action
+    ))
+}
+
+/// Relative strength ordering of security modes; higher means stronger
+/// (more restrictive) handling.
+fn mode_rank(mode: SecurityMode) -> u8 {
+    match mode {
+        SecurityMode::Direct => 0,
+        SecurityMode::Approval => 1,
+        SecurityMode::Otp => 2,
+        SecurityMode::Anonymized => 3,
+        SecurityMode::Zkp => 4,
+        SecurityMode::Native => 5,
+    }
+}
+
+/// Minimal glob matcher supporting `*` (any run within a path segment) and
+/// `**` (any run including `/`).
+fn glob_match(pattern: &str, value: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let v: Vec<char> = value.chars().collect();
+    glob_inner(&p, &v)
+}
+
+fn glob_inner(p: &[char], v: &[char]) -> bool {
+    if p.is_empty() {
+        return v.is_empty();
+    }
+    if p[0] == '*' {
+        // `**` matches across segments; single `*` stops at `/`.
+        let double = p.len() >= 2 && p[1] == '*';
+        let rest = if double { &p[2..] } else { &p[1..] };
+        // Zero-width match.
+        if glob_inner(rest, v) {
+            return true;
+        }
+        let mut i = 0;
+        while i < v.len() {
+            if !double && v[i] == '/' {
+                break;
+            }
+            i += 1;
+            if glob_inner(rest, &v[i..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if !v.is_empty() && p[0] == v[0] {
+        return glob_inner(&p[1..], &v[1..]);
+    }
+    false
 }
 
 fn required_str<'a>(value: &'a Value, key: &str) -> std::result::Result<&'a str, String> {
@@ -641,8 +830,18 @@ fn required_str<'a>(value: &'a Value, key: &str) -> std::result::Result<&'a str,
 #[derive(Debug)]
 enum PairState {
     Unpaired,
-    AlreadyPaired,
+    /// Paired; carries the bound agent identity when one was resolved.
+    AlreadyPaired(Option<ResolvedAgent>),
     Failed,
+}
+
+impl PairState {
+    fn agent(&self) -> Option<&ResolvedAgent> {
+        match self {
+            PairState::AlreadyPaired(agent) => agent.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -893,7 +1092,7 @@ mod tests {
     #[tokio::test]
     async fn initialize_returns_protocol_version() {
         let server = server();
-        let mut pair = PairState::AlreadyPaired;
+        let mut pair = PairState::AlreadyPaired(None);
         let response = server
             .dispatch(
                 r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
@@ -909,7 +1108,7 @@ mod tests {
     #[tokio::test]
     async fn tools_list_has_five() {
         let server = server();
-        let mut pair = PairState::AlreadyPaired;
+        let mut pair = PairState::AlreadyPaired(None);
         let response = server
             .dispatch(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
@@ -950,7 +1149,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response["result"]["paired"], true);
-        assert!(matches!(pair, PairState::AlreadyPaired));
+        assert!(matches!(pair, PairState::AlreadyPaired(_)));
     }
 
     #[tokio::test]
@@ -972,7 +1171,7 @@ mod tests {
     #[tokio::test]
     async fn write_then_read_roundtrip() {
         let server = server();
-        let mut pair = PairState::AlreadyPaired;
+        let mut pair = PairState::AlreadyPaired(None);
         let payload = B64.encode(b"hello vault");
         let write_request = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.write","arguments":{{"container":"notes","file_name":"a.txt","content_b64":"{payload}"}}}}}}"#
@@ -997,7 +1196,7 @@ mod tests {
     async fn locked_vault_returns_error() {
         let vault: SharedVault<StubVault> = Arc::new(Mutex::new(None));
         let server = McpServer::new(vault, "x");
-        let mut pair = PairState::AlreadyPaired;
+        let mut pair = PairState::AlreadyPaired(None);
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vault.list","arguments":{}}}"#;
         let response = server
             .dispatch(request, &mut pair, AccessTransport::McpWs)
@@ -1009,7 +1208,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_method_404() {
         let server = server();
-        let mut pair = PairState::AlreadyPaired;
+        let mut pair = PairState::AlreadyPaired(None);
         let response = server
             .dispatch(
                 r#"{"jsonrpc":"2.0","id":1,"method":"frobnicate"}"#,
@@ -1027,7 +1226,7 @@ mod tests {
         let server = server()
             .with_access_controller(Arc::new(DenyController))
             .with_audit_sink(audit.clone());
-        let mut pair = PairState::AlreadyPaired;
+        let mut pair = PairState::AlreadyPaired(None);
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vault.read","arguments":{"container":"notes","file_name":"a.txt"}}}"#;
         let response = server
             .dispatch(request, &mut pair, AccessTransport::McpWs)
@@ -1039,5 +1238,171 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].decision, AuditDecision::Denied);
         assert_eq!(events[0].action, AuditAction::ReadFile);
+    }
+
+    struct FakeAuthenticator {
+        agent_id: String,
+        token: String,
+        scopes: Vec<ResolvedScope>,
+    }
+
+    impl AgentAuthenticator for FakeAuthenticator {
+        fn authenticate(
+            &self,
+            agent_id: Option<&str>,
+            token: &str,
+        ) -> std::result::Result<ResolvedAgent, String> {
+            // Default-agent fallback: shared secret with no agent_id.
+            if agent_id.is_none() {
+                if token == "test-secret" {
+                    return Ok(ResolvedAgent {
+                        agent_id: "ag_default".into(),
+                        scopes: vec![],
+                    });
+                }
+                return Err("invalid shared secret".into());
+            }
+            if agent_id == Some(self.agent_id.as_str()) && token == self.token {
+                Ok(ResolvedAgent {
+                    agent_id: self.agent_id.clone(),
+                    scopes: self.scopes.clone(),
+                })
+            } else {
+                Err("unknown agent".into())
+            }
+        }
+    }
+
+    fn authed_server(scopes: Vec<ResolvedScope>) -> McpServer<StubVault> {
+        let auth = Arc::new(FakeAuthenticator {
+            agent_id: "ag_1".into(),
+            token: "tok-1".into(),
+            scopes,
+        });
+        server().with_agent_authenticator(auth)
+    }
+
+    #[tokio::test]
+    async fn shared_secret_still_pairs_with_authenticator() {
+        let server = authed_server(vec![]);
+        let mut pair = PairState::Unpaired;
+        let response = server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":1,"method":"vault.pair","params":{"secret":"test-secret"}}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["paired"], true);
+        assert_eq!(response["result"]["agent_id"], "ag_default");
+    }
+
+    #[tokio::test]
+    async fn per_agent_token_binds_identity_and_stamps_audit() {
+        let audit = Arc::new(MemoryAudit(Default::default()));
+        let server = authed_server(vec![]).with_audit_sink(audit.clone());
+        let mut pair = PairState::Unpaired;
+        let pair_resp = server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":1,"method":"vault.pair","params":{"agent_id":"ag_1","token":"tok-1"}}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pair_resp["result"]["agent_id"], "ag_1");
+
+        let payload = B64.encode(b"hi");
+        let write = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"vault.write","arguments":{{"container":"notes","file_name":"a.txt","content_b64":"{payload}"}}}}}}"#
+        );
+        let resp = server
+            .dispatch(&write, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], false);
+        let events = audit.0.lock().unwrap();
+        assert_eq!(events.last().unwrap().agent_id.as_deref(), Some("ag_1"));
+    }
+
+    #[tokio::test]
+    async fn wrong_agent_token_rejected() {
+        let server = authed_server(vec![]);
+        let mut pair = PairState::Unpaired;
+        let response = server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":1,"method":"vault.pair","params":{"agent_id":"ag_1","token":"bad"}}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["error"]["code"], codes::UNPAIRED);
+        assert!(matches!(pair, PairState::Failed));
+    }
+
+    #[tokio::test]
+    async fn scope_denies_action_not_granted() {
+        // Agent may only read "notes", so a write must be denied by scope.
+        let server = authed_server(vec![ResolvedScope {
+            container_glob: "notes".into(),
+            actions: vec![AccessAction::ReadFile],
+            mode_ceiling: None,
+        }]);
+        let mut pair = PairState::Unpaired;
+        server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":1,"method":"vault.pair","params":{"agent_id":"ag_1","token":"tok-1"}}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
+            .await
+            .unwrap();
+        let payload = B64.encode(b"hi");
+        let write = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"vault.write","arguments":{{"container":"notes","file_name":"a.txt","content_b64":"{payload}"}}}}}}"#
+        );
+        let resp = server
+            .dispatch(&write, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn scope_allows_granted_action() {
+        let server = authed_server(vec![ResolvedScope {
+            container_glob: "notes".into(),
+            actions: vec![AccessAction::ReadFile, AccessAction::WriteFile],
+            mode_ceiling: None,
+        }]);
+        let mut pair = PairState::Unpaired;
+        server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":1,"method":"vault.pair","params":{"agent_id":"ag_1","token":"tok-1"}}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
+            .await
+            .unwrap();
+        let payload = B64.encode(b"hi");
+        let write = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"vault.write","arguments":{{"container":"notes","file_name":"a.txt","content_b64":"{payload}"}}}}}}"#
+        );
+        let resp = server
+            .dispatch(&write, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], false);
+    }
+
+    #[test]
+    fn glob_matches() {
+        assert!(glob_match("notes", "notes"));
+        assert!(glob_match("notes/**", "notes/sub/file"));
+        assert!(glob_match("*", "notes"));
+        assert!(!glob_match("*", "notes/sub"));
+        assert!(!glob_match("notes", "other"));
     }
 }
