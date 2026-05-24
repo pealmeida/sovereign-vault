@@ -1,6 +1,6 @@
 # ADR-0009 — Broker and transit MCP tools (use secrets without exposing them)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-05-23
 - **Deciders:** pealmeida
 

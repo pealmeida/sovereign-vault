@@ -1,6 +1,6 @@
 # ADR-0007 — Root key / data key hierarchy (the keyring)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-05-23
 - **Deciders:** pealmeida
 

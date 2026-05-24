@@ -268,7 +268,7 @@ pub async fn execute(
         builder = builder.body(body.clone());
     }
 
-    let resp = builder
+    let mut resp = builder
         .send()
         .await
         .map_err(|e| BrokerError::Upstream(redact_url(&e.to_string(), &resolved.secret)))?;
@@ -285,14 +285,26 @@ pub async fn execute(
         }
     }
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| BrokerError::Upstream(e.to_string()))?;
-    if bytes.len() > MAX_RESPONSE_BYTES {
-        return Err(BrokerError::ResponseTooLarge(MAX_RESPONSE_BYTES));
+    // Reject early if the server advertises an oversized body...
+    if let Some(len) = resp.content_length() {
+        if len > MAX_RESPONSE_BYTES as u64 {
+            return Err(BrokerError::ResponseTooLarge(MAX_RESPONSE_BYTES));
+        }
     }
-    let body = String::from_utf8_lossy(&bytes).into_owned();
+    // ...and enforce the cap while streaming so a lying or chunked server
+    // cannot make us buffer unbounded memory.
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| BrokerError::Upstream(e.to_string()))?
+    {
+        if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(BrokerError::ResponseTooLarge(MAX_RESPONSE_BYTES));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8_lossy(&buf).into_owned();
 
     Ok(BrokerResponse {
         status,
