@@ -23,6 +23,7 @@ pub use sv_mcp;
 pub use sv_recovery;
 pub use sv_storage;
 
+pub mod agents;
 pub mod keyring;
 
 use std::fs;
@@ -239,6 +240,46 @@ impl VaultHandle {
     /// under the current key.
     pub fn audit_hmac_key(&self) -> [u8; 32] {
         self.vault.derive_subkey(b"sv-audit-hmac-v1")
+    }
+
+    /// Derive the keyed HMAC key used to hash agent tokens in `agents.json`.
+    ///
+    /// Like [`Self::audit_hmac_key`], this is derived from the ACTIVE DEK, so
+    /// after a key rotation existing token hashes no longer verify.
+    pub fn agent_token_key(&self) -> [u8; 32] {
+        self.vault.derive_subkey(b"sv-agent-token-v1")
+    }
+
+    // ---- agent registry (ADR-0008) ---------------------------------------
+
+    /// Mint a new agent identity. Returns `(agent_id, one_time_token)`.
+    pub fn create_agent(
+        &self,
+        name: &str,
+        scopes: Vec<agents::AgentScope>,
+    ) -> Result<(String, String)> {
+        agents::create_agent(self.root(), &self.agent_token_key(), name, scopes)
+    }
+
+    /// List all registered agents.
+    pub fn list_agents(&self) -> Result<Vec<agents::AgentRecord>> {
+        agents::list_agents(self.root())
+    }
+
+    /// Revoke an agent by id.
+    pub fn revoke_agent(&self, agent_id: &str) -> Result<()> {
+        agents::revoke_agent(self.root(), agent_id)
+    }
+
+    /// Authenticate an agent against the registry by id + token.
+    pub fn authenticate_agent(&self, agent_id: &str, token: &str) -> Result<agents::AgentRecord> {
+        agents::authenticate(self.root(), &self.agent_token_key(), agent_id, token)
+    }
+
+    /// Ensure the built-in "Default" agent exists wrapping `pairing_secret`.
+    /// Idempotent; used by the desktop migration.
+    pub fn ensure_default_agent(&self, pairing_secret: &str) -> Result<()> {
+        agents::ensure_default_agent(self.root(), &self.agent_token_key(), pairing_secret)
     }
 
     // ---- storage facade --------------------------------------------------

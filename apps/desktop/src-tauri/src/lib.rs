@@ -210,6 +210,68 @@ impl sv_mcp::AuditSink for DesktopAuditSink {
     }
 }
 
+struct DesktopAgentAuthenticator {
+    root: PathBuf,
+    token_key: [u8; 32],
+    shared_secret: String,
+}
+
+fn parse_access_action(s: &str) -> Option<sv_mcp::AccessAction> {
+    match s {
+        "list" | "list_containers" => Some(sv_mcp::AccessAction::ListContainers),
+        "list_files" => Some(sv_mcp::AccessAction::ListFiles),
+        "read" | "read_file" => Some(sv_mcp::AccessAction::ReadFile),
+        "write" | "write_file" => Some(sv_mcp::AccessAction::WriteFile),
+        "delete" | "delete_file" => Some(sv_mcp::AccessAction::DeleteFile),
+        "create_container" => Some(sv_mcp::AccessAction::CreateContainer),
+        _ => None,
+    }
+}
+
+fn resolve_scopes(scopes: &[sv_core::agents::AgentScope]) -> Vec<sv_mcp::ResolvedScope> {
+    scopes
+        .iter()
+        .map(|s| sv_mcp::ResolvedScope {
+            container_glob: s.container_glob.clone(),
+            actions: s.actions.iter().filter_map(|a| parse_access_action(a)).collect(),
+            mode_ceiling: s
+                .mode_ceiling
+                .as_deref()
+                .and_then(|m| SecurityMode::parse(m).ok()),
+        })
+        .collect()
+}
+
+impl sv_mcp::AgentAuthenticator for DesktopAgentAuthenticator {
+    fn authenticate(
+        &self,
+        agent_id: Option<&str>,
+        token: &str,
+    ) -> Result<sv_mcp::ResolvedAgent, String> {
+        // Legacy fallback: a bare shared secret resolves to the Default agent.
+        let agent_id = match agent_id {
+            Some(id) => id.to_string(),
+            None => {
+                if token != self.shared_secret {
+                    return Err("invalid shared secret".into());
+                }
+                sv_core::agents::list_agents(&self.root)
+                    .map_err(estr)?
+                    .into_iter()
+                    .find(|a| a.name == sv_core::agents::DEFAULT_AGENT_NAME && !a.revoked)
+                    .map(|a| a.agent_id)
+                    .ok_or_else(|| "no default agent".to_string())?
+            }
+        };
+        let record = sv_core::agents::authenticate(&self.root, &self.token_key, &agent_id, token)
+            .map_err(estr)?;
+        Ok(sv_mcp::ResolvedAgent {
+            agent_id: record.agent_id,
+            scopes: resolve_scopes(&record.scopes),
+        })
+    }
+}
+
 struct DesktopAccessController {
     approvals: Arc<ApprovalState>,
 }
@@ -923,6 +985,59 @@ async fn mcp_status(state: State<'_, VaultState>) -> Result<McpStatus, String> {
     })
 }
 
+/// One agent as surfaced to the UI (never includes the token).
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentInfo {
+    agent_id: String,
+    name: String,
+    created_at: String,
+    expires_at: Option<String>,
+    revoked: bool,
+    scopes: Vec<sv_core::agents::AgentScope>,
+}
+
+/// Response for [`agent_create`]: the one-time token is shown exactly once.
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentCreated {
+    agent_id: String,
+    token: String,
+}
+
+#[tauri::command]
+async fn agent_create(
+    app: AppHandle,
+    state: State<'_, VaultState>,
+    name: String,
+    scopes: Option<Vec<sv_core::agents::AgentScope>>,
+) -> Result<AgentCreated, String> {
+    let _ = &app;
+    let (agent_id, token) =
+        with_handle(&state, |handle| handle.create_agent(&name, scopes.unwrap_or_default()).map_err(estr))
+            .await?;
+    Ok(AgentCreated { agent_id, token })
+}
+
+#[tauri::command]
+async fn agent_list(state: State<'_, VaultState>) -> Result<Vec<AgentInfo>, String> {
+    let agents = with_handle(&state, |handle| handle.list_agents().map_err(estr)).await?;
+    Ok(agents
+        .into_iter()
+        .map(|a| AgentInfo {
+            agent_id: a.agent_id,
+            name: a.name,
+            created_at: a.created_at.to_rfc3339(),
+            expires_at: a.expires_at.map(|t| t.to_rfc3339()),
+            revoked: a.revoked,
+            scopes: a.scopes,
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn agent_revoke(state: State<'_, VaultState>, agent_id: String) -> Result<(), String> {
+    with_handle(&state, |handle| handle.revoke_agent(&agent_id).map_err(estr)).await
+}
+
 #[tauri::command]
 fn cli_binary_path() -> Result<String, String> {
     let me = std::env::current_exe().map_err(estr)?;
@@ -949,23 +1064,35 @@ async fn start_servers(state: &State<'_, VaultState>) -> Result<(), String> {
     let http_listener = tokio::net::TcpListener::bind(http_addr).await.map_err(estr)?;
 
     let audit_root = audit_root(&state)?;
-    let audit_hmac_key = {
+    let vault_dir = vault_root(&state.app)?;
+    let (audit_hmac_key, agent_token_key) = {
         let guard = state.handle.lock().await;
         let handle = guard
             .as_ref()
             .ok_or_else(|| "vault is locked".to_string())?;
-        handle.audit_hmac_key()
+        (handle.audit_hmac_key(), handle.agent_token_key())
     };
+
+    // Migration: ensure a "Default" agent wraps the current shared secret so
+    // existing pairing keeps working. Idempotent.
+    sv_core::agents::ensure_default_agent(&vault_dir, &agent_token_key, &secret).map_err(estr)?;
+
     let controller = Arc::new(DesktopAccessController {
         approvals: state.approvals.clone(),
     });
     let sink = Arc::new(DesktopAuditSink::new(audit_root, audit_hmac_key));
+    let authenticator = Arc::new(DesktopAgentAuthenticator {
+        root: vault_dir,
+        token_key: agent_token_key,
+        shared_secret: secret.clone(),
+    });
 
     let (ws_tx, ws_rx) = oneshot::channel::<()>();
     let ws_server = Arc::new(
         sv_mcp::McpServer::new(state.handle.clone() as sv_mcp::SharedVault<VaultHandle>, secret.clone())
             .with_access_controller(controller)
-            .with_audit_sink(sink),
+            .with_audit_sink(sink)
+            .with_agent_authenticator(authenticator),
     );
     let ws_task = spawn(async move {
         if let Err(error) = ws_server.serve_ws_listener(ws_listener, ws_rx).await {
@@ -1040,6 +1167,9 @@ pub fn run() {
             vault_delete_file,
             approval_respond,
             mcp_status,
+            agent_create,
+            agent_list,
+            agent_revoke,
             cli_binary_path,
         ])
         .run(tauri::generate_context!())

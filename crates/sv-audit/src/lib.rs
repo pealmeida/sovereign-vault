@@ -138,6 +138,10 @@ pub struct AuditEvent {
     /// Error message for failed operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Identity of the agent that originated the action, when known. Becomes
+    /// part of the hash-chained bytes; absent on legacy entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 impl AuditEvent {
@@ -154,6 +158,7 @@ impl AuditEvent {
             byte_size: None,
             detail: None,
             error: None,
+            agent_id: None,
         }
     }
 }

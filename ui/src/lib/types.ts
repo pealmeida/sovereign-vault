@@ -46,3 +46,23 @@ export interface McpStatus {
   ws_url: string;
   http_url: string;
 }
+
+export interface AgentScope {
+  container_glob: string;
+  actions: string[];
+  mode_ceiling?: string | null;
+}
+
+export interface AgentInfo {
+  agent_id: string;
+  name: string;
+  created_at: string;
+  expires_at: string | null;
+  revoked: boolean;
+  scopes: AgentScope[];
+}
+
+export interface AgentCreated {
+  agent_id: string;
+  token: string;
+}
