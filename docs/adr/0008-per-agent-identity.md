@@ -1,6 +1,6 @@
 # ADR-0008 — Per-agent identity and scoped capability grants
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-05-23
 - **Deciders:** pealmeida
 
