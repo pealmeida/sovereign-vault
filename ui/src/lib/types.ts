@@ -66,3 +66,31 @@ export interface AgentCreated {
   agent_id: string;
   token: string;
 }
+
+export interface TransitKeyInfo {
+  name: string;
+  version: number;
+}
+
+export interface SigningKeyInfo {
+  name: string;
+  version: number;
+  public_b64: string;
+}
+
+export interface BrokerAllow {
+  host: string;
+  path_prefix: string;
+  methods: string[];
+  allow_private_ip?: boolean;
+}
+
+export type BrokerInjection =
+  | 'bearer_auth'
+  | { header: { name: string } };
+
+export interface BrokerSecretInfo {
+  name: string;
+  allow: BrokerAllow[];
+  injection: BrokerInjection;
+}

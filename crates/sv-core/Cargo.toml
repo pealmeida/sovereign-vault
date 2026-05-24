@@ -23,4 +23,7 @@ chrono       = { workspace = true }
 hmac         = { workspace = true }
 sha2         = { workspace = true }
 subtle       = { workspace = true }
+reqwest      = { workspace = true }
+url          = "2.5"
+async-trait  = "0.1"
 base64       = "0.22"

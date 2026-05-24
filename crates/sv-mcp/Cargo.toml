@@ -10,6 +10,7 @@ description = "Model Context Protocol (MCP) server for Sovereign Vault. Stdio + 
 [dependencies]
 sv-audit          = { workspace = true }
 sv-storage        = { workspace = true }
+sv-crypto         = { workspace = true }
 serde             = { workspace = true }
 serde_json        = { workspace = true }
 thiserror         = { workspace = true }

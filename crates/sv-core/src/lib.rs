@@ -24,7 +24,9 @@ pub use sv_recovery;
 pub use sv_storage;
 
 pub mod agents;
+pub mod broker;
 pub mod keyring;
+pub mod transit;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -282,6 +284,83 @@ impl VaultHandle {
         agents::ensure_default_agent(self.root(), &self.agent_token_key(), pairing_secret)
     }
 
+    // ---- transit / signing / broker key material (ADR-0009) -------------
+
+    /// Derive the wrapping key under which transit/signing/broker material is
+    /// sealed. Derived from the ACTIVE DEK (HKDF), so it never exposes the DEK
+    /// itself and changes after a rotation (material is re-wrapped on rotate).
+    fn material_wrap_key(&self) -> MasterKey {
+        MasterKey::from_bytes(self.vault.derive_subkey(b"sv-transit-wrap-v1"))
+    }
+
+    /// Create a named symmetric transit key. Returns its metadata.
+    pub fn transit_create_key(&self, name: &str) -> Result<transit::TransitKeyInfo> {
+        transit::transit_create_key(self.root(), &self.material_wrap_key(), name)
+    }
+
+    /// List transit keys (metadata only).
+    pub fn transit_list(&self) -> Result<Vec<transit::TransitKeyInfo>> {
+        transit::transit_list(self.root())
+    }
+
+    /// Encrypt `plaintext` under `key_ref`, returning base64 ciphertext.
+    pub fn transit_encrypt(&self, key_ref: &str, plaintext: &[u8]) -> Result<String> {
+        transit::transit_encrypt(self.root(), &self.material_wrap_key(), key_ref, plaintext)
+    }
+
+    /// Decrypt base64 `ciphertext_b64` under `key_ref`.
+    pub fn transit_decrypt(&self, key_ref: &str, ciphertext_b64: &str) -> Result<Vec<u8>> {
+        transit::transit_decrypt(self.root(), &self.material_wrap_key(), key_ref, ciphertext_b64)
+    }
+
+    /// Create an Ed25519 signing key. Returns metadata incl. the public key.
+    pub fn signing_create_key(&self, name: &str) -> Result<transit::SigningKeyInfo> {
+        transit::signing_create_key(self.root(), &self.material_wrap_key(), name)
+    }
+
+    /// List signing keys (metadata + public keys only).
+    pub fn signing_list(&self) -> Result<Vec<transit::SigningKeyInfo>> {
+        transit::signing_list(self.root())
+    }
+
+    /// Exportable base64 public key for `key_ref`.
+    pub fn signing_public_key(&self, key_ref: &str) -> Result<String> {
+        transit::signing_public_key(self.root(), key_ref)
+    }
+
+    /// Sign `payload` with `key_ref`, returning a base64 signature.
+    pub fn signing_sign(&self, key_ref: &str, payload: &[u8]) -> Result<String> {
+        transit::signing_sign(self.root(), &self.material_wrap_key(), key_ref, payload)
+    }
+
+    /// Create a brokered secret with a destination allowlist.
+    pub fn broker_create(
+        &self,
+        name: &str,
+        secret: &str,
+        allow: Vec<transit::BrokerAllow>,
+        injection: transit::BrokerInjection,
+    ) -> Result<transit::BrokerSecretInfo> {
+        transit::broker_create(
+            self.root(),
+            &self.material_wrap_key(),
+            name,
+            secret,
+            allow,
+            injection,
+        )
+    }
+
+    /// List brokered secrets (metadata only).
+    pub fn broker_list(&self) -> Result<Vec<transit::BrokerSecretInfo>> {
+        transit::broker_list(self.root())
+    }
+
+    /// Resolve a brokered secret for in-process injection (not for agents).
+    pub fn broker_resolve(&self, secret_ref: &str) -> Result<transit::ResolvedBrokerSecret> {
+        transit::broker_resolve(self.root(), &self.material_wrap_key(), secret_ref)
+    }
+
     // ---- storage facade --------------------------------------------------
 
     /// List all containers.
@@ -436,6 +515,7 @@ fn derive_passphrase_kek(root: &Path, passphrase: &str) -> Result<MasterKey> {
     MasterKey::from_passphrase(passphrase, &salt).map_err(CoreError::from)
 }
 
+#[async_trait::async_trait]
 impl sv_mcp::VaultFacade for VaultHandle {
     fn list_containers(&self) -> std::result::Result<Vec<ContainerInfo>, String> {
         VaultHandle::list_containers(self).map_err(|e| e.to_string())
@@ -469,6 +549,66 @@ impl sv_mcp::VaultFacade for VaultHandle {
     }
     fn container_mode(&self, container: &str) -> std::result::Result<SecurityMode, String> {
         VaultHandle::container_mode(self, container).map_err(|e| e.to_string())
+    }
+
+    fn transit_encrypt(
+        &self,
+        key_ref: &str,
+        plaintext: &[u8],
+    ) -> std::result::Result<String, String> {
+        VaultHandle::transit_encrypt(self, key_ref, plaintext).map_err(|e| e.to_string())
+    }
+
+    fn transit_decrypt(
+        &self,
+        key_ref: &str,
+        ciphertext_b64: &str,
+    ) -> std::result::Result<Vec<u8>, String> {
+        VaultHandle::transit_decrypt(self, key_ref, ciphertext_b64).map_err(|e| e.to_string())
+    }
+
+    fn sign(&self, key_ref: &str, payload: &[u8]) -> std::result::Result<String, String> {
+        VaultHandle::signing_sign(self, key_ref, payload).map_err(|e| e.to_string())
+    }
+
+    fn signing_public_key(&self, key_ref: &str) -> std::result::Result<String, String> {
+        VaultHandle::signing_public_key(self, key_ref).map_err(|e| e.to_string())
+    }
+
+    fn broker_enabled(&self) -> bool {
+        broker::is_enabled()
+    }
+
+    async fn broker_request(
+        &self,
+        secret_ref: &str,
+        method: &str,
+        url: &str,
+        headers: std::collections::BTreeMap<String, String>,
+        body: Option<String>,
+    ) -> std::result::Result<sv_mcp::BrokerOutcome, String> {
+        let resolved = self.broker_resolve(secret_ref).map_err(|e| e.to_string())?;
+        let request = broker::BrokerRequest {
+            method: method.to_string(),
+            url: url.to_string(),
+            headers,
+            body,
+        };
+        // Resolve the target host for audit attribution before the call.
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_default();
+        let response = broker::execute(&request, &resolved)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(sv_mcp::BrokerOutcome {
+            status: response.status,
+            headers: response.headers,
+            body: response.body,
+            host,
+            method: method.to_ascii_uppercase(),
+        })
     }
 }
 

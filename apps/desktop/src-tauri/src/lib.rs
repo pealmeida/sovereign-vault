@@ -224,6 +224,11 @@ fn parse_access_action(s: &str) -> Option<sv_mcp::AccessAction> {
         "write" | "write_file" => Some(sv_mcp::AccessAction::WriteFile),
         "delete" | "delete_file" => Some(sv_mcp::AccessAction::DeleteFile),
         "create_container" => Some(sv_mcp::AccessAction::CreateContainer),
+        "encrypt" => Some(sv_mcp::AccessAction::Encrypt),
+        "decrypt" => Some(sv_mcp::AccessAction::Decrypt),
+        "sign" => Some(sv_mcp::AccessAction::Sign),
+        "verify" => Some(sv_mcp::AccessAction::Verify),
+        "broker" | "broker_request" => Some(sv_mcp::AccessAction::Broker),
         _ => None,
     }
 }
@@ -331,6 +336,20 @@ fn record_desktop_event(state: &VaultState, event: AuditEvent) {
 }
 
 fn approval_requirement(request: &sv_mcp::AccessRequest) -> Result<ApprovalPromptKind, String> {
+    // Broker is the highest-risk action and ALWAYS requires approval, never
+    // DIRECT, regardless of any (absent) container mode.
+    if matches!(request.action, sv_mcp::AccessAction::Broker) {
+        return Ok(ApprovalPromptKind::Click);
+    }
+    // Transit + signing carry no container mode; gate them on a click, except
+    // verify (public-key only, no secret material involved).
+    match request.action {
+        sv_mcp::AccessAction::Encrypt
+        | sv_mcp::AccessAction::Decrypt
+        | sv_mcp::AccessAction::Sign => return Ok(ApprovalPromptKind::Click),
+        sv_mcp::AccessAction::Verify => return Ok(ApprovalPromptKind::NotRequired),
+        _ => {}
+    }
     match request.mode {
         Some(SecurityMode::Direct) | None => match request.action {
             sv_mcp::AccessAction::ListContainers | sv_mcp::AccessAction::CreateContainer => {
@@ -1039,6 +1058,64 @@ async fn agent_revoke(state: State<'_, VaultState>, agent_id: String) -> Result<
 }
 
 #[tauri::command]
+async fn transit_create_key(
+    state: State<'_, VaultState>,
+    name: String,
+) -> Result<sv_core::transit::TransitKeyInfo, String> {
+    with_handle(&state, |handle| handle.transit_create_key(&name).map_err(estr)).await
+}
+
+#[tauri::command]
+async fn transit_list_keys(
+    state: State<'_, VaultState>,
+) -> Result<Vec<sv_core::transit::TransitKeyInfo>, String> {
+    with_handle(&state, |handle| handle.transit_list().map_err(estr)).await
+}
+
+#[tauri::command]
+async fn signing_create_key(
+    state: State<'_, VaultState>,
+    name: String,
+) -> Result<sv_core::transit::SigningKeyInfo, String> {
+    with_handle(&state, |handle| handle.signing_create_key(&name).map_err(estr)).await
+}
+
+#[tauri::command]
+async fn signing_list_keys(
+    state: State<'_, VaultState>,
+) -> Result<Vec<sv_core::transit::SigningKeyInfo>, String> {
+    with_handle(&state, |handle| handle.signing_list().map_err(estr)).await
+}
+
+#[tauri::command]
+async fn broker_create_secret(
+    state: State<'_, VaultState>,
+    name: String,
+    secret: String,
+    allow: Vec<sv_core::transit::BrokerAllow>,
+    injection: Option<sv_core::transit::BrokerInjection>,
+) -> Result<sv_core::transit::BrokerSecretInfo, String> {
+    with_handle(&state, |handle| {
+        handle
+            .broker_create(&name, &secret, allow, injection.unwrap_or_default())
+            .map_err(estr)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn broker_list_secrets(
+    state: State<'_, VaultState>,
+) -> Result<Vec<sv_core::transit::BrokerSecretInfo>, String> {
+    with_handle(&state, |handle| handle.broker_list().map_err(estr)).await
+}
+
+#[tauri::command]
+fn broker_enabled() -> bool {
+    sv_core::broker::is_enabled()
+}
+
+#[tauri::command]
 fn cli_binary_path() -> Result<String, String> {
     let me = std::env::current_exe().map_err(estr)?;
     let dir = me.parent().ok_or_else(|| "no parent dir".to_string())?;
@@ -1170,6 +1247,13 @@ pub fn run() {
             agent_create,
             agent_list,
             agent_revoke,
+            transit_create_key,
+            transit_list_keys,
+            signing_create_key,
+            signing_list_keys,
+            broker_create_secret,
+            broker_list_secrets,
+            broker_enabled,
             cli_binary_path,
         ])
         .run(tauri::generate_context!())
