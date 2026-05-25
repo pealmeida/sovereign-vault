@@ -64,7 +64,7 @@ Companion to `e2e-test-plan.md`. Concrete, repeatable desktop-app cases driven t
 - **UI-APP-1** An agent MCP call to an APPROVAL container raises a desktop prompt; Approve → call proceeds; Deny → call fails.
 - **UI-APP-2** OTP container → prompt requires the displayed one-time code; wrong code rejected.
 - **UI-APP-3** Settings → *Pending requests* lists in-flight approvals; "Open audit folder" works.
-  > **OPEN ITEM (2026-05-25):** a background MCP `vault.list` (approval-required) showed **no visible approval modal** within 25 s on the Vault page, and the call returned nothing. Verify the `vault://approval-request` event renders a modal/banner regardless of active page and populates *Pending requests*. **Blocks trusting APPROVAL/OTP via the UI** — highest-priority UI fix to confirm.
+  > **FIXED in code (commit `87c8ff8`), pending live re-verify:** approvals never reached the UI — the frontend listened for `mcp-approval` while the backend emits `vault://approval-request`, and the modal was only rendered inside FilesPage. App.svelte now listens on the correct event and hosts the Approval/OTP modal globally (keyed per request id). Re-run UI-APP-1/2 on a non-Files page to confirm the modal appears and Approve/Deny resolve the agent call.
 
 ## Lock / lifecycle
 
@@ -73,7 +73,7 @@ Companion to `e2e-test-plan.md`. Concrete, repeatable desktop-app cases driven t
 
 ## Known UI findings (track to closure)
 
-1. **Approval modal surfacing** (UI-APP-3 open item) — verify/fix.
+1. **Approval modal surfacing** — fixed in code (`87c8ff8`: event-name + global modal host); pending live re-verify.
 2. **Leading-dot filenames** rejected (can't import a literal `.env`).
 3. **Broker UI** lacks multi-allow-entry editing, custom-header injection, and key rotate/delete actions.
 4. **Native file dialog** import not yet automated in computer-use runs (manual step).
