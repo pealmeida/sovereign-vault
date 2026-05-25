@@ -234,6 +234,11 @@ pub struct AccessRequest {
     pub byte_size: Option<usize>,
     /// Identity of the agent that originated the request, when bound.
     pub agent_id: Option<String>,
+    /// One-time code supplied by the caller for OTP-mode containers. The vault
+    /// displays a fresh code on the trusted desktop; the agent resends the same
+    /// request carrying that code here. Cross-channel: the code is shown in one
+    /// place (desktop) and entered in another (agent), binding the session.
+    pub otp: Option<String>,
 }
 
 /// A scope grant resolved for an authenticated agent. Scopes can only narrow
@@ -724,6 +729,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     mode,
                     byte_size: None,
                     agent_id: None,
+                    otp: args.get("otp").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 })
             }
             "vault.read" => {
@@ -737,6 +743,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     mode: Some(handle.container_mode(container)?),
                     byte_size: None,
                     agent_id: None,
+                    otp: args.get("otp").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 })
             }
             "vault.write" => {
@@ -754,6 +761,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     mode: Some(handle.container_mode(container)?),
                     byte_size: Some(bytes.len()),
                     agent_id: None,
+                    otp: args.get("otp").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 })
             }
             "vault.delete" => {
@@ -767,6 +775,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     mode: Some(handle.container_mode(container)?),
                     byte_size: None,
                     agent_id: None,
+                    otp: args.get("otp").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 })
             }
             "vault.create_container" => {
@@ -783,6 +792,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     mode: Some(SecurityMode::parse(mode).map_err(|e| e.to_string())?),
                     byte_size: None,
                     agent_id: None,
+                    otp: args.get("otp").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 })
             }
             "vault.encrypt" => {
@@ -1037,6 +1047,7 @@ fn simple_request(transport: AccessTransport, action: AccessAction) -> AccessReq
         mode: None,
         byte_size: None,
         agent_id: None,
+        otp: None,
     }
 }
 
@@ -1158,7 +1169,8 @@ fn base_tool_descriptors() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "container": { "type": "string", "description": "Container name. Omit to list all containers." }
+                    "container": { "type": "string", "description": "Container name. Omit to list all containers." },
+                    "otp": { "type": "string", "description": "One-time code shown on the trusted desktop (OTP-mode containers only). Resend the same request carrying this code to authorize." }
                 },
                 "additionalProperties": false
             }
@@ -1172,7 +1184,8 @@ fn base_tool_descriptors() -> Value {
                 "required": ["container", "file_name"],
                 "properties": {
                     "container": { "type": "string" },
-                    "file_name": { "type": "string" }
+                    "file_name": { "type": "string" },
+                    "otp": { "type": "string", "description": "One-time code shown on the trusted desktop (OTP-mode containers only). Resend the same request carrying this code to authorize." }
                 },
                 "additionalProperties": false
             }
@@ -1187,7 +1200,8 @@ fn base_tool_descriptors() -> Value {
                 "properties": {
                     "container": { "type": "string" },
                     "file_name": { "type": "string" },
-                    "content_b64": { "type": "string", "description": "Base64-encoded plaintext content." }
+                    "content_b64": { "type": "string", "description": "Base64-encoded plaintext content." },
+                    "otp": { "type": "string", "description": "One-time code shown on the trusted desktop (OTP-mode containers only). Resend the same request carrying this code to authorize." }
                 },
                 "additionalProperties": false
             }
@@ -1200,7 +1214,8 @@ fn base_tool_descriptors() -> Value {
                 "required": ["container", "file_name"],
                 "properties": {
                     "container": { "type": "string" },
-                    "file_name": { "type": "string" }
+                    "file_name": { "type": "string" },
+                    "otp": { "type": "string", "description": "One-time code shown on the trusted desktop (OTP-mode containers only). Resend the same request carrying this code to authorize." }
                 },
                 "additionalProperties": false
             }
@@ -1216,7 +1231,8 @@ fn base_tool_descriptors() -> Value {
                 "properties": {
                     "name":        { "type": "string", "description": "Alphanumeric, hyphen, underscore. <=64 chars." },
                     "mode":        { "type": "string", "enum": ["DIRECT", "APPROVAL", "OTP", "ANONYMIZED", "ZKP", "NATIVE"], "default": "DIRECT" },
-                    "description": { "type": "string", "description": "Optional human-readable description." }
+                    "description": { "type": "string", "description": "Optional human-readable description." },
+                    "otp": { "type": "string", "description": "One-time code shown on the trusted desktop (OTP-mode only). Resend the same request carrying this code to authorize." }
                 },
                 "additionalProperties": false
             }

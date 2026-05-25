@@ -89,7 +89,10 @@
      regardless of the active page, so an agent call never hangs invisibly. -->
 {#each approvalStore.queue.slice(0, 1) as prompt (prompt.id)}
   {#if prompt.otp_code !== null}
-    <OtpModal {prompt} onClose={() => denyById(prompt.id)} />
+    <!-- OTP is display-only: the code is entered on the agent side, so closing
+         the modal just dismisses it (the challenge lives server-side until the
+         agent resends with the code or it expires). -->
+    <OtpModal {prompt} onClose={() => approvalStore.remove(prompt.id)} />
   {:else}
     <ApprovalModal {prompt} onClose={() => denyById(prompt.id)} />
   {/if}
