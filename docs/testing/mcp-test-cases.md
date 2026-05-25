@@ -44,7 +44,7 @@ The trailing `sleep` keeps stdin open so responses flush before EOF. `scripts/e2
   → `content_b64` equals what was written. **VERIFIED 2026-05-25:** wrote a fake `.env`, read returned the identical base64. ✅
 - **TC-RW-3 on-disk check** — the `<container>/<file>.svault` blob contains no plaintext.
 - **TC-RW-4** read a missing file → `isError:true`, "not found".
-- **TC-RW-5** invalid name (leading dot `.env`, `..`, slash) → rejected by validation. *Known: leading-dot names are rejected; store `webapp.env`.*
+- **TC-RW-5** invalid name (`..`, slash, empty, >128) → rejected by validation. **Leading-dot names are now allowed** (fix in `sv-storage::is_valid_file_name`). **VERIFIED LIVE 2026-05-25:** wrote `.env` to `claude-test` via MCP (`byte_size:69, ok:true`), `vault.list` returned it, and the Files-page eye/preview decrypted it inline to the fake `API_KEY`/`DB_URL`. ✅
 
 ## Tool discovery
 
@@ -68,8 +68,9 @@ The trailing `sleep` keeps stdin open so responses flush before EOF. `scripts/e2
 
 ## Human-in-the-loop
 
-- **TC-APPROVE** run `vault.list` (DIRECT) via the proxy in the background; the desktop shows an approval prompt; approve → list returns; deny → `isError`.
-  > **Root cause found + fixed (commit `87c8ff8`), pending live re-verify:** the approval event reached nothing — frontend listened for `mcp-approval` vs backend `vault://approval-request`, and the modal lived only in FilesPage. Now listened correctly and hosted globally in App.svelte. Re-run this case after deploying the rebuilt app.
+- **TC-APPROVE** run an approval-gated tool via the proxy in the background; the desktop shows an approval prompt; approve → call returns; deny → `isError`.
+  > **VERIFIED LIVE 2026-05-25** (commit `87c8ff8`): background `vault.encrypt {key_ref:"demo-key"}` raised the global "Approval required — Action: Encrypt" modal **while the Settings page was active** (not Files), confirming the App.svelte global host + `vault://approval-request` event fix. Clicking APPROVE resolved the blocked call → `{ciphertext_b64, key_ref}` returned, no key bytes leaked. ✅
+  > Note: `vault.list` on a DIRECT container returns **without** a prompt in this build (backend does not gate file-listing within a container), so use `vault.encrypt`/`decrypt`/`sign` to exercise the approval path.
 
 ## Scopes (per-agent token)
 
