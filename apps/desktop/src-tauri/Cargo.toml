@@ -26,6 +26,7 @@ tauri                 = { version = "2", features = [] }
 tauri-plugin-dialog   = "2"
 tauri-plugin-fs       = "2"
 tauri-plugin-opener   = "2"
+tauri-plugin-single-instance = "2"
 async-trait           = "0.1"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]

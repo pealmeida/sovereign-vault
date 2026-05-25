@@ -27,6 +27,7 @@
 
   onMount(() => {
     let unlisten: (() => void) | undefined;
+    let unlistenCancel: (() => void) | undefined;
 
     (async () => {
       try {
@@ -45,9 +46,15 @@
       unlisten = await listen<ApprovalPrompt>('vault://approval-request', (ev) => {
         approvalStore.push(ev.payload);
       });
+      // Backend cancels a pending request (timed out, superseded by a newer
+      // identical request, or the caller disconnected) — drop its modal so the
+      // queue never piles up with stale prompts (APPROVAL_CANCEL_EVENT).
+      unlistenCancel = await listen<{ id: number }>('vault://approval-cancel', (ev) => {
+        approvalStore.remove(ev.payload.id);
+      });
     })();
 
-    return () => unlisten?.();
+    return () => { unlisten?.(); unlistenCancel?.(); };
   });
 
   // Deny a specific request if it is still pending (e.g. modal dismissed
