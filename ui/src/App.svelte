@@ -8,6 +8,8 @@
   import VaultPage from './pages/VaultPage.svelte';
   import FilesPage from './pages/FilesPage.svelte';
   import SettingsPage from './pages/SettingsPage.svelte';
+  import ApprovalModal from './components/ApprovalModal.svelte';
+  import OtpModal from './components/OtpModal.svelte';
   import { vaultStore } from './stores/vault.svelte';
   import { containerStore } from './stores/containers.svelte';
   import { mcpStore } from './stores/mcp.svelte';
@@ -37,15 +39,25 @@
         toastStore.setError(e);
       }
 
-      // Listen for MCP approval events from Tauri
+      // Listen for MCP approval events from Tauri (name must match the
+      // backend APPROVAL_EVENT constant in apps/desktop/src-tauri/src/lib.rs).
       const { listen } = await import('@tauri-apps/api/event');
-      unlisten = await listen<ApprovalPrompt>('mcp-approval', (ev) => {
+      unlisten = await listen<ApprovalPrompt>('vault://approval-request', (ev) => {
         approvalStore.push(ev.payload);
       });
     })();
 
     return () => unlisten?.();
   });
+
+  // Deny a specific request if it is still pending (e.g. modal dismissed
+  // without an explicit decision). Keyed by id so resolving one request
+  // never accidentally denies the next one in the queue.
+  async function denyById(id: number) {
+    if (approvalStore.queue.find((q) => q.id === id)) {
+      try { await approvalStore.respond(id, false); } catch { /* ignore */ }
+    }
+  }
 </script>
 
 <div class="app-shell">
@@ -65,6 +77,16 @@
   </main>
 </div>
 <Toast />
+
+<!-- Global approval surface: any incoming MCP approval/OTP request is shown
+     regardless of the active page, so an agent call never hangs invisibly. -->
+{#each approvalStore.queue.slice(0, 1) as prompt (prompt.id)}
+  {#if prompt.otp_code !== null}
+    <OtpModal {prompt} onClose={() => denyById(prompt.id)} />
+  {:else}
+    <ApprovalModal {prompt} onClose={() => denyById(prompt.id)} />
+  {/if}
+{/each}
 
 <style>
   .boot-state {
