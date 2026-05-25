@@ -61,10 +61,10 @@ Companion to `e2e-test-plan.md`. Concrete, repeatable desktop-app cases driven t
 
 ## Approvals (human-in-the-loop)
 
-- **UI-APP-1** An agent MCP call to an APPROVAL container raises a desktop prompt; Approve → call proceeds; Deny → call fails.
+- **UI-APP-1** An approval-gated agent MCP call raises a desktop prompt; Approve → call proceeds; Deny → call fails. **VERIFIED LIVE 2026-05-25:** background `vault.encrypt` raised the global modal on the **Settings** page; APPROVE resolved the call. ✅
 - **UI-APP-2** OTP container → prompt requires the displayed one-time code; wrong code rejected.
 - **UI-APP-3** Settings → *Pending requests* lists in-flight approvals; "Open audit folder" works.
-  > **FIXED in code (commit `87c8ff8`), pending live re-verify:** approvals never reached the UI — the frontend listened for `mcp-approval` while the backend emits `vault://approval-request`, and the modal was only rendered inside FilesPage. App.svelte now listens on the correct event and hosts the Approval/OTP modal globally (keyed per request id). Re-run UI-APP-1/2 on a non-Files page to confirm the modal appears and Approve/Deny resolve the agent call.
+  > **VERIFIED LIVE 2026-05-25 (commit `87c8ff8`):** confirmed on the **Settings** page (a non-Files page) — the global Approval modal appeared for a background `vault.encrypt`, and APPROVE resolved the agent call. The event-name + global-host fix works end-to-end. ✅
 
 ## Lock / lifecycle
 
@@ -73,7 +73,7 @@ Companion to `e2e-test-plan.md`. Concrete, repeatable desktop-app cases driven t
 
 ## Known UI findings (track to closure)
 
-1. **Approval modal surfacing** — fixed in code (`87c8ff8`: event-name + global modal host); pending live re-verify.
-2. **Leading-dot filenames** rejected (can't import a literal `.env`).
+1. **Approval modal surfacing** — FIXED + VERIFIED LIVE 2026-05-25 (`87c8ff8`: event-name + global modal host).
+2. **Leading-dot filenames** — FIXED + VERIFIED LIVE 2026-05-25 (`is_valid_file_name` now allows `.env`; wrote/listed/previewed `.env` in `claude-test`).
 3. **Broker UI** lacks multi-allow-entry editing, custom-header injection, and key rotate/delete actions.
 4. **Native file dialog** import not yet automated in computer-use runs (manual step).
