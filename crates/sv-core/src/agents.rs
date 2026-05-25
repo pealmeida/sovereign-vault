@@ -166,19 +166,29 @@ pub fn create_agent(
     Ok((agent_id, token))
 }
 
-/// Ensure a "Default" agent exists whose token is `pairing_secret`. Idempotent:
-/// if any agent already exists this is a no-op. Used by the migration so
-/// existing single-shared-secret setups keep working.
+/// Ensure a "Default" agent exists whose token is the current `pairing_secret`.
+///
+/// The pairing secret is regenerated every launch, so this UPSERTS: if a
+/// Default agent already exists its `token_hash` is refreshed to the current
+/// secret (otherwise a stale hash from a previous launch would reject the
+/// shared-secret pairing that existing MCP clients rely on). Creates the agent
+/// if absent. Other agents are left untouched.
 pub fn ensure_default_agent(root: &Path, hmac_key: &[u8; 32], pairing_secret: &str) -> Result<()> {
     let mut file = read_file(root)?;
-    if !file.agents.is_empty() {
-        return Ok(());
+    let new_hash = token_hash(hmac_key, pairing_secret);
+    if let Some(existing) = file
+        .agents
+        .iter_mut()
+        .find(|a| a.name == DEFAULT_AGENT_NAME)
+    {
+        existing.token_hash = new_hash;
+        existing.revoked = false;
+        return write_file(root, &file);
     }
-    let agent_id = fresh_agent_id()?;
     file.agents.push(AgentRecord {
-        agent_id,
+        agent_id: fresh_agent_id()?,
         name: DEFAULT_AGENT_NAME.to_string(),
-        token_hash: token_hash(hmac_key, pairing_secret),
+        token_hash: new_hash,
         created_at: Utc::now(),
         expires_at: None,
         revoked: false,
@@ -312,6 +322,29 @@ mod tests {
         // The default agent authenticates with the shared secret as its token.
         let id = agents[0].agent_id.clone();
         assert!(authenticate(&root, &KEY, &id, "secret").is_ok());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_default_refreshes_token_on_relaunch() {
+        // The pairing secret rotates every launch; the Default agent must track
+        // the CURRENT secret, not a stale one from a previous launch.
+        let root = tmp_dir("default-refresh");
+        ensure_default_agent(&root, &KEY, "secret-launch-1").unwrap();
+        // A user mints another agent — Default must still be refreshed, not skipped.
+        create_agent(&root, &KEY, "Cursor", vec![]).unwrap();
+        ensure_default_agent(&root, &KEY, "secret-launch-2").unwrap();
+
+        let agents = list_agents(&root).unwrap();
+        let default = agents
+            .iter()
+            .find(|a| a.name == DEFAULT_AGENT_NAME)
+            .expect("default present");
+        // New secret works; the stale one does not.
+        assert!(authenticate(&root, &KEY, &default.agent_id, "secret-launch-2").is_ok());
+        assert!(authenticate(&root, &KEY, &default.agent_id, "secret-launch-1").is_err());
+        // Exactly one Default agent, plus the user's agent.
+        assert_eq!(agents.iter().filter(|a| a.name == DEFAULT_AGENT_NAME).count(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 }
