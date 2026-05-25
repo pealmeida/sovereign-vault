@@ -69,7 +69,7 @@ The trailing `sleep` keeps stdin open so responses flush before EOF. `scripts/e2
 ## Human-in-the-loop
 
 - **TC-APPROVE** run `vault.list` (DIRECT) via the proxy in the background; the desktop shows an approval prompt; approve → list returns; deny → `isError`.
-  > **OPEN ITEM (2026-05-25):** in a manual run, an approval-required `vault.list` produced **no visible approval modal** within 25 s and the call returned nothing. Must verify whether the `vault://approval-request` event renders the modal/banner and populates Settings → *Pending requests*. Track to closure before trusting APPROVAL/OTP gating end-to-end.
+  > **Root cause found + fixed (commit `87c8ff8`), pending live re-verify:** the approval event reached nothing — frontend listened for `mcp-approval` vs backend `vault://approval-request`, and the modal lived only in FilesPage. Now listened correctly and hosted globally in App.svelte. Re-run this case after deploying the rebuilt app.
 
 ## Scopes (per-agent token)
 
