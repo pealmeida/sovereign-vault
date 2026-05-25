@@ -30,6 +30,11 @@ use tokio::sync::{oneshot, Mutex};
 
 const RPC_PORT: u16 = 9944;
 const APPROVAL_EVENT: &str = "vault://approval-request";
+const APPROVAL_CANCEL_EVENT: &str = "vault://approval-cancel";
+/// How long a pending approval stays open before auto-cancelling. Kept short so
+/// a caller that disconnects (e.g. its own MCP client timed out) doesn't leave a
+/// stale modal lingering on screen.
+const APPROVAL_TIMEOUT_SECS: u64 = 120;
 
 type SharedHandle = Arc<Mutex<Option<VaultHandle>>>;
 
@@ -46,6 +51,22 @@ struct ServersShutdown {
 struct PendingApproval {
     tx: oneshot::Sender<bool>,
     otp_code: Option<String>,
+    /// Identity of the request (action + target + agent). Used to dedupe a
+    /// retry storm: an identical request supersedes the older pending one.
+    signature: String,
+}
+
+/// Stable identity for an access request so retries collapse onto one modal.
+fn request_signature(request: &sv_mcp::AccessRequest) -> String {
+    format!(
+        "{:?}|{:?}|{:?}|{:?}",
+        request.action, request.container, request.file_name, request.agent_id
+    )
+}
+
+#[derive(Clone, Serialize)]
+struct ApprovalCancel {
+    id: u64,
 }
 
 enum ApprovalPromptKind {
@@ -77,16 +98,36 @@ impl ApprovalState {
         };
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let signature = request_signature(&request);
         let (tx, rx) = oneshot::channel();
-        {
+        let superseded: Vec<u64> = {
             let mut pending = self.pending.lock().await;
+            // Supersede any outstanding request with the same signature: a
+            // duplicate almost always means the previous caller disconnected
+            // and retried, so the old modal is stale. Cancel it (deny the old
+            // call) instead of stacking a second modal.
+            let stale: Vec<u64> = pending
+                .iter()
+                .filter(|(_, p)| p.signature == signature)
+                .map(|(k, _)| *k)
+                .collect();
+            for old in &stale {
+                if let Some(prev) = pending.remove(old) {
+                    let _ = prev.tx.send(false);
+                }
+            }
             pending.insert(
                 id,
                 PendingApproval {
                     tx,
                     otp_code: otp_code.clone(),
+                    signature,
                 },
             );
+            stale
+        };
+        for old in superseded {
+            let _ = self.app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: old });
         }
 
         let payload = ApprovalPrompt {
@@ -100,13 +141,16 @@ impl ApprovalState {
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
 
-        match tokio::time::timeout(Duration::from_secs(300), rx).await {
+        match tokio::time::timeout(Duration::from_secs(APPROVAL_TIMEOUT_SECS), rx).await {
             Ok(Ok(true)) => Ok(()),
             Ok(Ok(false)) => Err("access denied by user".into()),
             Ok(Err(_)) => Err("approval channel closed".into()),
             Err(_) => {
                 let mut pending = self.pending.lock().await;
                 pending.remove(&id);
+                drop(pending);
+                // Tell the UI to drop the now-defunct modal.
+                let _ = self.app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id });
                 Err("approval timed out".into())
             }
         }
@@ -1219,6 +1263,14 @@ async fn stop_servers(state: &State<'_, VaultState>) {
 /// Build and run the Tauri application.
 pub fn run() {
     tauri::Builder::default()
+        // Must be registered FIRST. A second launch focuses the existing
+        // window instead of spawning another instance bound to the same vault.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
