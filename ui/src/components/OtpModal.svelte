@@ -1,53 +1,33 @@
 <script lang="ts">
   import { X } from 'lucide-svelte';
   import type { ApprovalPrompt } from '../lib/types';
-  import { approvalStore } from '../stores/approvals.svelte';
-  import { toastStore } from '../stores/toast.svelte';
 
   let { prompt, onClose }: { prompt: ApprovalPrompt; onClose: () => void } = $props();
-
-  let otpInput = $state('');
-
-  async function submit() {
-    if (!otpInput.trim()) { toastStore.setError('Enter the OTP code.'); return; }
-    try {
-      await approvalStore.respond(prompt.id, true, otpInput.trim());
-      onClose();
-    } catch (e) {
-      toastStore.setError(e);
-    }
-  }
 </script>
 
 <div class="modal-shell" role="dialog" aria-modal="true">
-  <div class="modal-card panel-card" style="max-width:400px;width:100%">
+  <div class="modal-card panel-card" style="max-width:420px;width:100%">
     <div class="panel-header">
       <div>
-        <p class="eyebrow">OTP container</p>
-        <h3>One-time password required</h3>
+        <p class="eyebrow">OTP container{prompt.container ? ` · ${prompt.container}` : ''}</p>
+        <h3>One-time code</h3>
       </div>
       <button class="ghost-button" onclick={onClose}><X size={16} /></button>
     </div>
 
     {#if prompt.otp_code}
-      <div class="notice-banner" style="font-family:var(--font-mono);font-size:1.4rem;letter-spacing:0.2em;text-align:center">
+      <div class="notice-banner" style="font-family:var(--font-mono);font-size:1.6rem;letter-spacing:0.3em;text-align:center">
         {prompt.otp_code}
       </div>
-      <p style="color:var(--muted);font-size:0.85rem;margin-top:0.75rem">
-        The vault generated this one-time code. Type it below to approve — this
-        confirms a human is present at the trusted desktop.
-      </p>
     {/if}
-    <label class="field" style="margin-top:0.75rem">
-      <span>OTP code</span>
-      <input type="text" placeholder="123456" bind:value={otpInput} onkeydown={(e) => { if (e.key === 'Enter') submit(); }} />
-    </label>
+    <p style="color:var(--muted);font-size:0.85rem;margin-top:0.75rem">
+      Give this code to the agent that made the request — set it as the
+      <code>otp</code> argument and resend. The code is shown only here and
+      entered only on the agent side, so a request can only proceed when a human
+      at this desktop relays it. Expires in 2 minutes; single use.
+    </p>
     <div style="display:flex;gap:0.75rem;margin-top:1rem;justify-content:flex-end">
-      <button class="ghost-button" onclick={async () => {
-        try { await approvalStore.respond(prompt.id, false); } catch (e) { toastStore.setError(e); }
-        onClose();
-      }}>Deny</button>
-      <button class="primary-button" onclick={submit}>Approve</button>
+      <button class="primary-button" onclick={onClose}>Done</button>
     </div>
   </div>
 </div>

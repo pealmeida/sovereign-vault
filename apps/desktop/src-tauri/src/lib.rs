@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -72,13 +72,22 @@ struct ApprovalCancel {
 enum ApprovalPromptKind {
     NotRequired,
     Click,
-    Otp(String),
+    /// OTP-mode container: cross-channel challenge/response. The vault shows a
+    /// code on the desktop; the agent must resend the request carrying it.
+    Otp,
 }
+
+/// How long an issued OTP challenge stays valid for the resend.
+const OTP_TTL_SECS: u64 = 120;
 
 struct ApprovalState {
     app: AppHandle,
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, PendingApproval>>,
+    /// Outstanding OTP challenges keyed by request signature →
+    /// (code, modal_id, issued_at). The code is shown on the desktop; the agent
+    /// resends the request with it. Single-use, TTL-bounded.
+    otp_pending: Mutex<HashMap<String, (String, u64, Instant)>>,
 }
 
 impl ApprovalState {
@@ -87,15 +96,71 @@ impl ApprovalState {
             app,
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
+            otp_pending: Mutex::new(HashMap::new()),
         }
     }
 
-    async fn request(&self, request: sv_mcp::AccessRequest) -> Result<(), String> {
-        let otp_code = match approval_requirement(&request)? {
-            ApprovalPromptKind::NotRequired => return Ok(()),
-            ApprovalPromptKind::Click => None,
-            ApprovalPromptKind::Otp(code) => Some(code),
+    /// OTP cross-channel flow. First call (no/invalid code): issue a fresh code,
+    /// show it on the desktop (display-only), and return `otp_required` so the
+    /// agent prompts for it. Second call carrying the matching code: consume it
+    /// and allow. The code is never accepted from the same channel that shows
+    /// it — it binds the agent session to a human at the trusted desktop.
+    async fn handle_otp(&self, request: &sv_mcp::AccessRequest) -> Result<(), String> {
+        let key = request_signature(request);
+
+        if let Some(supplied) = request.otp.as_deref() {
+            let mut store = self.otp_pending.lock().await;
+            if let Some((code, modal_id, issued)) = store.get(&key) {
+                let fresh = issued.elapsed() < Duration::from_secs(OTP_TTL_SECS);
+                if fresh && supplied == code.as_str() {
+                    let modal_id = *modal_id;
+                    store.remove(&key);
+                    drop(store);
+                    // Consumed — close the display modal on the desktop.
+                    let _ = self
+                        .app
+                        .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: modal_id });
+                    return Ok(());
+                }
+            }
+            // Wrong or expired code → fall through and issue a fresh challenge.
+        }
+
+        // Issue a new challenge.
+        let code = generate_otp_code()?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut store = self.otp_pending.lock().await;
+            // Supersede any prior challenge for this signature (close its modal).
+            if let Some((_, old_modal, _)) = store.remove(&key) {
+                let _ = self
+                    .app
+                    .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: old_modal });
+            }
+            store.insert(key, (code.clone(), id, Instant::now()));
+        }
+
+        let payload = ApprovalPrompt {
+            id,
+            action: format!("{:?}", request.action),
+            container: request.container.clone(),
+            file_name: request.file_name.clone(),
+            mode: request.mode.map(|m| m.as_str().to_string()),
+            byte_size: request.byte_size,
+            otp_code: Some(code),
         };
+        self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
+        Err("otp_required: a one-time code is shown on the Sovereign Vault desktop. \
+             Resend this exact request with the `otp` argument set to that code."
+            .into())
+    }
+
+    async fn request(&self, request: sv_mcp::AccessRequest) -> Result<(), String> {
+        match approval_requirement(&request)? {
+            ApprovalPromptKind::NotRequired => return Ok(()),
+            ApprovalPromptKind::Click => {}
+            ApprovalPromptKind::Otp => return self.handle_otp(&request).await,
+        }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let signature = request_signature(&request);
@@ -120,7 +185,7 @@ impl ApprovalState {
                 id,
                 PendingApproval {
                     tx,
-                    otp_code: otp_code.clone(),
+                    otp_code: None,
                     signature,
                 },
             );
@@ -137,7 +202,7 @@ impl ApprovalState {
             file_name: request.file_name.clone(),
             mode: request.mode.map(|m| m.as_str().to_string()),
             byte_size: request.byte_size,
-            otp_code,
+            otp_code: None,
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
 
@@ -402,7 +467,7 @@ fn approval_requirement(request: &sv_mcp::AccessRequest) -> Result<ApprovalPromp
             _ => Ok(ApprovalPromptKind::NotRequired),
         },
         Some(SecurityMode::Approval) => Ok(ApprovalPromptKind::Click),
-        Some(SecurityMode::Otp) => Ok(ApprovalPromptKind::Otp(generate_otp_code()?)),
+        Some(SecurityMode::Otp) => Ok(ApprovalPromptKind::Otp),
         Some(SecurityMode::Anonymized) => {
             Err("ANONYMIZED mode is not implemented for live MCP access".into())
         }
