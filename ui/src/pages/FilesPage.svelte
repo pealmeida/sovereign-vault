@@ -4,22 +4,17 @@
   import UploadDropzone from '../components/UploadDropzone.svelte';
   import ApprovalBanner from '../components/ApprovalBanner.svelte';
   import FileViewerModal from '../components/FileViewerModal.svelte';
-  import ApprovalModal from '../components/ApprovalModal.svelte';
-  import OtpModal from '../components/OtpModal.svelte';
   import ModePill from '../components/ModePill.svelte';
   import { fileStore } from '../stores/files.svelte';
   import { containerStore } from '../stores/containers.svelte';
-  import { approvalStore } from '../stores/approvals.svelte';
   import { toastStore } from '../stores/toast.svelte';
-  import type { FileInfo, ApprovalPrompt } from '../lib/types';
+  import type { FileInfo } from '../lib/types';
 
   // svelte-spa-router v5: URL params passed as props
   let { params: routeParams }: { params?: Record<string, string> } = $props();
 
   let selectedContainer = $state<string | null>(null);
   let previewFile = $state<FileInfo | null>(null);
-  let approvalModal = $state<ApprovalPrompt | null>(null);
-  let otpModal = $state<ApprovalPrompt | null>(null);
 
   onMount(async () => {
     if (containerStore.list.length === 0) {
@@ -36,17 +31,6 @@
     if (container && container !== selectedContainer) {
       selectedContainer = container;
       fileStore.refresh(container).catch((e) => toastStore.setError(e));
-    }
-  });
-
-  // Auto-open approval/OTP modals for pending requests
-  $effect(() => {
-    const pending = approvalStore.queue.find(
-      (p) => !selectedContainer || p.container === selectedContainer
-    );
-    if (pending && !approvalModal && !otpModal) {
-      if (pending.otp_code !== null) otpModal = pending;
-      else approvalModal = pending;
     }
   });
 </script>
@@ -115,31 +99,5 @@
     file={previewFile}
     container={selectedContainer}
     onClose={() => previewFile = null}
-  />
-{/if}
-
-{#if approvalModal}
-  <ApprovalModal
-    prompt={approvalModal}
-    onClose={async () => {
-      const p = approvalModal;
-      approvalModal = null;
-      if (p && approvalStore.queue.find(q => q.id === p.id)) {
-        try { await approvalStore.respond(p.id, false); } catch { /* ignore */ }
-      }
-    }}
-  />
-{/if}
-
-{#if otpModal}
-  <OtpModal
-    prompt={otpModal}
-    onClose={async () => {
-      const p = otpModal;
-      otpModal = null;
-      if (p && approvalStore.queue.find(q => q.id === p.id)) {
-        try { await approvalStore.respond(p.id, false); } catch { /* ignore */ }
-      }
-    }}
   />
 {/if}
