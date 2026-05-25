@@ -627,12 +627,14 @@ fn validate_container_name(name: &str) -> Result<()> {
     }
 }
 
-/// Validate a file name. Same rules as containers, but also allows `.` (not leading).
+/// Validate a file name. Allows `.` anywhere — including a leading dot, so
+/// dotfiles such as `.env` are storable. Still forbids the traversal names
+/// `.`/`..`, any `..` sequence, and path separators (only `[A-Za-z0-9._-]`).
 pub fn is_valid_file_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 128 {
         return false;
     }
-    if name.starts_with('.') {
+    if name == "." || name == ".." {
         return false;
     }
     if name.contains("..") {
@@ -804,6 +806,26 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&root_a);
         let _ = fs::remove_dir_all(&root_b);
+    }
+
+    #[test]
+    fn dotfiles_are_storable() {
+        assert!(is_valid_file_name(".env"));
+        assert!(is_valid_file_name(".gitignore"));
+        assert!(!is_valid_file_name("."));
+        assert!(!is_valid_file_name(".."));
+        assert!(!is_valid_file_name("..env"));
+        assert!(!is_valid_file_name("a/b"));
+
+        let root = tmp_dir("dotenv");
+        let v = Vault::open_or_init(&root, MasterKey::generate()).unwrap();
+        v.create_container("env", SecurityMode::Direct, None).unwrap();
+        v.write_file("env", ".env", b"API_KEY=fake").unwrap();
+        assert_eq!(v.read_file("env", ".env").unwrap(), b"API_KEY=fake");
+        let files = v.list_files("env").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, ".env");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
