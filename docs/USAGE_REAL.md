@@ -1,0 +1,97 @@
+# Real-usage guide — Sovereign Vault
+
+Last updated: 2026-05-29. Layout scaffolded on this machine; populate it yourself.
+
+## 1. Container layout (already created, empty)
+
+| Container | Mode | Purpose |
+|---|---|---|
+| `env-publimatch` | APPROVAL | `.env*` files for the publimatch codebase |
+| `env-sovereign-vault` | APPROVAL | `.env*` files for the sovereign-vault codebase |
+| `secrets-cloud` | APPROVAL | Cloud-provider keys (AWS, GCP, DO, Vercel…) |
+| `secrets-api` | APPROVAL | 3rd-party API keys (Stripe, OpenAI, Anthropic, Supabase…) |
+| `personal-id` | **OTP** | IDs, passports, recovery codes — high friction by design |
+| `finance` | OTP | Pre-existing financial container |
+
+Pre-existing test containers (`approval-test`, `claude-test`, `mcp-demo`, `otp-demo`) are still there. Delete them in the desktop UI once you don't need them.
+
+Mode cheatsheet:
+- **DIRECT**: no prompt. Use only for working data that isn't sensitive.
+- **APPROVAL**: every access raises a desktop modal (Approve / Deny). Daily-use secrets.
+- **OTP**: cross-channel — desktop shows a 6-digit code, agent resends with `otp=<code>`. Single-use, 120s TTL. For irreversible/regulated data.
+- ANONYMIZED / ZKP / NATIVE: enum reserved, not implemented yet — don't use.
+
+## 2. Wire an MCP client (any project)
+
+The vault's MCP server binds on unlock at `ws://127.0.0.1:9944` and exposes pairing on `http://127.0.0.1:9943/.well-known/mcp-pairing`. Every client uses the same stdio proxy: `sovereign-vault.exe mcp-stdio`. The proxy auto-fetches the per-launch pairing secret.
+
+**Claude Code** (`%APPDATA%\Claude\claude_desktop_config.json` or per-project `.mcp.json`):
+
+```jsonc
+{
+  "mcpServers": {
+    "sovereign-vault": {
+      "command": "C:\\Users\\pealm\\Code\\sovereign-vault\\target\\release\\sovereign-vault.exe",
+      "args": ["mcp-stdio"]
+    }
+  }
+}
+```
+
+**Cursor / Continue.dev**: copy from the desktop app, **Settings → MCP server → Copy Cursor config / Copy Continue.dev config**. Same idea.
+
+The vault must be **unlocked** before the client can call any tool. Lock = MCP servers stop binding.
+
+## 3. Recommended: per-agent scoped tokens
+
+Don't reuse the `Default` agent across every project — mint a scoped agent per project so a compromised client can only touch its own container:
+
+1. Desktop → **Settings → Agents → New agent**
+2. Name: e.g. `publimatch-prod`
+3. Copy the **one-time token** (shown ONCE).
+4. In that project's MCP client config, pass the token instead of using the default secret. (When using `sovereign-vault.exe mcp-stdio` the proxy reads `SV_PAIRING_TOKEN` from env if set; otherwise it falls back to the Default agent's per-launch secret. Set `SV_PAIRING_TOKEN=<the token>` in that project's env so its agent is bound to its scoped identity.)
+5. Add scopes (in the Agents panel): glob `env-publimatch/*`, actions `read,list`.
+
+Revoke any time from the Agents panel. The token never appears in the UI again.
+
+## 4. Move an `.env` into the vault — playbook
+
+From the project directory:
+
+```bash
+# 1. Encode (Windows Git Bash):
+B64=$(base64 -w0 < .env)
+
+# 2. Write via MCP proxy (vault must be unlocked, you'll approve in desktop):
+WRITE="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"vault.write\",\"arguments\":{\"container\":\"env-publimatch\",\"file_name\":\".env\",\"content_b64\":\"$B64\"}}}"
+{ printf '%s\n' "$WRITE"; sleep 5; } | sovereign-vault.exe mcp-stdio
+
+# 3. Verify, then DELETE the plaintext .env:
+rm .env
+git rm --cached .env 2>/dev/null
+echo ".env" >> .gitignore && git add .gitignore
+```
+
+For an OTP container (e.g. `personal-id`), the first `vault.write` returns `otp_required` and shows a code on the desktop; resend with `otp=<that code>`.
+
+In dev, your app reads the secret back at startup via the MCP client (an agent tool call to `vault.read`). Don't echo it to logs.
+
+## 5. Daily safety habits
+
+- **Lock the vault** when you step away — kills MCP access until next unlock.
+- **Approve carefully**: every modal shows the agent id, action, container, file. If something asks for `secrets-cloud` and you didn't initiate it, deny.
+- **OTP for blast-radius data**: financial, ID, recovery phrases. Cross-channel typing is your friend.
+- **Audit log** (`Settings → Open audit folder`) is append-only + hash-chained. Skim it weekly.
+- **Backups**: copy the entire vault root and the OS-keychain entry (or recovery phrase) to a cold offline medium (USB stick, encrypted). Pre-alpha — keep independent copies.
+
+## 6. Known limits (today)
+
+- ANONYMIZED / ZKP / NATIVE modes are stubs (`"...not implemented for live MCP access"`).
+- Container `delete` is destructive and not yet undo-able — confirm twice.
+- Broker (`vault.broker_request`) is off by default. Enable with `SV_ENABLE_BROKER=1` if you want to inject secrets into outbound HTTP without exposing them.
+
+## 7. What I did NOT touch on your behalf
+
+- No real secrets typed by the agent. Empty container shells only.
+- `finance` and any user data left unread.
+- Agent identities: only the `Default` agent was used by the scaffolding. You decide which per-project agents to mint.
