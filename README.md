@@ -1,103 +1,148 @@
 # Sovereign Vault
 
-**Vaults for AI Agents - Safeguarding Memory, Access, and Control.**
+**The local-first, human-in-the-loop secrets vault built for AI agents.**
 
-A local-first encrypted file vault for AI agents. Agents request access through the [Model Context Protocol (MCP)](https://modelcontextprotocol.io), users approve or deny protected operations from a desktop UI, and each operation is audited.
+Your API keys, `.env` files, and sensitive data stay encrypted on *your* machine. AI agents (Claude, Cursor, Continue, any MCP client) request access through the [Model Context Protocol](https://modelcontextprotocol.io) — and **you** approve or deny each protected operation from a desktop app. Every access is written to a tamper-evident audit log.
 
-> **Status: pre-alpha (v0.0.0).** The repository is usable for local, single-user evaluation flows on one machine. Expect rough edges, schema churn, and missing hardening outside the implemented scope below.
+No cloud. No plaintext sprawl. No agent ever sees a secret you didn't release.
+
+> **Status: pre-alpha (v0.0.0).** Usable today for local, single-user evaluation on one machine. Expect rough edges and schema churn. Keep independent backups.
 
 ---
 
-## Why
+## Why Sovereign Vault
 
-Today, AI agents often hold user secrets in plaintext: environment variables, `.env` files, and scattered config. A compromised agent leaks the lot.
+Agents today hoard secrets in plaintext — `.env` files, env vars, scattered config. One compromised agent leaks everything.
 
 Sovereign Vault inverts the trust model:
 
-- Secrets live encrypted in the vault, wrapped by an OS-keychain-backed master key or a passphrase.
-- Agents request reads and writes through MCP; they do not see plaintext until the vault allows it.
-- Per-container security modes (`DIRECT`, `APPROVAL`, `OTP`) gate access.
-- Every read, write, delete, create, approve, and deny is recorded in an append-only audit log.
+- **Secrets live encrypted**, wrapped by an OS-keychain key or a passphrase (XChaCha20-Poly1305 + Argon2id, key hierarchy with rotation).
+- **Agents ask; you decide.** Reads/writes flow over MCP. Protected containers raise a desktop prompt — Approve, Deny, or enter a one-time code.
+- **Use secrets without exposing them.** Transit `encrypt`/`decrypt`/`sign` and the optional outbound *broker* let an agent *use* a key without ever receiving its bytes.
+- **Scoped agent identities.** Each agent gets its own token and capability scope — a compromised client only reaches what you granted it.
+- **Everything is audited.** Append-only, hash-chained JSONL log. Tampering breaks the chain.
 
-## Current scope
+That combination — local-first **+** human-in-the-loop **+** MCP-native **+** secret brokering — is what makes it a *sovereign* vault: you keep custody and control.
 
-- Single root vault per OS user with sub-containers.
-- Whole-file XChaCha20-Poly1305 envelopes with path-bound AAD.
-- 5 MCP tools: `vault.list`, `vault.read`, `vault.write`, `vault.delete`, `vault.create_container`.
-- Desktop approval flow for MCP requests against protected containers.
-- `DIRECT`, `APPROVAL`, and `OTP` container modes for live MCP access.
-- Append-only JSONL audit log covering desktop and MCP operations.
-- BIP39 24-word recovery phrase generated at first launch, with `recovery.svault` master-key wrap.
+## What's inside (implemented)
+
+- **Single root vault** per OS user, with sub-containers and per-container security modes.
+- **Security modes:** `DIRECT` (no prompt), `APPROVAL` (desktop confirm), `OTP` (cross-channel one-time code — shown on desktop, entered by the agent).
+- **9 MCP tools:** `vault.list` / `read` / `write` / `delete` / `create_container`, plus transit `encrypt` / `decrypt` / `sign` / `verify`. Optional `vault.broker_request` behind `SV_ENABLE_BROKER=1`.
+- **Key hierarchy:** OS-keychain or passphrase wraps a rotatable data key (rotate re-encrypts in place).
+- **Per-agent identity & scopes** — mint/revoke tokens from the desktop; scopes can only narrow access.
+- **Hash-chained audit log** over both desktop and MCP operations.
+- **BIP39 24-word recovery phrase** generated at first launch.
+- **Drop-in client loaders** (`clients/`) for Node, Python, and shell — vault-primary with automatic `.env` fallback.
 
 ## Not implemented yet
 
-- Chunked `.svault-v2` storage format.
-- Encrypted `.svault-bundle` backup/export workflow.
-- Hash-chained audit entries.
-- Agent identity and capability tokens.
-- `ANONYMIZED`, `ZKP`, and `NATIVE` live-access flows.
-- Sync, mobile targets, memory/RAG, and policy engine work from the broader design.
+- `ANONYMIZED`, `ZKP`, `NATIVE` live-access modes (reserved in the enum; rejected at runtime).
+- Chunked `.svault-v2` format and encrypted `.svault-bundle` export.
+- Sync, mobile, memory/RAG, and the broader policy engine.
+
+---
 
 ## Install
 
-Pre-1.0; no signed releases yet. Build from source:
+Pre-1.0; no signed releases yet — build from source.
 
-### Prerequisites
-
-- [Rust stable](https://www.rust-lang.org/tools/install) (>= 1.78)
-- [Node.js](https://nodejs.org/) (>= 20)
-- Platform dependencies for Tauri 2 - see <https://tauri.app/start/prerequisites/>
+**Prerequisites**
+- [Rust stable](https://www.rust-lang.org/tools/install) (≥ 1.78)
+- [Node.js](https://nodejs.org/) (≥ 20)
+- Tauri 2 platform deps — see <https://tauri.app/start/prerequisites/>
 - Tauri CLI: `cargo install tauri-cli --version "^2.0.0"`
 
-### Build
+**Build & run**
 
 ```bash
 git clone https://github.com/pealmeida/sovereign-vault.git
 cd sovereign-vault
 
-# Workspace check
-cargo check --workspace
+cargo check --workspace          # verify the Rust workspace
+( cd ui && npm install )         # frontend deps
 
-# UI install
-( cd ui && npm install )
-
-# Run desktop app in dev mode
+# Dev (hot reload):
 cargo tauri dev --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+# Production bundle (build the UI FIRST, then bundle):
+( cd ui && npm run build )
+cargo tauri build --manifest-path apps/desktop/src-tauri/Cargo.toml
+# installers land in apps/desktop/src-tauri/target/release/bundle/
 ```
 
-> **Note**: An icon must exist at `apps/desktop/src-tauri/icons/icon.png` before the first Tauri build.
+> First launch walks you through custody (OS keychain or passphrase) and shows your recovery phrase **once** — write it down.
 
-## Repo layout
+---
+
+## Use it (5 minutes)
+
+**1. Create containers.** In the desktop app → **Vault → New vault**, pick a mode:
+`env-myproject` (APPROVAL), `secrets-cloud` (APPROVAL), `personal-id` (OTP)…
+
+**2. Connect an agent.** Point any MCP client at the stdio proxy — it auto-pairs:
+
+```jsonc
+// Claude Code / Cursor / Continue MCP config
+{
+  "mcpServers": {
+    "sovereign-vault": {
+      "command": "/abs/path/to/target/release/sovereign-vault",
+      "args": ["mcp-stdio"]
+    }
+  }
+}
+```
+
+The vault must be **unlocked** for clients to connect (lock = servers stop).
+
+**3. Read secrets in your app — with `.env` fallback.** Use a client loader so a locked vault never blocks you:
+
+```js
+import { loadSecrets } from "./clients/node/sv-secrets.mjs";
+const { source, vars } = await loadSecrets({ container: "env-myproject" });
+Object.assign(process.env, vars);   // source: "vault" | "env" | "cache"
+```
+
+Flip the source with one env var — `SECRETS_SOURCE=auto|vault|env`. Python (`clients/python/sv_secrets.py`) and shell (`clients/shell/sv-secrets.sh`) ports behave identically.
+
+**Full walkthrough:** [`docs/USAGE_REAL.md`](./docs/USAGE_REAL.md) — container layout, per-agent scoped tokens, `.env` migration playbook, OTP flow, session cache, backups.
+
+---
+
+## Modify / contribute
 
 ```text
 crates/
   sv-crypto      AEAD, KDF, key wrap, zeroize
-  sv-storage     Containers, envelope format, manifest
-  sv-keychain    OS keychain abstraction + passphrase fallback
-  sv-recovery    BIP39 recovery phrase support
-  sv-audit       Append-only JSONL audit log
-  sv-mcp         MCP server (stdio + WS)
-  sv-http        Read-only HTTP (/health, agent card, MCP pairing)
-  sv-core        Integration crate consumed by apps/
+  sv-storage     containers, envelope format, manifest, name validation
+  sv-keychain    OS keychain + passphrase fallback
+  sv-recovery    BIP39 recovery phrase
+  sv-audit       append-only, hash-chained JSONL audit log
+  sv-mcp         MCP server (stdio + WS), tool dispatch, approval hook
+  sv-http        read-only HTTP (/health, agent card, MCP pairing)
+  sv-core        integration crate consumed by apps/
 
-apps/
-  desktop        Tauri 2 desktop app
-  cli            Headless `sovereign-vault` binary
-  mobile         Tauri Mobile target (post-v1.0)
-
+apps/desktop     Tauri 2 app (Rust commands + approval state)
+apps/cli         headless `sovereign-vault` binary (incl. `mcp-stdio` proxy)
 ui/              Svelte 5 + Vite frontend
-docs/            Threat model, architecture, MCP protocol, ADRs
-examples/        Claude Desktop / Cursor / Continue.dev integration samples
+clients/         Node / Python / shell secret loaders (vault + .env fallback)
+docs/            threat model, architecture, ADRs, test plans, USAGE_REAL
+examples/        Claude / Cursor / Continue integration samples
 ```
+
+- Verify before claiming done: `cargo check --workspace`, `cargo test --workspace`, and `( cd ui && npm run check )`.
+- Architecture decisions live in `docs/adr/`. New behavior → add an ADR + tests.
+- Security model: [`docs/`](./docs/) threat model and `SECURITY.md`.
 
 ## License
 
-Apache-2.0 - see [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
+Apache-2.0 — see [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
 
 ## Lineage
 
-This codebase originated as a proof-of-concept inside [agentic-sovereign-ecosystem](https://github.com/pealmeida/agentic-sovereign-ecosystem). v1.0 is a clean Rust-native rewrite to drop the original Node bridge and remove the Mission Control / Digital Twin coupling.
+Originated as a proof-of-concept inside [agentic-sovereign-ecosystem](https://github.com/pealmeida/agentic-sovereign-ecosystem); rewritten Rust-native to drop the Node bridge and the Mission Control / Digital Twin coupling.
 
 ## Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md). Security disclosures go via [SECURITY.md](./SECURITY.md), not the public issue tracker.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md). Report vulnerabilities via [SECURITY.md](./SECURITY.md), not the public issue tracker.
