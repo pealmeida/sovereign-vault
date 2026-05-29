@@ -146,6 +146,12 @@ prompt; `--clear-cache` forced the next read back through the vault.
 - `source=env` → 3 keys from local `.env`;
 - `source=auto` with the vault unreachable → automatic fallback to `.env` + warning.
 
+**Other languages (same behavior, same env knobs):**
+- **Python** `clients/python/sv_secrets.py` — `from sv_secrets import load_secrets; src, vars = load_secrets(container="env-publimatch")`. CLI identical to Node. Stdlib only (≥3.8).
+- **Shell** `clients/shell/sv-secrets.sh` — `source sv-secrets.sh; sv_load env-publimatch [auto|vault|env]` loads into the current shell; or `eval "$(bash sv-secrets.sh env-publimatch --export)"`. Wraps the Node loader by default (`SV_RUNNER=python SV_LOADER=…/sv_secrets.py` to use Python).
+
+All three verified live: vault read (one Approve), `.env` fallback, `source=env`, and auto-fallback when the vault is unreachable.
+
 Migration path: keep both in sync while you trust-build (`SECRETS_SOURCE=auto`),
 then drop the local `.env` (or set `SECRETS_SOURCE=vault`) once confident.
 APPROVAL containers prompt on every read — for hands-off dev boots either keep a
