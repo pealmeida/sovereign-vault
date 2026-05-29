@@ -1,0 +1,261 @@
+"""sv_secrets.py — Sovereign Vault secrets loader with .env redundancy.
+
+Python port of clients/node/sv-secrets.mjs. Use the vault as your primary
+secrets manager with the local .env as an automatic fallback. Stdlib only
+(Python >= 3.8). Never logs secret values.
+
+Quick start:
+    from sv_secrets import load_secrets
+    source, vars = load_secrets(container="env-publimatch")
+    os.environ.update(vars)
+
+Source switch (env var, no code change):
+    SECRETS_SOURCE=auto   (default) vault first, fall back to .env on any failure
+    SECRETS_SOURCE=vault  vault only; raise if unavailable
+    SECRETS_SOURCE=env    local .env only
+
+CLI:
+    python sv_secrets.py --container env-publimatch                 # print .env to stdout
+    python sv_secrets.py --container env-publimatch --out .env.runtime
+    SECRETS_SOURCE=env python sv_secrets.py --container env-publimatch
+
+Knobs (env): SV_BIN, SV_TIMEOUT_MS (default 30000), SV_OTP, SV_CACHE_TTL_MS (default 0=off).
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import queue
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+DEFAULT_BIN = os.environ.get(
+    "SV_BIN",
+    r"C:\Users\pealm\Code\sovereign-vault\target\release\sovereign-vault.exe",
+)
+DEFAULT_FILE = ".env"
+DEFAULT_ENV_PATH = ".env"
+DEFAULT_TIMEOUT_MS = int(os.environ.get("SV_TIMEOUT_MS") or 30000)
+CACHE_DIR = Path(tempfile.gettempdir()) / "sv-secrets-cache"
+
+
+def parse_dotenv(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        if key:
+            out[key] = val
+    return out
+
+
+def read_from_vault(container, file=DEFAULT_FILE, bin=DEFAULT_BIN,
+                    timeout_ms=DEFAULT_TIMEOUT_MS, otp=None) -> str:
+    """Read+decode one file from a vault container via the mcp-stdio proxy.
+    Returns plaintext. Raises on lock/deny/timeout/OTP. Vault must be unlocked;
+    APPROVAL containers raise a desktop prompt."""
+    if not container:
+        raise ValueError("container is required")
+    args = {"container": container, "file_name": file}
+    if otp:
+        args["otp"] = otp
+    frame = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "vault.read", "arguments": args},
+    })
+
+    proc = subprocess.Popen(
+        [bin, "mcp-stdio"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, bufsize=1,
+    )
+    q: "queue.Queue[str]" = queue.Queue()
+
+    def reader():
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                q.put(line)
+        except Exception:
+            pass
+
+    threading.Thread(target=reader, daemon=True).start()
+    try:
+        proc.stdin.write(frame + "\n")  # type: ignore[union-attr]
+        proc.stdin.flush()  # type: ignore[union-attr]
+        # keep stdin open so the proxy stays alive until the response arrives
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            try:
+                line = q.get(timeout=deadline - time.monotonic())
+            except queue.Empty:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("id") != 1 or "result" not in msg:
+                continue
+            result = msg["result"]
+            text = (result.get("content") or [{}])[0].get("text", "")
+            if result.get("isError"):
+                raise RuntimeError(f"vault: {text}")  # includes otp_required
+            payload = json.loads(text)
+            b64 = payload.get("content_b64")
+            if not b64:
+                raise RuntimeError("vault response missing content_b64")
+            return base64.b64decode(b64).decode("utf-8")
+        raise TimeoutError(f"vault read timed out after {timeout_ms}ms")
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+# ── Session cache (opt-in) ─────────────────────────────────────────────────
+# SECURITY TRADEOFF: caches decrypted secrets to a 0600 temp file for the TTL,
+# partially defeating the vault. Off by default.
+def _cache_path(container, file) -> Path:
+    h = hashlib.sha256(f"{container} {file}".encode()).hexdigest()[:24]
+    return CACHE_DIR / f"{h}.json"
+
+
+def _read_cache(container, file, ttl_ms):
+    if not ttl_ms or ttl_ms <= 0:
+        return None
+    p = _cache_path(container, file)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text("utf-8"))
+        if (time.time() * 1000 - data["ts"]) > ttl_ms:
+            return None
+        return data["vars"]
+    except Exception:
+        return None
+
+
+def _write_cache(container, file, vars):
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        p = _cache_path(container, file)
+        p.write_text(json.dumps({"ts": time.time() * 1000, "vars": vars}), "utf-8")
+        try:
+            os.chmod(p, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        pass  # best-effort
+
+
+def clear_cache(container=None, file=DEFAULT_FILE):
+    import shutil
+    try:
+        if container:
+            _cache_path(container, file).unlink(missing_ok=True)
+        else:
+            shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _read_env_file(env_path=DEFAULT_ENV_PATH) -> str:
+    p = Path(env_path)
+    if not p.exists():
+        raise FileNotFoundError(f"no local fallback at {env_path}")
+    return p.read_text("utf-8")
+
+
+def load_secrets(container, file=DEFAULT_FILE, env_path=DEFAULT_ENV_PATH,
+                 source=None, bin=DEFAULT_BIN, timeout_ms=DEFAULT_TIMEOUT_MS,
+                 otp=None, cache_ttl_ms=None):
+    """Return (source, vars). Honors SECRETS_SOURCE (auto|vault|env)."""
+    source = source or os.environ.get("SECRETS_SOURCE") or "auto"
+    otp = otp if otp is not None else os.environ.get("SV_OTP")
+    cache_ttl_ms = cache_ttl_ms if cache_ttl_ms is not None else int(os.environ.get("SV_CACHE_TTL_MS") or 0)
+
+    if source == "env":
+        return "env", parse_dotenv(_read_env_file(env_path))
+
+    cached = _read_cache(container, file, cache_ttl_ms)
+    if cached is not None:
+        return "cache", cached
+
+    def try_vault():
+        return parse_dotenv(read_from_vault(container, file, bin, timeout_ms, otp))
+
+    if source == "vault":
+        vars = try_vault()
+        _write_cache(container, file, vars)
+        return "vault", vars
+
+    # auto
+    try:
+        vars = try_vault()
+        _write_cache(container, file, vars)
+        return "vault", vars
+    except Exception as e:
+        sys.stderr.write(f"[sv-secrets] vault unavailable ({e}); falling back to {env_path}\n")
+        return "env", parse_dotenv(_read_env_file(env_path))
+
+
+def _to_dotenv(vars: dict[str, str]) -> str:
+    return "\n".join(f"{k}={v}" for k, v in vars.items()) + "\n"
+
+
+def _main(argv):
+    def get(flag):
+        return argv[argv.index(flag) + 1] if flag in argv and argv.index(flag) + 1 < len(argv) else None
+
+    container = get("--container")
+    file = get("--file") or DEFAULT_FILE
+    out = get("--out")
+    source = get("--source") or os.environ.get("SECRETS_SOURCE") or "auto"
+    cache_ttl_ms = int(get("--cache-ttl")) if get("--cache-ttl") else int(os.environ.get("SV_CACHE_TTL_MS") or 0)
+
+    if "--clear-cache" in argv:
+        clear_cache(container, file)
+        sys.stderr.write("[sv-secrets] cache cleared\n")
+        if not container:
+            return 0
+    if not container:
+        sys.stderr.write("usage: python sv_secrets.py --container <name> [--file .env] "
+                         "[--source auto|vault|env] [--out path] [--cache-ttl <ms>] [--clear-cache]\n")
+        return 2
+    try:
+        source, vars = load_secrets(container=container, file=file, source=source, cache_ttl_ms=cache_ttl_ms)
+        sys.stderr.write(f"[sv-secrets] {len(vars)} keys from {source}\n")
+        text = _to_dotenv(vars)
+        if out:
+            Path(out).write_text(text, "utf-8")
+            try:
+                os.chmod(out, 0o600)
+            except Exception:
+                pass
+            sys.stderr.write(f"[sv-secrets] wrote {out}\n")
+        else:
+            sys.stdout.write(text)
+        return 0
+    except Exception as e:
+        sys.stderr.write(f"[sv-secrets] ERROR {e}\n")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv[1:]))
