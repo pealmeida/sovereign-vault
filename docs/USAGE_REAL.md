@@ -122,7 +122,24 @@ SECRETS_SOURCE=env node sv-secrets.mjs --container env-publimatch   # force loca
 ```
 
 Knobs: `SV_BIN` (path to `sovereign-vault.exe`), `SV_TIMEOUT_MS` (approval wait,
-default 30000), `SV_OTP` (code for OTP containers).
+default 30000), `SV_OTP` (code for OTP containers), `SV_CACHE_TTL_MS` (session
+cache, default 0 = off).
+
+**Session cache (opt-in) — stop re-prompting on every dev restart.** With
+`SV_CACHE_TTL_MS` > 0 (or `--cache-ttl <ms>`), a successful **vault** read is
+cached to a `0600` temp file; subsequent runs within the TTL return
+`source: "cache"` with **no approval prompt**. Clear it with `--clear-cache`.
+
+```bash
+SV_CACHE_TTL_MS=1800000 node sv-secrets.mjs --container env-publimatch  # 30-min cache
+node sv-secrets.mjs --clear-cache                                       # wipe all cached secrets
+```
+
+⚠️ **Tradeoff:** the cache writes *decrypted* secrets to your temp dir for the
+TTL window — that partially defeats the vault. Off by default. Use short TTLs,
+`--clear-cache` when done, and never enable it on shared machines. **Verified
+live:** first read prompted once + cached; second read served from cache with no
+prompt; `--clear-cache` forced the next read back through the vault.
 
 **Verified live 2026-05-29** on `env-publimatch`:
 - `source=vault` → 3 keys pulled from vault (after one desktop Approve);
