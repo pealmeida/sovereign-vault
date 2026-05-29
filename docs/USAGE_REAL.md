@@ -90,7 +90,52 @@ In dev, your app reads the secret back at startup via the MCP client (an agent t
 - Container `delete` is destructive and not yet undo-able — confirm twice.
 - Broker (`vault.broker_request`) is off by default. Enable with `SV_ENABLE_BROKER=1` if you want to inject secrets into outbound HTTP without exposing them.
 
-## 7. What I did NOT touch on your behalf
+## 7. Vault-as-primary with `.env` redundancy (the safe switch)
+
+Use the vault as your main secrets manager, but keep the local `.env` as an
+automatic fallback so a locked/buggy vault never blocks a project. Loader:
+`clients/node/sv-secrets.mjs` (dependency-free, Node ≥18). Copy it into a
+project or reference it directly.
+
+**One env var flips the source — no code change:**
+
+| `SECRETS_SOURCE` | Behavior |
+|---|---|
+| `auto` (default) | Try vault; on **any** failure (locked, timeout, OTP, denied) fall back to `.env` with a stderr warning |
+| `vault` | Vault only; throw if unavailable (no silent fallback — use in CI gates) |
+| `env` | Local `.env` only; never touch the vault |
+
+**App integration (startup):**
+
+```js
+import { loadSecrets } from "./sv-secrets.mjs";
+const { source, vars } = await loadSecrets({ container: "env-publimatch" });
+Object.assign(process.env, vars);
+console.error(`[secrets] ${Object.keys(vars).length} keys via ${source}`);
+```
+
+**CLI (materialize a runtime file or pipe):**
+
+```bash
+node sv-secrets.mjs --container env-publimatch --out .env.runtime   # writes 0600 file
+SECRETS_SOURCE=env node sv-secrets.mjs --container env-publimatch   # force local
+```
+
+Knobs: `SV_BIN` (path to `sovereign-vault.exe`), `SV_TIMEOUT_MS` (approval wait,
+default 30000), `SV_OTP` (code for OTP containers).
+
+**Verified live 2026-05-29** on `env-publimatch`:
+- `source=vault` → 3 keys pulled from vault (after one desktop Approve);
+- `source=env` → 3 keys from local `.env`;
+- `source=auto` with the vault unreachable → automatic fallback to `.env` + warning.
+
+Migration path: keep both in sync while you trust-build (`SECRETS_SOURCE=auto`),
+then drop the local `.env` (or set `SECRETS_SOURCE=vault`) once confident.
+APPROVAL containers prompt on every read — for hands-off dev boots either keep a
+session-cached `.env.runtime`, use a DIRECT dev container, or pre-load once per
+session.
+
+## 8. What I did NOT touch on your behalf
 
 - No real secrets typed by the agent. Empty container shells only.
 - `finance` and any user data left unread.
