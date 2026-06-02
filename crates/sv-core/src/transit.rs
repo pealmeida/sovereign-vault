@@ -537,6 +537,36 @@ mod tests {
     }
 
     #[test]
+    fn transit_key_name_round_trips_verbatim_for_mcp_lookup() {
+        // Regression: a lowercase, hyphenated name created in the UI
+        // (e.g. `demo-key`) must be stored verbatim — NOT capitalized — so an
+        // MCP client calling `vault.encrypt {key_ref:"demo-key"}` resolves it.
+        // This guards the documented happy-path in scripts/e2e_mcp_usage.sh and
+        // docs/testing/mcp-test-cases.md (TC-TR-1).
+        let root = tmp_dir("transit-name-verbatim");
+        let info = transit_create_key(&root, &wrap(), "demo-key").unwrap();
+        assert_eq!(info.name, "demo-key", "name must not be capitalized");
+
+        // The persisted listing keeps the exact name.
+        let list = transit_list(&root).unwrap();
+        assert_eq!(list[0].name, "demo-key");
+
+        // Resolvable by the bare name (no version) exactly as the MCP path uses it.
+        let ct = transit_encrypt(&root, &wrap(), "demo-key", b"rotate-me-please").unwrap();
+        let pt = transit_decrypt(&root, &wrap(), "demo-key", &ct).unwrap();
+        assert_eq!(pt, b"rotate-me-please");
+
+        // And by `name:vN`.
+        let ct_v = transit_encrypt(&root, &wrap(), "demo-key:v1", b"x").unwrap();
+        assert_eq!(transit_decrypt(&root, &wrap(), "demo-key:v1", &ct_v).unwrap(), b"x");
+
+        // The capitalized variant must NOT resolve — confirms storage is the
+        // verbatim lowercase name, not a case-folded one.
+        assert!(transit_encrypt(&root, &wrap(), "Demo-key", b"x").is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn transit_list_never_returns_key_bytes() {
         let root = tmp_dir("transit-list");
         transit_create_key(&root, &wrap(), "api").unwrap();
