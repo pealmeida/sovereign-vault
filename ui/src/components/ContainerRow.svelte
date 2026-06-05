@@ -6,6 +6,7 @@
   import { containerStore } from '../stores/containers.svelte';
   import { toastStore } from '../stores/toast.svelte';
   import { push } from 'svelte-spa-router';
+  import { confirm } from '@tauri-apps/plugin-dialog';
 
   let { container }: { container: ContainerInfo } = $props();
 
@@ -13,7 +14,11 @@
   let ctx = $state<{ x: number; y: number } | null>(null);
 
   async function doDelete() {
-    if (!confirm(`Delete container "${container.name}" and all its files?`)) return;
+    const ok = await confirm(
+      `Delete container "${container.name}" and all its files? This cannot be undone.`,
+      { title: 'Delete container', kind: 'warning' },
+    );
+    if (!ok) return;
     try {
       await containerStore.remove(container.name);
       toastStore.setNotice(`Container "${container.name}" deleted.`);

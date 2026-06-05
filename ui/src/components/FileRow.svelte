@@ -5,7 +5,7 @@
   import { formatBytes, formatDate } from '../lib/formatters';
   import { fileStore } from '../stores/files.svelte';
   import { toastStore } from '../stores/toast.svelte';
-  import { save } from '@tauri-apps/plugin-dialog';
+  import { save, confirm } from '@tauri-apps/plugin-dialog';
   import { writeFile } from '@tauri-apps/plugin-fs';
 
   let {
@@ -15,7 +15,11 @@
   }: { file: FileInfo; container: string; onPreview: (f: FileInfo) => void } = $props();
 
   async function doDelete() {
-    if (!confirm(`Delete "${file.name}"?`)) return;
+    const ok = await confirm(`Delete "${file.name}"? This cannot be undone.`, {
+      title: 'Delete file',
+      kind: 'warning',
+    });
+    if (!ok) return;
     try {
       await fileStore.remove(container, file.name);
       toastStore.setNotice(`"${file.name}" deleted.`);

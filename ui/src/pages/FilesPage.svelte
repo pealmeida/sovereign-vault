@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import FileRow from '../components/FileRow.svelte';
   import UploadDropzone from '../components/UploadDropzone.svelte';
   import ApprovalBanner from '../components/ApprovalBanner.svelte';
@@ -23,15 +23,26 @@
     }
   });
 
-  // Sync URL param → selectedContainer and load files
+  // Sync URL param → selectedContainer and load files.
+  //
+  // Depends ONLY on the route param and the container list. The current
+  // selection is read/written inside `untrack` so a manual tab click (which
+  // sets `selectedContainer` directly) does not re-trigger this effect and get
+  // reverted to the first container. Precedence: explicit route target, then
+  // the existing selection (preserved across list refreshes), then the first
+  // container on initial load.
   $effect(() => {
-    const container = routeParams?.container
+    const routeContainer = routeParams?.container
       ? decodeURIComponent(routeParams.container)
-      : containerStore.list[0]?.name ?? null;
-    if (container && container !== selectedContainer) {
-      selectedContainer = container;
-      fileStore.refresh(container).catch((e) => toastStore.setError(e));
-    }
+      : null;
+    const list = containerStore.list;
+    untrack(() => {
+      const target = routeContainer ?? selectedContainer ?? list[0]?.name ?? null;
+      if (target && target !== selectedContainer) {
+        selectedContainer = target;
+        fileStore.refresh(target).catch((e) => toastStore.setError(e));
+      }
+    });
   });
 </script>
 

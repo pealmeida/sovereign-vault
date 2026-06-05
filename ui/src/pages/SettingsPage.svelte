@@ -308,7 +308,7 @@
             {/each}
           {/if}
           <div style="display:flex;gap:0.5rem">
-            <input class="text-input" placeholder="New transit key name" bind:value={newTransitName} style="flex:1" />
+            <input class="text-input" placeholder="New transit key name" bind:value={newTransitName} autocapitalize="none" autocorrect="off" spellcheck="false" style="flex:1" />
             <button class="primary-button" onclick={createTransitKey}>Create</button>
           </div>
 
@@ -327,7 +327,7 @@
             {/each}
           {/if}
           <div style="display:flex;gap:0.5rem">
-            <input class="text-input" placeholder="New signing key name" bind:value={newSigningName} style="flex:1" />
+            <input class="text-input" placeholder="New signing key name" bind:value={newSigningName} autocapitalize="none" autocorrect="off" spellcheck="false" style="flex:1" />
             <button class="primary-button" onclick={createSigningKey}>Create</button>
           </div>
         </div>
@@ -367,9 +367,9 @@
             {/each}
           {/if}
           <p class="eyebrow" style="margin-top:0.5rem">New brokered secret (Bearer auth)</p>
-          <input class="text-input" placeholder="Name" bind:value={newBrokerName} />
+          <input class="text-input" placeholder="Name" bind:value={newBrokerName} autocapitalize="none" autocorrect="off" spellcheck="false" />
           <input class="text-input" type="password" placeholder="Secret value" bind:value={newBrokerSecret} autocomplete="off" />
-          <input class="text-input" placeholder="Allowed host (e.g. api.stripe.com)" bind:value={newBrokerHost} />
+          <input class="text-input" placeholder="Allowed host (e.g. api.stripe.com)" bind:value={newBrokerHost} autocapitalize="none" autocorrect="off" spellcheck="false" />
           <input class="text-input" placeholder="Path prefix (e.g. /v1)" bind:value={newBrokerPathPrefix} />
           <input class="text-input" placeholder="Methods (comma-separated, e.g. GET,POST)" bind:value={newBrokerMethods} />
           <button class="primary-button" onclick={createBrokerSecret}>Create brokered secret</button>
@@ -486,6 +486,9 @@
             class="text-input"
             placeholder="New agent name"
             bind:value={newAgentName}
+            autocapitalize="none"
+            autocorrect="off"
+            spellcheck="false"
             style="flex:1"
           />
           <button class="primary-button" onclick={createAgent}>New agent</button>

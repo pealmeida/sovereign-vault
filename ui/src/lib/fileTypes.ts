@@ -122,7 +122,12 @@ export function detectFileType(name: string): FileTypeInfo {
   if (lower === 'dockerfile' || lower.endsWith('/dockerfile')) {
     return map.dockerfile!;
   }
-  if (lower === 'makefile' || lower === '.gitignore' || lower === '.env') {
+  if (lower === 'makefile' || lower === '.gitignore') {
+    return { kind: 'text', mime: 'text/plain' };
+  }
+  // Dotenv files are plain text: `.env`, `webapp.env`, `.env.local`,
+  // `app.env.production`, etc. The bare-`.env` case is covered by endsWith.
+  if (lower.endsWith('.env') || lower.includes('.env.')) {
     return { kind: 'text', mime: 'text/plain' };
   }
 

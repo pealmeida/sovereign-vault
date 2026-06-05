@@ -41,7 +41,7 @@
 
     <label class="field">
       <span>Name</span>
-      <input type="text" placeholder="my-vault" bind:value={name} />
+      <input type="text" placeholder="my-vault" bind:value={name} autocapitalize="none" autocorrect="off" spellcheck="false" />
     </label>
 
     <label class="field" style="margin-top:0.75rem">
