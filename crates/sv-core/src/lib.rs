@@ -87,6 +87,11 @@ pub type Result<T> = std::result::Result<T, CoreError>;
 
 const SALT_FILENAME: &str = "master.salt";
 
+/// HKDF context for the key under which transit/signing/broker material is
+/// sealed. Derived from the active DEK, so rotation must re-wrap material
+/// forward (see [`transit::rewrap_all_material`]).
+const MATERIAL_WRAP_CONTEXT: &[u8] = b"sv-transit-wrap-v1";
+
 /// Live, unlocked vault handle.
 ///
 /// Owns an open [`Vault`] (and therefore the master key). Drop the
@@ -290,7 +295,7 @@ impl VaultHandle {
     /// sealed. Derived from the ACTIVE DEK (HKDF), so it never exposes the DEK
     /// itself and changes after a rotation (material is re-wrapped on rotate).
     fn material_wrap_key(&self) -> MasterKey {
-        MasterKey::from_bytes(self.vault.derive_subkey(b"sv-transit-wrap-v1"))
+        MasterKey::from_bytes(self.vault.derive_subkey(MATERIAL_WRAP_CONTEXT))
     }
 
     /// Create a named symmetric transit key. Returns its metadata.
@@ -453,6 +458,12 @@ impl VaultHandle {
             }
         };
 
+        // Capture the wrap key derived from the OLD active DEK before rotating.
+        // Transit/signing/broker material is sealed under it; once the old DEK
+        // is retired below we can no longer derive it, so we must re-wrap every
+        // entry forward or it is permanently orphaned.
+        let old_material_wrap = self.material_wrap_key();
+
         let new_dek = MasterKey::generate();
         let new_version = keyring::add_active_dek(root, &kek, &new_dek)?;
 
@@ -473,6 +484,11 @@ impl VaultHandle {
         let unwrapped = keyring::load(root, &kek)?;
         self.vault =
             Vault::open_existing_with_keys(root, unwrapped.keys, unwrapped.active_version)?;
+
+        // `self.vault` now derives from the new DEK; re-seal every transit /
+        // signing / broker secret forward from the old wrap key to the new one.
+        let new_material_wrap = self.material_wrap_key();
+        transit::rewrap_all_material(root, &old_material_wrap, &new_material_wrap)?;
 
         // The old recovery phrase wrapped the old DEK; re-issue for the new one.
         let recovery_phrase = sv_recovery::issue_recovery_phrase(root, &new_dek)?;

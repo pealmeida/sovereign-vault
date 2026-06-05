@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use sv_core::sv_crypto::{random_bytes, MasterKey};
 use sv_core::sv_storage::{SecurityMode, Vault};
-use sv_core::{CustodyMode, VaultHandle};
+use sv_core::{transit, CustodyMode, VaultHandle};
 
 fn tmp_dir(label: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -121,6 +121,92 @@ fn rotate_key_reseals_files_and_reissues_recovery() {
     let hr = VaultHandle::unlock_with_recovery(&root, &new_phrase).unwrap();
     assert_eq!(hr.read_file("c", "f.txt").unwrap(), b"rotate-me");
     assert!(VaultHandle::unlock_with_recovery(&root, &old_phrase).is_err());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rotate_key_preserves_transit_signing_and_broker_material() {
+    // Regression: `rotate_key` once re-sealed only container files and dropped
+    // the old DEK, permanently orphaning all transit/signing/broker material
+    // (which is wrapped under a subkey of the active DEK). The listings still
+    // showed the keys, so the breakage was silent. Rotation must now re-wrap
+    // every entry forward so encrypt/decrypt/sign/verify/resolve all survive.
+    let root = tmp_dir("rotate-material");
+    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    let mut handle = boot.handle;
+
+    // Transit key + a ciphertext produced BEFORE rotation.
+    handle.transit_create_key("demo-key").unwrap();
+    let pre_ct = handle
+        .transit_encrypt("demo-key", b"rotate-me-please")
+        .unwrap();
+    assert_eq!(
+        handle.transit_decrypt("demo-key", &pre_ct).unwrap(),
+        b"rotate-me-please"
+    );
+
+    // Signing key + a signature produced BEFORE rotation.
+    let sk = handle.signing_create_key("signer").unwrap();
+    let pre_sig = handle.signing_sign("signer", b"payload").unwrap();
+
+    // Brokered secret with a destination allowlist.
+    let allow = vec![transit::BrokerAllow {
+        host: "api.example.com".into(),
+        path_prefix: "/v1".into(),
+        methods: vec!["GET".into()],
+        allow_private_ip: false,
+    }];
+    handle
+        .broker_create(
+            "stripe",
+            "sk_live_xyz",
+            allow.clone(),
+            transit::BrokerInjection::BearerAuth,
+        )
+        .unwrap();
+
+    // Rotate the DEK.
+    let new_phrase = handle.rotate_key(&root, Some("hunter2")).unwrap();
+    assert!(!new_phrase.is_empty());
+
+    // Listings still show the keys (they always did — that was the trap).
+    assert_eq!(handle.transit_list().unwrap().len(), 1);
+    assert_eq!(handle.signing_list().unwrap().len(), 1);
+    assert_eq!(handle.broker_list().unwrap().len(), 1);
+
+    // Transit: the PRE-rotation ciphertext still decrypts, and a fresh
+    // encrypt/decrypt round-trips under the rotated DEK.
+    assert_eq!(
+        handle.transit_decrypt("demo-key", &pre_ct).unwrap(),
+        b"rotate-me-please"
+    );
+    let post_ct = handle
+        .transit_encrypt("demo-key", b"after-rotation")
+        .unwrap();
+    assert_eq!(
+        handle.transit_decrypt("demo-key", &post_ct).unwrap(),
+        b"after-rotation"
+    );
+
+    // Signing: the PRE-rotation signature still verifies, and new signing works.
+    assert!(transit::signing_verify(&sk.public_b64, b"payload", &pre_sig).unwrap());
+    let post_sig = handle.signing_sign("signer", b"more").unwrap();
+    assert!(transit::signing_verify(&sk.public_b64, b"more", &post_sig).unwrap());
+
+    // Broker: resolve still yields the secret and its allowlist.
+    let resolved = handle.broker_resolve("stripe").unwrap();
+    assert_eq!(resolved.secret, "sk_live_xyz");
+    assert_eq!(resolved.allow, allow);
+    drop(handle);
+
+    // Material also survives a fresh unlock from disk.
+    let h = VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    assert_eq!(
+        h.transit_decrypt("demo-key", &pre_ct).unwrap(),
+        b"rotate-me-please"
+    );
+    assert!(transit::signing_verify(&sk.public_b64, b"payload", &pre_sig).unwrap());
+    assert_eq!(h.broker_resolve("stripe").unwrap().secret, "sk_live_xyz");
     let _ = std::fs::remove_dir_all(&root);
 }
 
