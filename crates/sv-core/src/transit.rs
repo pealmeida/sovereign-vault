@@ -446,6 +446,72 @@ pub fn broker_resolve(
     })
 }
 
+// ---- rotation: re-wrap material forward ----------------------------------
+
+/// Re-seal every transit key, signing seed, and broker secret from `old_wrap`
+/// to `new_wrap`.
+///
+/// The wrapping key is derived from the active DEK (see
+/// `VaultHandle::material_wrap_key`), so a DEK rotation changes it. Without
+/// this step every piece of material stays sealed under the retired DEK and is
+/// permanently orphaned (unseal fails with `Crypto(Aead)`), even though the
+/// metadata listings still show the keys. Idempotent and a no-op for any store
+/// that does not exist yet.
+pub fn rewrap_all_material(
+    root: &Path,
+    old_wrap: &MasterKey,
+    new_wrap: &MasterKey,
+) -> Result<()> {
+    rewrap_transit(root, old_wrap, new_wrap)?;
+    rewrap_signing(root, old_wrap, new_wrap)?;
+    rewrap_brokers(root, old_wrap, new_wrap)?;
+    Ok(())
+}
+
+fn reseal(old_wrap: &MasterKey, new_wrap: &MasterKey, aad: &[u8], wrapped_b64: &str) -> Result<String> {
+    let sealed = B64
+        .decode(wrapped_b64.as_bytes())
+        .map_err(|e| CoreError::Base64(e.to_string()))?;
+    let raw = aead_open(old_wrap, &sealed, aad)?;
+    let resealed = aead_seal(new_wrap, &raw, aad)?;
+    Ok(B64.encode(resealed))
+}
+
+fn rewrap_transit(root: &Path, old_wrap: &MasterKey, new_wrap: &MasterKey) -> Result<()> {
+    let mut file: TransitFile = read_json(root, TRANSIT_FILE)?;
+    if file.entries.is_empty() {
+        return Ok(());
+    }
+    for entry in &mut file.entries {
+        entry.wrapped_b64 = reseal(old_wrap, new_wrap, TRANSIT_AAD, &entry.wrapped_b64)?;
+    }
+    write_json(root, TRANSIT_FILE, &file)
+}
+
+fn rewrap_signing(root: &Path, old_wrap: &MasterKey, new_wrap: &MasterKey) -> Result<()> {
+    let mut file: SigningFile = read_json(root, SIGNING_FILE)?;
+    if file.entries.is_empty() {
+        return Ok(());
+    }
+    for entry in &mut file.entries {
+        entry.wrapped_secret_b64 =
+            reseal(old_wrap, new_wrap, SIGNING_AAD, &entry.wrapped_secret_b64)?;
+    }
+    write_json(root, SIGNING_FILE, &file)
+}
+
+fn rewrap_brokers(root: &Path, old_wrap: &MasterKey, new_wrap: &MasterKey) -> Result<()> {
+    let mut file: BrokerFile = read_json(root, BROKERS_FILE)?;
+    if file.entries.is_empty() {
+        return Ok(());
+    }
+    for entry in &mut file.entries {
+        entry.wrapped_secret_b64 =
+            reseal(old_wrap, new_wrap, BROKER_AAD, &entry.wrapped_secret_b64)?;
+    }
+    write_json(root, BROKERS_FILE, &file)
+}
+
 // ---- shared helpers ------------------------------------------------------
 
 fn parse_key_ref(key_ref: &str) -> (String, Option<u32>) {
