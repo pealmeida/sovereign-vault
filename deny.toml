@@ -1,6 +1,8 @@
 # cargo-deny configuration — supply-chain policy for the Rust workspace.
 # Run locally with: cargo install cargo-deny && cargo deny check
-# CI enforces `advisories bans sources` (see .github/workflows/ci.yml).
+# CI enforces `bans sources` here; vulnerability advisories run via cargo-audit
+# (see .github/workflows/ci.yml). The [advisories]/[licenses] config below is
+# used only when you run cargo-deny locally with those checks enabled.
 
 [advisories]
 # Fail on known-vulnerable / yanked crates. Add IDs here only with a written
