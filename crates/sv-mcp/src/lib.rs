@@ -446,9 +446,9 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 Err(e) => return Err(McpError::Transport(e.to_string())),
             };
             let text = match msg {
-                Message::Text(t) => t,
+                Message::Text(t) => t.to_string(),
                 Message::Binary(b) => {
-                    String::from_utf8(b).map_err(|e| McpError::Protocol(e.to_string()))?
+                    String::from_utf8(b.to_vec()).map_err(|e| McpError::Protocol(e.to_string()))?
                 }
                 Message::Ping(p) => {
                     sink.send(Message::Pong(p))
@@ -465,7 +465,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
             if let Some(resp) = response {
                 let bytes =
                     serde_json::to_string(&resp).map_err(|e| McpError::Protocol(e.to_string()))?;
-                sink.send(Message::Text(bytes))
+                sink.send(Message::Text(bytes.into()))
                     .await
                     .map_err(|e| McpError::Transport(e.to_string()))?;
             }
@@ -1345,7 +1345,7 @@ fn base_tool_descriptors() -> Value {
 /// secret material such as pairing secrets, so on RNG failure we surface the
 /// error to the caller rather than emitting guessable bytes.
 fn getrandom_fill(buf: &mut [u8]) -> std::result::Result<(), getrandom::Error> {
-    getrandom::getrandom(buf)
+    getrandom::fill(buf)
 }
 
 /// Crate version string.

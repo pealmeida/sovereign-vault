@@ -85,7 +85,7 @@ impl MasterKey {
     /// Generate a fresh random master key from the OS RNG.
     pub fn generate() -> Self {
         let mut bytes = [0u8; MASTER_KEY_LEN];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         Self(bytes)
     }
 
@@ -135,14 +135,14 @@ pub fn derive_subkey(key: &MasterKey, context: &[u8]) -> [u8; 32] {
 /// Generate `n` cryptographically secure random bytes.
 pub fn random_bytes(n: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
-    getrandom::getrandom(&mut buf).map_err(|e| CryptoError::Random(e.to_string()))?;
+    getrandom::fill(&mut buf).map_err(|e| CryptoError::Random(e.to_string()))?;
     Ok(buf)
 }
 
 /// Generate a fresh 16-byte salt suitable for [`MasterKey::from_passphrase`].
 pub fn random_salt() -> Result<[u8; SALT_LEN]> {
     let mut salt = [0u8; SALT_LEN];
-    getrandom::getrandom(&mut salt).map_err(|e| CryptoError::Random(e.to_string()))?;
+    getrandom::fill(&mut salt).map_err(|e| CryptoError::Random(e.to_string()))?;
     Ok(salt)
 }
 
@@ -153,7 +153,7 @@ pub fn random_salt() -> Result<[u8; SALT_LEN]> {
 pub fn seal(key: &MasterKey, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from_slice(&nonce_bytes);
     let ct = cipher
         .encrypt(
@@ -195,7 +195,7 @@ pub fn open(key: &MasterKey, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
 /// seed and must be wrapped before storage; the public half is exportable.
 pub fn ed25519_generate() -> Result<([u8; ED25519_SECRET_LEN], [u8; ED25519_PUBLIC_LEN])> {
     let mut seed = [0u8; ED25519_SECRET_LEN];
-    getrandom::getrandom(&mut seed).map_err(|e| CryptoError::Random(e.to_string()))?;
+    getrandom::fill(&mut seed).map_err(|e| CryptoError::Random(e.to_string()))?;
     let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
     let public = signing.verifying_key().to_bytes();
     Ok((seed, public))

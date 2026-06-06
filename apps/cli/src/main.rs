@@ -86,7 +86,7 @@ async fn run_mcp_stdio() -> Result<(), String> {
         "method": "vault.pair",
         "params": { "secret": secret }
     });
-    sink.send(Message::Text(pair_req.to_string()))
+    sink.send(Message::Text(pair_req.to_string().into()))
         .await
         .map_err(|e| format!("send pair: {e}"))?;
     match source.next().await {
@@ -114,7 +114,7 @@ async fn run_mcp_stdio() -> Result<(), String> {
                     Ok(Some(l)) => {
                         let l = l.trim();
                         if l.is_empty() { continue; }
-                        if let Err(e) = sink.send(Message::Text(l.to_string())).await {
+                        if let Err(e) = sink.send(Message::Text(l.to_string().into())).await {
                             return Err(format!("ws send: {e}"));
                         }
                     }
@@ -134,7 +134,7 @@ async fn run_mcp_stdio() -> Result<(), String> {
                         stdout.flush().await.map_err(|e| e.to_string())?;
                     }
                     Some(Ok(Message::Binary(b))) => {
-                        if let Ok(t) = String::from_utf8(b) {
+                        if let Ok(t) = String::from_utf8(b.to_vec()) {
                             if is_supported_frame(&t) {
                                 stdout.write_all(t.as_bytes()).await.map_err(|e| e.to_string())?;
                                 stdout.write_all(b"\n").await.map_err(|e| e.to_string())?;
