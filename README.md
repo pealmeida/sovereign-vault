@@ -69,7 +69,7 @@ tools over-serve and `.env` files under-serve.
 Pre-1.0; no signed releases yet — build from source.
 
 **Prerequisites**
-- [Rust stable](https://www.rust-lang.org/tools/install) (≥ 1.78)
+- [Rust stable](https://www.rust-lang.org/tools/install) (≥ 1.85)
 - [Node.js](https://nodejs.org/) (≥ 20)
 - Tauri 2 platform deps — see <https://tauri.app/start/prerequisites/>
 - Tauri CLI: `cargo install tauri-cli --version "^2.0.0"`
