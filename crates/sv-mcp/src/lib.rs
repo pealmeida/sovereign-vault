@@ -20,6 +20,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -292,6 +293,53 @@ pub trait AuditSink: Send + Sync {
     fn record(&self, event: AuditEvent) -> std::result::Result<(), String>;
 }
 
+/// Per-tool-call latency decomposition emitted to an optional [`TimingSink`].
+///
+/// Maps the gateway-internal stages onto the thesis end-to-end latency model
+/// (§3.9.1, Equation 1: `T_total = T_vault + T_filter + T_hitl + T_wan +
+/// T_inference`). The gateway can only observe the legs it executes; the
+/// network/inference legs (`T_wan`, `T_inference`) are external and not
+/// measured here. The mapping is:
+///
+/// * [`validate`](Self::validate) — request parsing, name/path validation and
+///   scope enforcement: the *validation* portion of `T_filter`.
+/// * [`filter`](Self::filter) — PII masking on `ANONYMIZED` reads: the
+///   *sanitisation* portion of `T_filter`.
+/// * [`authorize`](Self::authorize) — the human-in-the-loop consent gate:
+///   `T_hitl`.
+/// * [`execute`](Self::execute) — the vault operation (decrypt + disk for a
+///   read): `T_vault`.
+///
+/// Recording is opt-in: with no sink installed the gateway does no timing work.
+#[derive(Debug, Clone)]
+pub struct StageTimings {
+    /// Action performed.
+    pub action: AccessAction,
+    /// Effective container mode, when applicable.
+    pub mode: Option<SecurityMode>,
+    /// Payload size in bytes, when known.
+    pub byte_size: Option<usize>,
+    /// Whether the call was allowed through to execution.
+    pub allowed: bool,
+    /// Validation + scope-enforcement time (part of `T_filter`).
+    pub validate: Duration,
+    /// Consent-gate time (`T_hitl`).
+    pub authorize: Duration,
+    /// Vault-operation time (`T_vault` for reads).
+    pub execute: Duration,
+    /// PII-masking time (sanitisation part of `T_filter`).
+    pub filter: Duration,
+    /// Sum of the measured legs (gateway-introduced latency).
+    pub total: Duration,
+}
+
+/// Hook used to observe the per-call latency decomposition. Used by the thesis
+/// evaluation harness (`apps/thesis-eval`); unused in production.
+pub trait TimingSink: Send + Sync {
+    /// Record one call's [`StageTimings`].
+    fn record_timing(&self, timings: StageTimings);
+}
+
 /// MCP server. Holds a shared vault handle + the per-launch pairing secret.
 pub struct McpServer<H: VaultFacade + 'static> {
     handle: SharedVault<H>,
@@ -299,6 +347,7 @@ pub struct McpServer<H: VaultFacade + 'static> {
     access_controller: Option<Arc<dyn AccessController>>,
     audit_sink: Option<Arc<dyn AuditSink>>,
     agent_authenticator: Option<Arc<dyn AgentAuthenticator>>,
+    timing_sink: Option<Arc<dyn TimingSink>>,
 }
 
 impl<H: VaultFacade + 'static> McpServer<H> {
@@ -310,6 +359,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
             access_controller: None,
             audit_sink: None,
             agent_authenticator: None,
+            timing_sink: None,
         }
     }
 
@@ -330,6 +380,14 @@ impl<H: VaultFacade + 'static> McpServer<H> {
     /// accepted and requests carry no `agent_id`.
     pub fn with_agent_authenticator(mut self, authenticator: Arc<dyn AgentAuthenticator>) -> Self {
         self.agent_authenticator = Some(authenticator);
+        self
+    }
+
+    /// Install a timing sink that receives a [`StageTimings`] for every tool
+    /// call. Off by default — used by the thesis evaluation harness. With no
+    /// sink installed the gateway performs no timing instrumentation.
+    pub fn with_timing_sink(mut self, sink: Arc<dyn TimingSink>) -> Self {
+        self.timing_sink = Some(sink);
         self
     }
 
@@ -601,6 +659,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         transport: AccessTransport,
         agent: Option<&ResolvedAgent>,
     ) -> std::result::Result<Value, String> {
+        let started = Instant::now();
         let mut access = {
             let guard = self.handle.lock().await;
             let handle = guard
@@ -614,30 +673,63 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         if let Some(agent) = agent {
             if let Err(error) = enforce_scopes(agent, &access) {
                 self.record_audit(&access, AuditDecision::Denied, None, Some(error.clone()));
+                self.emit_timing(
+                    &access,
+                    false,
+                    started.elapsed(),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                );
                 return Err(error);
             }
         }
+        // Validation + scope enforcement = the validation portion of T_filter.
+        let validate = started.elapsed();
 
+        let authorize_started = Instant::now();
         if let Some(controller) = &self.access_controller {
             if let Err(error) = controller.authorize(access.clone()).await {
                 self.record_audit(&access, AuditDecision::Denied, None, Some(error.clone()));
+                self.emit_timing(
+                    &access,
+                    false,
+                    validate,
+                    authorize_started.elapsed(),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                );
                 return Err(error);
             }
         }
+        // The human-in-the-loop consent gate = T_hitl.
+        let authorize = authorize_started.elapsed();
 
         // Brokering performs network I/O and is async; everything else runs
         // synchronously against the locked handle.
         if name == "vault.broker_request" {
+            let execute_started = Instant::now();
             let (result, detail) = self.execute_broker(&args).await;
+            let execute = execute_started.elapsed();
             match &result {
                 Ok(_) => self.record_audit(&access, AuditDecision::Allowed, detail, None),
                 Err(error) => {
                     self.record_audit(&access, AuditDecision::Error, detail, Some(error.clone()))
                 }
             }
+            self.emit_timing(
+                &access,
+                result.is_ok(),
+                validate,
+                authorize,
+                execute,
+                Duration::ZERO,
+            );
             return result;
         }
 
+        // The vault operation itself (decrypt + disk for a read) = T_vault.
+        let execute_started = Instant::now();
         let result = {
             let guard = self.handle.lock().await;
             let handle = guard
@@ -645,15 +737,107 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 .ok_or_else(|| "vault is locked".to_string())?;
             self.execute_tool(handle, name, &args)
         };
+        let execute = execute_started.elapsed();
+
+        // Privacy mediation (thesis module 3b): reads from an ANONYMIZED
+        // container return PII-masked content before crossing the agent
+        // boundary. This is the sanitisation portion of T_filter.
+        let filter_started = Instant::now();
+        let (result, filter_detail) = match result {
+            Ok(value) => {
+                let (value, detail) = self.apply_privacy_filter(&access, value);
+                (Ok(value), detail)
+            }
+            Err(error) => (Err(error), None),
+        };
+        let filter = filter_started.elapsed();
 
         match &result {
-            Ok(_) => self.record_audit(&access, AuditDecision::Allowed, None, None),
+            Ok(_) => self.record_audit(&access, AuditDecision::Allowed, filter_detail, None),
             Err(error) => {
                 self.record_audit(&access, AuditDecision::Error, None, Some(error.clone()))
             }
         }
+        self.emit_timing(
+            &access,
+            result.is_ok(),
+            validate,
+            authorize,
+            execute,
+            filter,
+        );
 
         result
+    }
+
+    /// Apply the PII privacy filter to a successful tool result when the
+    /// request was a read against an `ANONYMIZED`-mode container (thesis module
+    /// 3b). Text content is scanned and masked in place; non-UTF-8 (binary)
+    /// content passes through unscanned. Returns the possibly-rewritten value
+    /// and an audit-detail string when masking ran.
+    fn apply_privacy_filter(
+        &self,
+        access: &AccessRequest,
+        value: Value,
+    ) -> (Value, Option<String>) {
+        if access.action != AccessAction::ReadFile || access.mode != Some(SecurityMode::Anonymized)
+        {
+            return (value, None);
+        }
+        let Some(content_b64) = value.get("content_b64").and_then(|v| v.as_str()) else {
+            return (value, None);
+        };
+        let Ok(bytes) = B64.decode(content_b64.as_bytes()) else {
+            return (value, None);
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return (
+                value,
+                Some("anonymized: binary content passed through unscanned".into()),
+            );
+        };
+        let redaction = sv_privacy::redact(text, &sv_privacy::Policy::all());
+        let detail = Some(format!(
+            "anonymized: {} pii span(s) masked",
+            redaction.count()
+        ));
+        let mut value = value;
+        if let Value::Object(map) = &mut value {
+            map.insert(
+                "content_b64".to_string(),
+                json!(B64.encode(redaction.output.as_bytes())),
+            );
+            map.insert("byte_size".to_string(), json!(redaction.output.len()));
+            map.insert("anonymized".to_string(), json!(true));
+            map.insert("pii_redactions".to_string(), json!(redaction.count()));
+        }
+        (value, detail)
+    }
+
+    /// Emit a [`StageTimings`] to the installed [`TimingSink`], if any.
+    fn emit_timing(
+        &self,
+        access: &AccessRequest,
+        allowed: bool,
+        validate: Duration,
+        authorize: Duration,
+        execute: Duration,
+        filter: Duration,
+    ) {
+        let Some(sink) = &self.timing_sink else {
+            return;
+        };
+        sink.record_timing(StageTimings {
+            action: access.action,
+            mode: access.mode,
+            byte_size: access.byte_size,
+            allowed,
+            validate,
+            authorize,
+            execute,
+            filter,
+            total: validate + authorize + execute + filter,
+        });
     }
 
     /// Run the brokered request against the live handle. Returns the agent-safe
@@ -1489,6 +1673,10 @@ mod tests {
         }
 
         fn container_mode(&self, container: &str) -> std::result::Result<SecurityMode, String> {
+            // A dedicated container exercises the ANONYMIZED privacy-filter path.
+            if container == "anon" {
+                return Ok(SecurityMode::Anonymized);
+            }
             if self.containers.iter().any(|c| c.name == container) {
                 Ok(SecurityMode::Approval)
             } else {
@@ -1512,6 +1700,14 @@ mod tests {
         fn record(&self, event: AuditEvent) -> std::result::Result<(), String> {
             self.0.lock().unwrap().push(event);
             Ok(())
+        }
+    }
+
+    struct MemoryTiming(std::sync::Mutex<Vec<StageTimings>>);
+
+    impl TimingSink for MemoryTiming {
+        fn record_timing(&self, timings: StageTimings) {
+            self.0.lock().unwrap().push(timings);
         }
     }
 
@@ -1948,5 +2144,95 @@ mod tests {
         assert!(glob_match("*", "notes"));
         assert!(!glob_match("*", "notes/sub"));
         assert!(!glob_match("notes", "other"));
+    }
+
+    #[tokio::test]
+    async fn anonymized_read_masks_pii_before_returning() {
+        // A read from an ANONYMIZED container must return PII-masked content
+        // (thesis module 3b) — the raw email never crosses the agent boundary.
+        let server = server();
+        let mut pair = PairState::AlreadyPaired(None);
+        let secret = "email jane@example.com about CPF 529.982.247-25";
+        let payload = B64.encode(secret.as_bytes());
+        let write = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.write","arguments":{{"container":"anon","file_name":"c.txt","content_b64":"{payload}"}}}}}}"#
+        );
+        server
+            .dispatch(&write, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+
+        let read = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"vault.read","arguments":{"container":"anon","file_name":"c.txt"}}}"#;
+        let resp = server
+            .dispatch(read, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let inner: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["anonymized"], true);
+        assert_eq!(inner["pii_redactions"], 2);
+        let returned =
+            String::from_utf8(B64.decode(inner["content_b64"].as_str().unwrap()).unwrap()).unwrap();
+        assert!(returned.contains("[REDACTED:EMAIL]"));
+        assert!(returned.contains("[REDACTED:CPF]"));
+        assert!(!returned.contains("jane@example.com"));
+        assert!(!returned.contains("529.982.247-25"));
+    }
+
+    #[tokio::test]
+    async fn non_anonymized_read_is_not_masked() {
+        // A normal (APPROVAL/DIRECT) read returns content verbatim.
+        let server = server();
+        let mut pair = PairState::AlreadyPaired(None);
+        let secret = "email jane@example.com";
+        let payload = B64.encode(secret.as_bytes());
+        let write = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.write","arguments":{{"container":"notes","file_name":"c.txt","content_b64":"{payload}"}}}}}}"#
+        );
+        server
+            .dispatch(&write, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let read = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"vault.read","arguments":{"container":"notes","file_name":"c.txt"}}}"#;
+        let resp = server
+            .dispatch(read, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let inner: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["content_b64"], payload);
+        assert!(inner.get("anonymized").is_none());
+    }
+
+    #[tokio::test]
+    async fn timing_sink_records_one_decomposition_per_call() {
+        let timing = Arc::new(MemoryTiming(Default::default()));
+        let server = server().with_timing_sink(timing.clone());
+        let mut pair = PairState::AlreadyPaired(None);
+        let payload = B64.encode(b"hi");
+        let write = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.write","arguments":{{"container":"notes","file_name":"a.txt","content_b64":"{payload}"}}}}}}"#
+        );
+        server
+            .dispatch(&write, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let read = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"vault.read","arguments":{"container":"notes","file_name":"a.txt"}}}"#;
+        server
+            .dispatch(read, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+
+        let records = timing.0.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        let read_timing = records
+            .iter()
+            .find(|t| t.action == AccessAction::ReadFile)
+            .expect("read recorded");
+        assert!(read_timing.allowed);
+        assert_eq!(
+            read_timing.total,
+            read_timing.validate + read_timing.authorize + read_timing.execute + read_timing.filter
+        );
     }
 }

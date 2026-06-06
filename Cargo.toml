@@ -6,11 +6,13 @@ members = [
     "crates/sv-keychain",
     "crates/sv-recovery",
     "crates/sv-audit",
+    "crates/sv-privacy",
     "crates/sv-mcp",
     "crates/sv-http",
     "crates/sv-core",
     "apps/cli",
     "apps/desktop/src-tauri",
+    "apps/thesis-eval",
 ]
 
 [workspace.package]
@@ -33,6 +35,7 @@ sv-storage   = { path = "crates/sv-storage",   version = "0.0.0" }
 sv-keychain  = { path = "crates/sv-keychain",  version = "0.0.0" }
 sv-recovery  = { path = "crates/sv-recovery",  version = "0.0.0" }
 sv-audit     = { path = "crates/sv-audit",     version = "0.0.0" }
+sv-privacy   = { path = "crates/sv-privacy",   version = "0.0.0" }
 sv-mcp       = { path = "crates/sv-mcp",       version = "0.0.0" }
 sv-http      = { path = "crates/sv-http",      version = "0.0.0" }
 sv-core      = { path = "crates/sv-core",      version = "0.0.0" }

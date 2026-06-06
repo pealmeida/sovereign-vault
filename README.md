@@ -15,6 +15,8 @@ No cloud. No plaintext sprawl. No agent ever sees a secret you didn't release.
 
 > **Status: pre-alpha (v0.0.0).** Usable today for local, single-user evaluation on one machine. Expect rough edges and schema churn. Keep independent backups.
 
+> **Academic research project.** Sovereign Vault is the Design Science Research *instantiation* for a USP/ICMC MBA thesis on data sovereignty for personal AI agents — see [`docs/thesis/`](./docs/thesis/) and the [research paper](./docs/thesis/oliveira-2026-soberania-de-dados-agentes-ia.pdf). [Academic context ↓](#academic-context)
+
 ---
 
 ## Why Sovereign Vault
@@ -48,17 +50,18 @@ tools over-serve and `.env` files under-serve.
 ## What's inside (implemented)
 
 - **Single root vault** per OS user, with sub-containers and per-container security modes.
-- **Security modes:** `DIRECT` (no prompt), `APPROVAL` (desktop confirm), `OTP` (cross-channel one-time code — shown on desktop, entered by the agent).
+- **Security modes:** `DIRECT` (no prompt), `APPROVAL` (desktop confirm), `OTP` (cross-channel one-time code — shown on desktop, entered by the agent), `ANONYMIZED` (auto-allowed reads with PII masked out of the response).
 - **9 MCP tools:** `vault.list` / `read` / `write` / `delete` / `create_container`, plus transit `encrypt` / `decrypt` / `sign` / `verify`. Optional `vault.broker_request` behind `SV_ENABLE_BROKER=1`.
 - **Key hierarchy:** OS-keychain or passphrase wraps a rotatable data key (rotate re-encrypts in place).
 - **Per-agent identity & scopes** — mint/revoke tokens from the desktop; scopes can only narrow access.
 - **Hash-chained audit log** over both desktop and MCP operations.
 - **BIP39 24-word recovery phrase** generated at first launch.
 - **Drop-in client loaders** (`clients/`) for Node, Python, and shell — vault-primary with automatic `.env` fallback.
+- **PII privacy mediation** (`sv-privacy`): reads from `ANONYMIZED` containers are scanned and masked (email, CPF/CNPJ, credit card, IPv4, phone) before they reach the agent.
 
 ## Not implemented yet
 
-- `ANONYMIZED`, `ZKP`, `NATIVE` live-access modes (reserved in the enum; rejected at runtime).
+- `ZKP`, `NATIVE` live-access modes (reserved in the enum; rejected at runtime).
 - Chunked `.svault-v2` format and encrypted `.svault-bundle` export.
 - Sync, mobile, memory/RAG, and the broader policy engine.
 
@@ -145,22 +148,44 @@ crates/
   sv-keychain    OS keychain + passphrase fallback
   sv-recovery    BIP39 recovery phrase
   sv-audit       append-only, hash-chained JSONL audit log
+  sv-privacy     PII detection + masking for ANONYMIZED containers
   sv-mcp         MCP server (stdio + WS), tool dispatch, approval hook
   sv-http        read-only HTTP (/health, agent card, MCP pairing)
   sv-core        integration crate consumed by apps/
 
 apps/desktop     Tauri 2 app (Rust commands + approval state)
 apps/cli         headless `sovereign-vault` binary (incl. `mcp-stdio` proxy)
+apps/thesis-eval DSR evaluation harness (latency + adversarial block-rate)
 ui/              Svelte 5 + Vite frontend
 clients/         Node / Python / shell secret loaders (vault + .env fallback)
 examples/        ready-to-paste MCP client configs + an end-to-end script
-docs/            threat model, architecture, ADRs, test plans, USAGE_REAL
+docs/            threat model, architecture, ADRs, test plans, thesis mapping
 scripts/         build/run helpers (macOS .command) + e2e MCP usage script
 ```
 
 - Verify before claiming done: `cargo check --workspace`, `cargo test --workspace`, and `( cd ui && npm run check )`.
 - Architecture decisions live in `docs/adr/`. New behavior → add an ADR + tests.
 - Security model: [`docs/`](./docs/) threat model and `SECURITY.md`.
+
+## Academic context
+
+Sovereign Vault is the reference implementation — the Design Science Research **instantiation** artifact — of an academic research project:
+
+> **Oliveira, Pedro.** *Arquitetura de Soberania de Dados para Agentes de IA Pessoais: Um Modelo Local-First Baseado em Protocolos Descentralizados.* USP/ICMC — MBA em Inteligência Artificial e Big Data, 2026.
+
+The research paper lives in [`docs/thesis/`](./docs/thesis/) ([PDF](./docs/thesis/oliveira-2026-soberania-de-dados-agentes-ia.pdf)), alongside a [code ↔ thesis traceability map](./docs/thesis/TRACEABILITY.md), the [evaluation & reproduction guide](./docs/thesis/EVALUATION.md) (the §3.9 latency + adversarial protocols), and the [evolution roadmap](./docs/thesis/EVOLUTION.md). Design decisions are recorded as [ADRs](./docs/adr/).
+
+```bibtex
+@mastersthesis{oliveira2026soberania,
+  author = {Oliveira, Pedro},
+  title  = {Arquitetura de Soberania de Dados para Agentes de IA Pessoais: Um Modelo Local-First Baseado em Protocolos Descentralizados},
+  school = {Universidade de S{\~a}o Paulo (USP), Instituto de Ci{\^e}ncias Matem{\'a}ticas e de Computa{\c{c}}{\~a}o (ICMC)},
+  type   = {MBA em Intelig{\^e}ncia Artificial e Big Data},
+  year   = {2026}
+}
+```
+
+> The paper PDF is the author's academic work and is **not** covered by the repository's Apache-2.0 code license.
 
 ## License
 
