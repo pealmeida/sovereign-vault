@@ -6,11 +6,11 @@
 #
 # Source it, then call sv_load:
 #     source sv-secrets.sh
-#     sv_load env-publimatch            # SECRETS_SOURCE env or 'auto'
-#     sv_load env-publimatch vault      # force a source
+#     sv_load env-myproject            # SECRETS_SOURCE env or 'auto'
+#     sv_load env-myproject vault      # force a source
 #
 # Or run it to print KEY=VALUE for `eval`-style use:
-#     eval "$(SECRETS_SOURCE=env bash sv-secrets.sh env-publimatch --export)"
+#     eval "$(SECRETS_SOURCE=env bash sv-secrets.sh env-myproject --export)"
 #
 # Honors the same env knobs as the loaders: SECRETS_SOURCE, SV_BIN,
 # SV_TIMEOUT_MS, SV_OTP, SV_CACHE_TTL_MS.

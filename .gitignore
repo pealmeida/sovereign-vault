@@ -52,3 +52,10 @@ coverage/
 .cache/
 *.swp
 *.swo
+
+# Local agent / editor config (per-developer, never commit)
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
