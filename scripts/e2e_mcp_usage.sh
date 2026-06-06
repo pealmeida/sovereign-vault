@@ -9,8 +9,11 @@
 # Stores CLEARLY-FAKE secrets only — never real credentials.
 set -uo pipefail
 
-CLI="${SV_CLI:-target/release/sovereign-vault.exe}"
-[ -x "$CLI" ] || CLI="target/debug/sovereign-vault.exe"
+# Resolve the CLI cross-platform: SV_CLI override, else repo build, else PATH.
+EXE="sovereign-vault"; [ "${OS:-}" = "Windows_NT" ] && EXE="sovereign-vault.exe"
+CLI="${SV_CLI:-target/release/$EXE}"
+[ -x "$CLI" ] || CLI="target/debug/$EXE"
+[ -x "$CLI" ] || CLI="$EXE"  # fall back to PATH
 
 # Fake project .env (NOT real keys).
 ENV_CONTENT=$'API_KEY=sk-test-FAKE-0000000000\nDATABASE_URL=postgres://user:fakepw@localhost/app\nSTRIPE_KEY=sk_live_FAKE_do_not_use'

@@ -6,7 +6,7 @@ secrets manager with the local .env as an automatic fallback. Stdlib only
 
 Quick start:
     from sv_secrets import load_secrets
-    source, vars = load_secrets(container="env-publimatch")
+    source, vars = load_secrets(container="env-myproject")
     os.environ.update(vars)
 
 Source switch (env var, no code change):
@@ -15,9 +15,9 @@ Source switch (env var, no code change):
     SECRETS_SOURCE=env    local .env only
 
 CLI:
-    python sv_secrets.py --container env-publimatch                 # print .env to stdout
-    python sv_secrets.py --container env-publimatch --out .env.runtime
-    SECRETS_SOURCE=env python sv_secrets.py --container env-publimatch
+    python sv_secrets.py --container env-myproject                 # print .env to stdout
+    python sv_secrets.py --container env-myproject --out .env.runtime
+    SECRETS_SOURCE=env python sv_secrets.py --container env-myproject
 
 Knobs (env): SV_BIN, SV_TIMEOUT_MS (default 30000), SV_OTP, SV_CACHE_TTL_MS (default 0=off).
 """
@@ -35,10 +35,19 @@ import threading
 import time
 from pathlib import Path
 
-DEFAULT_BIN = os.environ.get(
-    "SV_BIN",
-    r"C:\Users\pealm\Code\sovereign-vault\target\release\sovereign-vault.exe",
-)
+def _default_bin() -> str:
+    """Resolve the vault CLI cross-platform, no machine-specific paths:
+    SV_BIN wins; else the repo build if this loader still lives in-tree;
+    else rely on PATH (sovereign-vault / sovereign-vault.exe)."""
+    override = os.environ.get("SV_BIN")
+    if override:
+        return override
+    exe = "sovereign-vault.exe" if os.name == "nt" else "sovereign-vault"
+    repo_bin = Path(__file__).resolve().parent.parent.parent / "target" / "release" / exe
+    return str(repo_bin) if repo_bin.exists() else exe
+
+
+DEFAULT_BIN = _default_bin()
 DEFAULT_FILE = ".env"
 DEFAULT_ENV_PATH = ".env"
 DEFAULT_TIMEOUT_MS = int(os.environ.get("SV_TIMEOUT_MS") or 30000)
