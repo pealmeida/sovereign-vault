@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Sovereign Vault",
   "version": "0.0.0",
-  "identifier": "com.sovereign-vault.app",
+  "identifier": "com.sovereignvault.desktop",
   "build": {
     "frontendDist": "../../../ui/dist",
     "devUrl": "http://localhost:1420",
