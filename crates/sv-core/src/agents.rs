@@ -344,7 +344,13 @@ mod tests {
         assert!(authenticate(&root, &KEY, &default.agent_id, "secret-launch-2").is_ok());
         assert!(authenticate(&root, &KEY, &default.agent_id, "secret-launch-1").is_err());
         // Exactly one Default agent, plus the user's agent.
-        assert_eq!(agents.iter().filter(|a| a.name == DEFAULT_AGENT_NAME).count(), 1);
+        assert_eq!(
+            agents
+                .iter()
+                .filter(|a| a.name == DEFAULT_AGENT_NAME)
+                .count(),
+            1
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

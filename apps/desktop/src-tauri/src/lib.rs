@@ -150,9 +150,11 @@ impl ApprovalState {
             otp_code: Some(code),
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
-        Err("otp_required: a one-time code is shown on the Sovereign Vault desktop. \
+        Err(
+            "otp_required: a one-time code is shown on the Sovereign Vault desktop. \
              Resend this exact request with the `otp` argument set to that code."
-            .into())
+                .into(),
+        )
     }
 
     async fn request(&self, request: sv_mcp::AccessRequest) -> Result<(), String> {
@@ -192,7 +194,9 @@ impl ApprovalState {
             stale
         };
         for old in superseded {
-            let _ = self.app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: old });
+            let _ = self
+                .app
+                .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: old });
         }
 
         let payload = ApprovalPrompt {
@@ -347,7 +351,11 @@ fn resolve_scopes(scopes: &[sv_core::agents::AgentScope]) -> Vec<sv_mcp::Resolve
         .iter()
         .map(|s| sv_mcp::ResolvedScope {
             container_glob: s.container_glob.clone(),
-            actions: s.actions.iter().filter_map(|a| parse_access_action(a)).collect(),
+            actions: s
+                .actions
+                .iter()
+                .filter_map(|a| parse_access_action(a))
+                .collect(),
             mode_ceiling: s
                 .mode_ceiling
                 .as_deref()
@@ -496,9 +504,11 @@ where
 }
 
 async fn container_mode(state: &State<'_, VaultState>, container: &str) -> Option<SecurityMode> {
-    with_handle(state, |handle| handle.container_mode(container).map_err(estr))
-        .await
-        .ok()
+    with_handle(state, |handle| {
+        handle.container_mode(container).map_err(estr)
+    })
+    .await
+    .ok()
 }
 
 #[tauri::command]
@@ -507,10 +517,7 @@ fn app_version() -> String {
 }
 
 #[tauri::command]
-async fn vault_status(
-    app: AppHandle,
-    state: State<'_, VaultState>,
-) -> Result<VaultStatus, String> {
+async fn vault_status(app: AppHandle, state: State<'_, VaultState>) -> Result<VaultStatus, String> {
     let root = vault_root(&app)?;
     let probe = sv_core::probe(&root).map_err(estr)?;
     let guard = state.handle.lock().await;
@@ -768,9 +775,12 @@ async fn vault_change_passphrase(
     new: String,
 ) -> Result<(), String> {
     let root = vault_root(&app)?;
-    let result =
-        with_handle(&state, |handle| handle.change_passphrase(&root, &current, &new).map_err(estr))
-            .await;
+    let result = with_handle(&state, |handle| {
+        handle
+            .change_passphrase(&root, &current, &new)
+            .map_err(estr)
+    })
+    .await;
     record_desktop_event(
         &state,
         desktop_event(
@@ -800,7 +810,9 @@ async fn vault_rotate_key(
     let result = {
         let mut guard = state.handle.lock().await;
         match guard.as_mut() {
-            Some(handle) => handle.rotate_key(&root, passphrase.as_deref()).map_err(estr),
+            Some(handle) => handle
+                .rotate_key(&root, passphrase.as_deref())
+                .map_err(estr),
             None => Err("vault is locked".to_string()),
         }
     };
@@ -901,7 +913,10 @@ async fn vault_create_container(
 #[tauri::command]
 async fn vault_delete_container(state: State<'_, VaultState>, name: String) -> Result<(), String> {
     let mode = container_mode(&state, &name).await;
-    let result = with_handle(&state, |handle| handle.delete_container(&name).map_err(estr)).await;
+    let result = with_handle(&state, |handle| {
+        handle.delete_container(&name).map_err(estr)
+    })
+    .await;
     match &result {
         Ok(_) => record_desktop_event(
             &state,
@@ -1018,7 +1033,10 @@ async fn vault_read_file(
     file_name: String,
 ) -> Result<Vec<u8>, String> {
     let mode = container_mode(&state, &container).await;
-    let result = with_handle(&state, |handle| handle.read_file(&container, &file_name).map_err(estr)).await;
+    let result = with_handle(&state, |handle| {
+        handle.read_file(&container, &file_name).map_err(estr)
+    })
+    .await;
     match &result {
         Ok(bytes) => record_desktop_event(
             &state,
@@ -1139,9 +1157,12 @@ async fn agent_create(
     scopes: Option<Vec<sv_core::agents::AgentScope>>,
 ) -> Result<AgentCreated, String> {
     let _ = &app;
-    let (agent_id, token) =
-        with_handle(&state, |handle| handle.create_agent(&name, scopes.unwrap_or_default()).map_err(estr))
-            .await?;
+    let (agent_id, token) = with_handle(&state, |handle| {
+        handle
+            .create_agent(&name, scopes.unwrap_or_default())
+            .map_err(estr)
+    })
+    .await?;
     Ok(AgentCreated { agent_id, token })
 }
 
@@ -1163,7 +1184,10 @@ async fn agent_list(state: State<'_, VaultState>) -> Result<Vec<AgentInfo>, Stri
 
 #[tauri::command]
 async fn agent_revoke(state: State<'_, VaultState>, agent_id: String) -> Result<(), String> {
-    with_handle(&state, |handle| handle.revoke_agent(&agent_id).map_err(estr)).await
+    with_handle(&state, |handle| {
+        handle.revoke_agent(&agent_id).map_err(estr)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1171,7 +1195,10 @@ async fn transit_create_key(
     state: State<'_, VaultState>,
     name: String,
 ) -> Result<sv_core::transit::TransitKeyInfo, String> {
-    with_handle(&state, |handle| handle.transit_create_key(&name).map_err(estr)).await
+    with_handle(&state, |handle| {
+        handle.transit_create_key(&name).map_err(estr)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1186,7 +1213,10 @@ async fn signing_create_key(
     state: State<'_, VaultState>,
     name: String,
 ) -> Result<sv_core::transit::SigningKeyInfo, String> {
-    with_handle(&state, |handle| handle.signing_create_key(&name).map_err(estr)).await
+    with_handle(&state, |handle| {
+        handle.signing_create_key(&name).map_err(estr)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1245,11 +1275,15 @@ async fn start_servers(state: &State<'_, VaultState>) -> Result<(), String> {
 
     let secret = sv_core::fresh_pairing_secret().map_err(estr)?;
     let ws_addr: SocketAddr = format!("127.0.0.1:{RPC_PORT}").parse().map_err(estr)?;
-    let http_addr: SocketAddr = format!("127.0.0.1:{}", RPC_PORT - 1).parse().map_err(estr)?;
+    let http_addr: SocketAddr = format!("127.0.0.1:{}", RPC_PORT - 1)
+        .parse()
+        .map_err(estr)?;
     let ws_listener = tokio::net::TcpListener::bind(ws_addr).await.map_err(estr)?;
-    let http_listener = tokio::net::TcpListener::bind(http_addr).await.map_err(estr)?;
+    let http_listener = tokio::net::TcpListener::bind(http_addr)
+        .await
+        .map_err(estr)?;
 
-    let audit_root = audit_root(&state)?;
+    let audit_root = audit_root(state)?;
     let vault_dir = vault_root(&state.app)?;
     let (audit_hmac_key, agent_token_key) = {
         let guard = state.handle.lock().await;
@@ -1275,10 +1309,13 @@ async fn start_servers(state: &State<'_, VaultState>) -> Result<(), String> {
 
     let (ws_tx, ws_rx) = oneshot::channel::<()>();
     let ws_server = Arc::new(
-        sv_mcp::McpServer::new(state.handle.clone() as sv_mcp::SharedVault<VaultHandle>, secret.clone())
-            .with_access_controller(controller)
-            .with_audit_sink(sink)
-            .with_agent_authenticator(authenticator),
+        sv_mcp::McpServer::new(
+            state.handle.clone() as sv_mcp::SharedVault<VaultHandle>,
+            secret.clone(),
+        )
+        .with_access_controller(controller)
+        .with_audit_sink(sink)
+        .with_agent_authenticator(authenticator),
     );
     let ws_task = spawn(async move {
         if let Err(error) = ws_server.serve_ws_listener(ws_listener, ws_rx).await {

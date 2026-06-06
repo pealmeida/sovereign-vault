@@ -204,8 +204,7 @@ impl VaultHandle {
         // DEK v1 wrapped under itself so the keyring path works uniformly.
         keyring::migrate_legacy(root, &kek)?;
         let unwrapped = keyring::load(root, &kek)?;
-        let vault =
-            Vault::open_existing_with_keys(root, unwrapped.keys, unwrapped.active_version)?;
+        let vault = Vault::open_existing_with_keys(root, unwrapped.keys, unwrapped.active_version)?;
         Ok(Self { vault, custody })
     }
 
@@ -315,7 +314,12 @@ impl VaultHandle {
 
     /// Decrypt base64 `ciphertext_b64` under `key_ref`.
     pub fn transit_decrypt(&self, key_ref: &str, ciphertext_b64: &str) -> Result<Vec<u8>> {
-        transit::transit_decrypt(self.root(), &self.material_wrap_key(), key_ref, ciphertext_b64)
+        transit::transit_decrypt(
+            self.root(),
+            &self.material_wrap_key(),
+            key_ref,
+            ciphertext_b64,
+        )
     }
 
     /// Create an Ed25519 signing key. Returns metadata incl. the public key.
@@ -469,8 +473,7 @@ impl VaultHandle {
 
         // Reopen with all versions so old files stay readable while we migrate.
         let unwrapped = keyring::load(root, &kek)?;
-        let vault =
-            Vault::open_existing_with_keys(root, unwrapped.keys, unwrapped.active_version)?;
+        let vault = Vault::open_existing_with_keys(root, unwrapped.keys, unwrapped.active_version)?;
 
         // Re-seal every file forward to the new active version.
         for container in vault.list_containers()? {

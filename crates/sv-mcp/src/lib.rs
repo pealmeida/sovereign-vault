@@ -344,7 +344,9 @@ impl<H: VaultFacade + 'static> McpServer<H> {
     pub fn fresh_pairing_secret() -> Result<String> {
         let mut buf = [0u8; 32];
         getrandom_fill(&mut buf).map_err(|e| {
-            McpError::Protocol(format!("OS RNG unavailable, refusing to generate secret: {e}"))
+            McpError::Protocol(format!(
+                "OS RNG unavailable, refusing to generate secret: {e}"
+            ))
         })?;
         Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf))
     }
@@ -363,7 +365,11 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 continue;
             }
             let response = self
-                .dispatch(trimmed, &mut PairState::AlreadyPaired(None), AccessTransport::McpStdio)
+                .dispatch(
+                    trimmed,
+                    &mut PairState::AlreadyPaired(None),
+                    AccessTransport::McpStdio,
+                )
                 .await;
             if let Some(resp) = response {
                 let bytes =
@@ -459,7 +465,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
             if let Some(resp) = response {
                 let bytes =
                     serde_json::to_string(&resp).map_err(|e| McpError::Protocol(e.to_string()))?;
-                sink.send(Message::Text(bytes.into()))
+                sink.send(Message::Text(bytes))
                     .await
                     .map_err(|e| McpError::Transport(e.to_string()))?;
             }
@@ -642,7 +648,9 @@ impl<H: VaultFacade + 'static> McpServer<H> {
 
         match &result {
             Ok(_) => self.record_audit(&access, AuditDecision::Allowed, None, None),
-            Err(error) => self.record_audit(&access, AuditDecision::Error, None, Some(error.clone())),
+            Err(error) => {
+                self.record_audit(&access, AuditDecision::Error, None, Some(error.clone()))
+            }
         }
 
         result
@@ -650,7 +658,10 @@ impl<H: VaultFacade + 'static> McpServer<H> {
 
     /// Run the brokered request against the live handle. Returns the agent-safe
     /// result plus an audit detail string (host + method + status, no secret).
-    async fn execute_broker(&self, args: &Value) -> (std::result::Result<Value, String>, Option<String>) {
+    async fn execute_broker(
+        &self,
+        args: &Value,
+    ) -> (std::result::Result<Value, String>, Option<String>) {
         let secret_ref = match required_str(args, "secret_ref") {
             Ok(s) => s.to_string(),
             Err(e) => return (Err(e), None),
@@ -680,7 +691,10 @@ impl<H: VaultFacade + 'static> McpServer<H> {
             };
             if !handle.broker_enabled() {
                 return (
-                    Err("broker disabled: set SV_ENABLE_BROKER to enable vault.broker_request".into()),
+                    Err(
+                        "broker disabled: set SV_ENABLE_BROKER to enable vault.broker_request"
+                            .into(),
+                    ),
                     None,
                 );
             }
@@ -729,7 +743,10 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     mode,
                     byte_size: None,
                     agent_id: None,
-                    otp: args.get("otp").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    otp: args
+                        .get("otp")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 })
             }
             "vault.read" => {
@@ -743,7 +760,10 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     mode: Some(handle.container_mode(container)?),
                     byte_size: None,
                     agent_id: None,
-                    otp: args.get("otp").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    otp: args
+                        .get("otp")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 })
             }
             "vault.write" => {
@@ -761,7 +781,10 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     mode: Some(handle.container_mode(container)?),
                     byte_size: Some(bytes.len()),
                     agent_id: None,
-                    otp: args.get("otp").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    otp: args
+                        .get("otp")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 })
             }
             "vault.delete" => {
@@ -775,7 +798,10 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     mode: Some(handle.container_mode(container)?),
                     byte_size: None,
                     agent_id: None,
-                    otp: args.get("otp").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    otp: args
+                        .get("otp")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 })
             }
             "vault.create_container" => {
@@ -792,7 +818,10 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     mode: Some(SecurityMode::parse(mode).map_err(|e| e.to_string())?),
                     byte_size: None,
                     agent_id: None,
-                    otp: args.get("otp").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    otp: args
+                        .get("otp")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 })
             }
             "vault.encrypt" => {
@@ -826,7 +855,12 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         }
     }
 
-    fn execute_tool(&self, handle: &H, name: &str, args: &Value) -> std::result::Result<Value, String> {
+    fn execute_tool(
+        &self,
+        handle: &H,
+        name: &str,
+        args: &Value,
+    ) -> std::result::Result<Value, String> {
         match name {
             "vault.list" => {
                 let container = args.get("container").and_then(|v| v.as_str());
@@ -933,7 +967,11 @@ impl<H: VaultFacade + 'static> McpServer<H> {
             return;
         };
 
-        let mut event = AuditEvent::new(request.action.audit_action(), decision, request.transport.as_str());
+        let mut event = AuditEvent::new(
+            request.action.audit_action(),
+            decision,
+            request.transport.as_str(),
+        );
         event.container = request.container.clone();
         event.file_name = request.file_name.clone();
         event.mode = request.mode.map(|mode| mode.as_str().to_string());
@@ -1353,7 +1391,8 @@ mod tests {
             plaintext: &[u8],
         ) -> std::result::Result<String, String> {
             let key = sv_crypto::MasterKey::from_bytes(self.transit_key(key_ref)?);
-            let sealed = sv_crypto::seal(&key, plaintext, key_ref.as_bytes()).map_err(|e| e.to_string())?;
+            let sealed =
+                sv_crypto::seal(&key, plaintext, key_ref.as_bytes()).map_err(|e| e.to_string())?;
             Ok(B64.encode(sealed))
         }
         fn transit_decrypt(
@@ -1362,7 +1401,9 @@ mod tests {
             ciphertext_b64: &str,
         ) -> std::result::Result<Vec<u8>, String> {
             let key = sv_crypto::MasterKey::from_bytes(self.transit_key(key_ref)?);
-            let sealed = B64.decode(ciphertext_b64.as_bytes()).map_err(|e| e.to_string())?;
+            let sealed = B64
+                .decode(ciphertext_b64.as_bytes())
+                .map_err(|e| e.to_string())?;
             sv_crypto::open(&key, &sealed, key_ref.as_bytes()).map_err(|e| e.to_string())
         }
         fn sign(&self, key_ref: &str, payload: &[u8]) -> std::result::Result<String, String> {
@@ -1556,16 +1597,24 @@ mod tests {
         let enc = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.encrypt","arguments":{{"key_ref":"k1","plaintext_b64":"{pt}"}}}}}}"#
         );
-        let resp = server.dispatch(&enc, &mut pair, AccessTransport::McpWs).await.unwrap();
-        let inner: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let resp = server
+            .dispatch(&enc, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let inner: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         let ct = inner["ciphertext_b64"].as_str().unwrap();
         // The transit key bytes must never appear in the response.
         assert!(!resp.to_string().contains("key bytes"));
         let dec = format!(
             r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"vault.decrypt","arguments":{{"key_ref":"k1","ciphertext_b64":"{ct}"}}}}}}"#
         );
-        let resp = server.dispatch(&dec, &mut pair, AccessTransport::McpWs).await.unwrap();
-        let inner: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let resp = server
+            .dispatch(&dec, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let inner: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(inner["plaintext_b64"], pt);
     }
 
@@ -1577,15 +1626,23 @@ mod tests {
         let sign = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.sign","arguments":{{"key_ref":"s1","payload_b64":"{payload}"}}}}}}"#
         );
-        let resp = server.dispatch(&sign, &mut pair, AccessTransport::McpWs).await.unwrap();
-        let inner: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let resp = server
+            .dispatch(&sign, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let inner: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         let sig = inner["signature_b64"].as_str().unwrap();
         let pubk = inner["public_key_b64"].as_str().unwrap();
         let verify = format!(
             r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"vault.verify","arguments":{{"public_key_b64":"{pubk}","payload_b64":"{payload}","signature_b64":"{sig}"}}}}}}"#
         );
-        let resp = server.dispatch(&verify, &mut pair, AccessTransport::McpWs).await.unwrap();
-        let inner: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let resp = server
+            .dispatch(&verify, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let inner: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(inner["valid"], true);
     }
 
@@ -1594,9 +1651,15 @@ mod tests {
         let server = server(); // broker disabled
         let mut pair = PairState::AlreadyPaired(None);
         let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vault.broker_request","arguments":{"secret_ref":"s","method":"GET","url":"https://api.example.com/x"}}}"#;
-        let resp = server.dispatch(call, &mut pair, AccessTransport::McpWs).await.unwrap();
+        let resp = server
+            .dispatch(call, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
         assert_eq!(resp["result"]["isError"], true);
-        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("broker disabled"));
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("broker disabled"));
     }
 
     #[tokio::test]
@@ -1666,7 +1729,9 @@ mod tests {
             .dispatch(read_request, &mut pair, AccessTransport::McpWs)
             .await
             .unwrap();
-        let inner = read_response["result"]["content"][0]["text"].as_str().unwrap();
+        let inner = read_response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
         let value: Value = serde_json::from_str(inner).unwrap();
         assert_eq!(value["content_b64"], payload);
     }

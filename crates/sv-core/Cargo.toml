@@ -27,3 +27,6 @@ reqwest      = { workspace = true }
 url          = "2.5"
 async-trait  = "0.1"
 base64       = "0.22"
+
+[lints]
+workspace = true

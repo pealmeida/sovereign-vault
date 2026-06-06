@@ -22,6 +22,10 @@ repository = "https://github.com/pealmeida/sovereign-vault"
 homepage = "https://github.com/pealmeida/sovereign-vault"
 authors = ["Sovereign Vault contributors"]
 
+# Enforced workspace-wide; each member opts in with `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [workspace.dependencies]
 # Workspace-internal crates
 sv-crypto    = { path = "crates/sv-crypto",    version = "0.0.0" }
