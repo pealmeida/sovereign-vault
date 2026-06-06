@@ -5,6 +5,18 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Surface new RUSTSEC advisories even without a push.
+    - cron: '17 6 * * 1'
+
+# Least privilege by default.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,6 +61,41 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-features
 
+      - name: cargo build (release, workspace compiles)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --workspace --release
+
+  msrv:
+    name: MSRV (1.78) check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev
+      - uses: dtolnay/rust-toolchain@1.78
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace
+
+  security-audit:
+    name: Supply-chain audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo audit (RUSTSEC advisories)
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: cargo deny (advisories, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # licenses check is opt-in until the allow-list in deny.toml is
+          # validated against the full dependency tree (see deny.toml).
+          command: check advisories bans sources
+
   ui:
     name: UI typecheck
     runs-on: ubuntu-latest
@@ -64,7 +111,7 @@ jobs:
 
       - name: Install UI deps
         working-directory: ui
-        run: npm ci || npm install
+        run: npm ci
 
       - name: svelte-check
         working-directory: ui
