@@ -38,8 +38,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub const AUDIT_FILE: &str = "audit.jsonl";
 
 /// Well-known genesis `prev_sha256` value (64 hex zeros) starting each file.
-pub const GENESIS_PREV: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+pub const GENESIS_PREV: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Default rotation threshold in bytes (8 MiB).
 pub const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -443,7 +442,8 @@ impl AuditLog {
 fn recover_head(path: &Path) -> String {
     match read_last_line(path) {
         Ok(Some(line)) => match serde_json::from_str::<AuditRecord>(&line) {
-            Ok(rec) => hash_record(&rec.prev_sha256, &rec.event).unwrap_or_else(|_| GENESIS_PREV.to_string()),
+            Ok(rec) => hash_record(&rec.prev_sha256, &rec.event)
+                .unwrap_or_else(|_| GENESIS_PREV.to_string()),
             // Legacy last line without prev_sha256: treat head as genesis.
             Err(_) => GENESIS_PREV.to_string(),
         },

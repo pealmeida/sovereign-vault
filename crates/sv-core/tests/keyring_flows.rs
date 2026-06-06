@@ -103,7 +103,9 @@ fn rotate_key_reseals_files_and_reissues_recovery() {
     let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("pass")).unwrap();
     let old_phrase = boot.recovery_phrase.clone();
     let mut handle = boot.handle;
-    handle.create_container("c", SecurityMode::Direct, None).unwrap();
+    handle
+        .create_container("c", SecurityMode::Direct, None)
+        .unwrap();
     handle.write_file("c", "f.txt", b"rotate-me").unwrap();
 
     let new_phrase = handle.rotate_key(&root, Some("pass")).unwrap();

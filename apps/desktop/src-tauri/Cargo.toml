@@ -31,3 +31,6 @@ async-trait           = "0.1"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-shell = "2"
+
+[lints]
+workspace = true

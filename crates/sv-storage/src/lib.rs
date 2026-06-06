@@ -490,9 +490,7 @@ impl Vault {
         kv.copy_from_slice(&raw[1..5]);
         let key_version = u32::from_be_bytes(kv);
         let key = self.keys.get(&key_version).ok_or_else(|| {
-            StorageError::State(format!(
-                "no key available for key_version {key_version}"
-            ))
+            StorageError::State(format!("no key available for key_version {key_version}"))
         })?;
         let sealed = &raw[5..];
         let aad = aad_for(container, file_name);
@@ -756,7 +754,10 @@ mod tests {
 
     #[test]
     fn parses_approval_mode() {
-        assert_eq!(SecurityMode::parse("APPROVAL").unwrap(), SecurityMode::Approval);
+        assert_eq!(
+            SecurityMode::parse("APPROVAL").unwrap(),
+            SecurityMode::Approval
+        );
     }
 
     #[test]
@@ -819,7 +820,8 @@ mod tests {
 
         let root = tmp_dir("dotenv");
         let v = Vault::open_or_init(&root, MasterKey::generate()).unwrap();
-        v.create_container("env", SecurityMode::Direct, None).unwrap();
+        v.create_container("env", SecurityMode::Direct, None)
+            .unwrap();
         v.write_file("env", ".env", b"API_KEY=fake").unwrap();
         assert_eq!(v.read_file("env", ".env").unwrap(), b"API_KEY=fake");
         let files = v.list_files("env").unwrap();

@@ -65,7 +65,8 @@ async fn agent_writes_and_reads_real_vault_over_mcp_stdio() {
     // And the plaintext must NOT be sitting unencrypted on disk.
     let blob = std::fs::read(root.join("notes").join("key.txt.svault")).unwrap();
     assert!(
-        !blob.windows(b"my-production-api-key".len())
+        !blob
+            .windows(b"my-production-api-key".len())
             .any(|w| w == b"my-production-api-key"),
         "plaintext found in the on-disk blob"
     );

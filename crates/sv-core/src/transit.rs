@@ -205,11 +205,7 @@ pub struct SigningKeyInfo {
 
 /// Create a new Ed25519 signing key; the private seed is wrapped under
 /// `wrap_key`, the public half is stored in the clear and returned.
-pub fn signing_create_key(
-    root: &Path,
-    wrap_key: &MasterKey,
-    name: &str,
-) -> Result<SigningKeyInfo> {
+pub fn signing_create_key(root: &Path, wrap_key: &MasterKey, name: &str) -> Result<SigningKeyInfo> {
     validate_name(name)?;
     let mut file: SigningFile = read_json(root, SIGNING_FILE)?;
     if file.entries.iter().any(|e| e.name == name) {
@@ -310,22 +306,17 @@ pub struct BrokerAllow {
 }
 
 /// How the secret is injected into the outbound request.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BrokerInjection {
     /// `Authorization: Bearer <secret>`.
+    #[default]
     BearerAuth,
     /// A custom header whose value is the raw secret.
     Header {
         /// Header name to set to the secret value.
         name: String,
     },
-}
-
-impl Default for BrokerInjection {
-    fn default() -> Self {
-        Self::BearerAuth
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -457,18 +448,19 @@ pub fn broker_resolve(
 /// permanently orphaned (unseal fails with `Crypto(Aead)`), even though the
 /// metadata listings still show the keys. Idempotent and a no-op for any store
 /// that does not exist yet.
-pub fn rewrap_all_material(
-    root: &Path,
-    old_wrap: &MasterKey,
-    new_wrap: &MasterKey,
-) -> Result<()> {
+pub fn rewrap_all_material(root: &Path, old_wrap: &MasterKey, new_wrap: &MasterKey) -> Result<()> {
     rewrap_transit(root, old_wrap, new_wrap)?;
     rewrap_signing(root, old_wrap, new_wrap)?;
     rewrap_brokers(root, old_wrap, new_wrap)?;
     Ok(())
 }
 
-fn reseal(old_wrap: &MasterKey, new_wrap: &MasterKey, aad: &[u8], wrapped_b64: &str) -> Result<String> {
+fn reseal(
+    old_wrap: &MasterKey,
+    new_wrap: &MasterKey,
+    aad: &[u8],
+    wrapped_b64: &str,
+) -> Result<String> {
     let sealed = B64
         .decode(wrapped_b64.as_bytes())
         .map_err(|e| CoreError::Base64(e.to_string()))?;
@@ -624,7 +616,10 @@ mod tests {
 
         // And by `name:vN`.
         let ct_v = transit_encrypt(&root, &wrap(), "demo-key:v1", b"x").unwrap();
-        assert_eq!(transit_decrypt(&root, &wrap(), "demo-key:v1", &ct_v).unwrap(), b"x");
+        assert_eq!(
+            transit_decrypt(&root, &wrap(), "demo-key:v1", &ct_v).unwrap(),
+            b"x"
+        );
 
         // The capitalized variant must NOT resolve — confirms storage is the
         // verbatim lowercase name, not a case-folded one.
