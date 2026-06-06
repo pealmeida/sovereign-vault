@@ -4096,7 +4096,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -4120,7 +4120,7 @@ dependencies = [
  "sv-mcp",
  "sv-recovery",
  "sv-storage",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "url",
 ]
@@ -4136,7 +4136,7 @@ dependencies = [
  "hkdf",
  "rand 0.8.6",
  "sha2",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "zeroize",
 ]
 
@@ -4149,7 +4149,7 @@ dependencies = [
  "hyper-util",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -4159,7 +4159,7 @@ name = "sv-keychain"
 version = "0.0.0"
 dependencies = [
  "keyring",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "zeroize",
 ]
 
@@ -4176,7 +4176,7 @@ dependencies = [
  "sv-audit",
  "sv-crypto",
  "sv-storage",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "tracing",
@@ -4191,7 +4191,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sv-crypto",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "zeroize",
 ]
 
@@ -4203,7 +4203,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sv-crypto",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
