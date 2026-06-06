@@ -4,7 +4,7 @@
 
 ## 1. Build and run
 
-Prerequisites: Rust (stable, ≥1.85), Node.js + npm, and the Tauri prerequisites for your OS (WebView2 is preinstalled on Windows 10/11).
+Prerequisites: Rust (stable, ≥1.88), Node.js + npm, and the Tauri prerequisites for your OS (WebView2 is preinstalled on Windows 10/11).
 
 ```bash
 # from the repo root
