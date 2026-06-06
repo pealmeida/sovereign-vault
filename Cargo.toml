@@ -52,7 +52,7 @@ zeroize      = { version = "1.8",  features = ["derive"] }
 tracing      = "0.1"
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
-hyper        = { version = "1.5", features = ["server", "http1"] }
+hyper        = { version = "1.10", features = ["server", "http1"] }
 hyper-util   = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 http-body-util = "0.1"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
