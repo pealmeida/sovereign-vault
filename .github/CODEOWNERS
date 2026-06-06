@@ -1,0 +1,12 @@
+# Default owner for everything.
+*                       @pealmeida
+
+# Security-critical crates get explicit review attention.
+/crates/sv-crypto/      @pealmeida
+/crates/sv-keychain/    @pealmeida
+/crates/sv-recovery/    @pealmeida
+/crates/sv-audit/       @pealmeida
+
+# CI / supply-chain config.
+/.github/               @pealmeida
+/deny.toml              @pealmeida

@@ -1,0 +1,39 @@
+# cargo-deny configuration — supply-chain policy for the Rust workspace.
+# Run locally with: cargo install cargo-deny && cargo deny check
+# CI enforces `advisories bans sources` (see .github/workflows/ci.yml).
+
+[advisories]
+# Fail on known-vulnerable / yanked crates. Add IDs here only with a written
+# justification if a fix is genuinely unavailable.
+ignore = []
+
+[bans]
+# Duplicate versions are a warning, not a hard failure (common in large trees).
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Only crates.io and the official git index are trusted by default.
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# --- licenses (opt-in) -------------------------------------------------------
+# Not enforced in CI yet. To enable, add `licenses` to the cargo-deny command
+# and validate this allow-list against `cargo deny check licenses` output.
+[licenses]
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "MPL-2.0",
+  "Unicode-DFS-2016",
+  "Unicode-3.0",
+  "CC0-1.0",
+  "BSL-1.0",
+  "OpenSSL",
+]
+confidence-threshold = 0.9
