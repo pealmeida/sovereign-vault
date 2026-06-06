@@ -2,7 +2,14 @@
 
 **The local-first, human-in-the-loop secrets vault built for AI agents.**
 
+[![CI](https://github.com/pealmeida/sovereign-vault/actions/workflows/ci.yml/badge.svg)](https://github.com/pealmeida/sovereign-vault/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
+[![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-orange.svg)](#)
+[![Rust](https://img.shields.io/badge/Rust-stable-informational.svg)](https://www.rust-lang.org/)
+
 Your API keys, `.env` files, and sensitive data stay encrypted on *your* machine. AI agents (Claude, Cursor, Continue, any MCP client) request access through the [Model Context Protocol](https://modelcontextprotocol.io) — and **you** approve or deny each protected operation from a desktop app. Every access is written to a tamper-evident audit log.
+
+> _Screenshot/GIF of the approval modal goes here — the human-in-the-loop prompt is the core differentiator. (Capture from the running desktop app.)_
 
 No cloud. No plaintext sprawl. No agent ever sees a secret you didn't release.
 
@@ -23,6 +30,20 @@ Sovereign Vault inverts the trust model:
 - **Everything is audited.** Append-only, hash-chained JSONL log. Tampering breaks the chain.
 
 That combination — local-first **+** human-in-the-loop **+** MCP-native **+** secret brokering — is what makes it a *sovereign* vault: you keep custody and control.
+
+### How it compares
+
+| | Sovereign Vault | HashiCorp Vault / OpenBao | Bitwarden / 1Password | `.env` files |
+|---|---|---|---|---|
+| Runs fully local, no server | ✅ | ❌ (server/cluster) | ❌ (cloud sync) | ✅ |
+| Per-operation human approval | ✅ | ❌ | ❌ | ❌ |
+| MCP-native (agents ask via tools) | ✅ | ❌ | ❌ | ❌ |
+| Use a key without revealing it (transit/sign/broker) | ✅ | ✅ | ❌ | ❌ |
+| Tamper-evident audit log | ✅ (hash-chained) | ✅ | partial | ❌ |
+| Secrets encrypted at rest | ✅ | ✅ | ✅ | ❌ |
+
+Built for the single-developer / single-agent-fleet case that the server-grade
+tools over-serve and `.env` files under-serve.
 
 ## What's inside (implemented)
 
@@ -68,10 +89,15 @@ cargo tauri dev --manifest-path apps/desktop/src-tauri/Cargo.toml
 # Production bundle (build the UI FIRST, then bundle):
 ( cd ui && npm run build )
 cargo tauri build --manifest-path apps/desktop/src-tauri/Cargo.toml
-# installers land in apps/desktop/src-tauri/target/release/bundle/
+# Installers land in the workspace target dir: target/release/bundle/
+#   macOS:   target/release/bundle/dmg/Sovereign Vault_<ver>_x64.dmg  (+ .app under bundle/macos/)
+#   Linux:   target/release/bundle/{deb,appimage}/
+#   Windows: target/release/bundle/{nsis,msi}/
 ```
 
 > First launch walks you through custody (OS keychain or passphrase) and shows your recovery phrase **once** — write it down.
+
+> **macOS Gatekeeper:** the bundle is unsigned (pre-1.0), so the first launch may be blocked. Clear the quarantine flag: `xattr -dr com.apple.quarantine "target/release/bundle/macos/Sovereign Vault.app"`.
 
 ---
 
@@ -127,8 +153,9 @@ apps/desktop     Tauri 2 app (Rust commands + approval state)
 apps/cli         headless `sovereign-vault` binary (incl. `mcp-stdio` proxy)
 ui/              Svelte 5 + Vite frontend
 clients/         Node / Python / shell secret loaders (vault + .env fallback)
+examples/        ready-to-paste MCP client configs + an end-to-end script
 docs/            threat model, architecture, ADRs, test plans, USAGE_REAL
-examples/        Claude / Cursor / Continue integration samples
+scripts/         build/run helpers (macOS .command) + e2e MCP usage script
 ```
 
 - Verify before claiming done: `cargo check --workspace`, `cargo test --workspace`, and `( cd ui && npm run check )`.

@@ -1,0 +1,9 @@
+{
+  "//": "Merge this mcpServers block into your ~/.continue/config.json",
+  "mcpServers": {
+    "sovereign-vault": {
+      "command": "/ABSOLUTE/PATH/TO/sovereign-vault/target/release/sovereign-vault",
+      "args": ["mcp-stdio"]
+    }
+  }
+}

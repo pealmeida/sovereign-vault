@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "sovereign-vault": {
+      "command": "/ABSOLUTE/PATH/TO/sovereign-vault/target/release/sovereign-vault",
+      "args": ["mcp-stdio"]
+    }
+  }
+}

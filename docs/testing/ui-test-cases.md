@@ -1,5 +1,8 @@
 # UI / Desktop Test Cases — detailed
 
+> **Platform note:** the NSIS/`%LOCALAPPDATA%` install steps are Windows-specific;
+> the macOS build installs a `.app`/DMG (see the repo README).
+
 Companion to `e2e-test-plan.md`. Concrete, repeatable desktop-app cases driven through the installed window (manually or via computer-use). Each case: precondition → steps → expected. Items marked **VERIFIED 2026-05-25** were exercised live in the installed prod build.
 
 ## Build & launch (prerequisite)

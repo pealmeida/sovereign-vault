@@ -10,7 +10,7 @@
 
 **Do not open a public GitHub issue.**
 
-Please report via [GitHub Security Advisories](https://github.com/pealmeida/sovereign-vault/security/advisories/new) (private). If you cannot use that channel, email `security@sovereign-vault.app` (TODO: configure before v1.0).
+Please report via [GitHub Security Advisories](https://github.com/pealmeida/sovereign-vault/security/advisories/new) (private). If you cannot use that channel, contact a maintainer directly through their GitHub profile — do **not** include vulnerability details in any public space.
 
 When reporting, include:
 

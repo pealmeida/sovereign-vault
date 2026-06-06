@@ -1,5 +1,8 @@
 # MCP Test Cases — detailed
 
+> **Platform note:** examples below using `sovereign-vault.exe` are Windows;
+> on macOS/Linux the binary is `sovereign-vault` (no extension).
+
 Companion to `e2e-test-plan.md`. These are the concrete, repeatable MCP-layer cases: exact JSON-RPC frames, preconditions, expected results, and approval behaviour. They exercise the **real** path a client (Claude Desktop / Cursor) uses — the `sovereign-vault mcp-stdio` proxy → `ws://127.0.0.1:9944`.
 
 ## How to run
