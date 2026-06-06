@@ -1345,7 +1345,7 @@ fn base_tool_descriptors() -> Value {
 /// secret material such as pairing secrets, so on RNG failure we surface the
 /// error to the caller rather than emitting guessable bytes.
 fn getrandom_fill(buf: &mut [u8]) -> std::result::Result<(), getrandom::Error> {
-    getrandom::getrandom(buf)
+    getrandom::fill(buf)
 }
 
 /// Crate version string.

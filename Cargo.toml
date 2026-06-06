@@ -57,6 +57,8 @@ hyper-util   = { version = "0.1", features = ["tokio", "server", "server-auto"] 
 http-body-util = "0.1"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 reqwest      = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rand         = "0.9"
+getrandom    = "0.4"
 
 [profile.release]
 lto = "thin"
