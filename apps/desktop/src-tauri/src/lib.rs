@@ -468,17 +468,20 @@ fn approval_requirement(request: &sv_mcp::AccessRequest) -> Result<ApprovalPromp
         _ => {}
     }
     match request.mode {
-        Some(SecurityMode::Direct) | None => match request.action {
-            sv_mcp::AccessAction::ListContainers | sv_mcp::AccessAction::CreateContainer => {
-                Ok(ApprovalPromptKind::Click)
+        // ANONYMIZED is auto-allowed without a consent prompt, exactly like
+        // DIRECT: its protection is the PII masking sv-mcp applies to read
+        // responses (thesis module 3b), not a human gate. Stored data is not
+        // altered; only egress to the agent is sanitised.
+        Some(SecurityMode::Direct) | Some(SecurityMode::Anonymized) | None => {
+            match request.action {
+                sv_mcp::AccessAction::ListContainers | sv_mcp::AccessAction::CreateContainer => {
+                    Ok(ApprovalPromptKind::Click)
+                }
+                _ => Ok(ApprovalPromptKind::NotRequired),
             }
-            _ => Ok(ApprovalPromptKind::NotRequired),
-        },
+        }
         Some(SecurityMode::Approval) => Ok(ApprovalPromptKind::Click),
         Some(SecurityMode::Otp) => Ok(ApprovalPromptKind::Otp),
-        Some(SecurityMode::Anonymized) => {
-            Err("ANONYMIZED mode is not implemented for live MCP access".into())
-        }
         Some(SecurityMode::Zkp) => Err("ZKP mode is not implemented for live MCP access".into()),
         Some(SecurityMode::Native) => {
             Err("NATIVE mode is not implemented for live MCP access".into())

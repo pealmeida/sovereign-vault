@@ -1,0 +1,14 @@
+[package]
+name        = "sv-privacy"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace= true
+license.workspace     = true
+repository.workspace  = true
+description = "Sovereign Vault privacy-mediation layer: PII detection and masking for the ANONYMIZED security mode."
+
+[dependencies]
+serde = { workspace = true }
+
+[lints]
+workspace = true

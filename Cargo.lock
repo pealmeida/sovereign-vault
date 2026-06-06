@@ -4263,11 +4263,19 @@ dependencies = [
  "serde_json",
  "sv-audit",
  "sv-crypto",
+ "sv-privacy",
  "sv-storage",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "tracing",
+]
+
+[[package]]
+name = "sv-privacy"
+version = "0.0.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -4766,6 +4774,24 @@ checksum = "c4790fc369d5a530f4b544b094e31388b9b3a37c0f4652ade4505945f5660d24"
 dependencies = [
  "new_debug_unreachable",
  "utf-8",
+]
+
+[[package]]
+name = "thesis-eval"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "sv-audit",
+ "sv-core",
+ "sv-mcp",
+ "sv-privacy",
+ "sv-storage",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]
