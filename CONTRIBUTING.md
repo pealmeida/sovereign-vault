@@ -12,7 +12,7 @@ Thanks for your interest. This project is pre-alpha; expect rough edges and shif
 
 ### Prerequisites
 
-- Rust stable (≥ 1.85) with `rustfmt` + `clippy`
+- Rust stable (≥ 1.88) with `rustfmt` + `clippy`
 - Node.js 20+ (for the Svelte UI)
 - Tauri 2 prerequisites — see <https://tauri.app/start/prerequisites/>
 
