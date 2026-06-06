@@ -25,7 +25,7 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use hkdf::Hkdf;
-use rand::RngCore;
+use rand::Rng; // rand 0.10 renamed the core trait RngCore -> Rng (provides fill_bytes)
 use sha2::Sha256;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
