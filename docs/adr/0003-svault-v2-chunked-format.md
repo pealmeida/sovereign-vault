@@ -6,7 +6,13 @@
 
 ## Context
 
-v1.0 stores files up to 100 MB. The current PoC uses whole-file AES-256-GCM envelopes, which require loading the full plaintext into memory before encrypting or decrypting. This is fine for credentials (KB-sized) but unworkable for the broader use case (financial documents, scans, images), especially on mobile devices with constrained memory.
+> **Implementation status (note):** this ADR is **Proposed** and the chunked
+> `.svault-v2` format is **not yet implemented**. This repo currently seals files
+> with **whole-file XChaCha20-Poly1305** (not AES-256-GCM — the AES reference
+> below describes the original pre-extraction PoC, not the shipped code). The
+> memory motivation still holds for the future chunked format.
+
+v1.0 stores files up to 100 MB. The original PoC used whole-file AES-256-GCM envelopes, which require loading the full plaintext into memory before encrypting or decrypting. This is fine for credentials (KB-sized) but unworkable for the broader use case (financial documents, scans, images), especially on mobile devices with constrained memory.
 
 ## Decision
 

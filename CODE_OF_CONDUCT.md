@@ -9,7 +9,7 @@ The full text is available at the link above; please read it before contributing
 - We pledge to make participation in our community a harassment-free experience for everyone.
 - We commit to demonstrating empathy and kindness, respecting differing opinions, giving and accepting constructive feedback, and focusing on what is best for the community.
 - Unacceptable behavior includes personal attacks, public or private harassment, and publishing others' private information without permission.
-- Project maintainers will enforce this Code of Conduct. Reports go to **conduct@sovereign-vault.app** (TODO: configure mailbox before v1.0).
+- Project maintainers will enforce this Code of Conduct. Report concerns privately by contacting a maintainer directly through their GitHub profile (or via a [private Security Advisory](https://github.com/pealmeida/sovereign-vault/security/advisories/new) if you need a confidential channel).
 
 ## Enforcement
 

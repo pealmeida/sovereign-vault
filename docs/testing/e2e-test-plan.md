@@ -2,6 +2,12 @@
 
 Status: living document · Owner: pealmeida · Last updated: 2026-05-25
 
+> **Platform note:** the recorded results and some install steps below were
+> captured on a **Windows/NSIS** build. The project now also ships a macOS
+> `.app`/DMG; the CLI binary is `sovereign-vault` (no `.exe`) on macOS/Linux.
+> Treat `.exe`/`%LOCALAPPDATA%`/NSIS references as Windows-specific. The dated
+> run log lives in [`docs/archive/e2e-results-2026-05-25.md`](../archive/e2e-results-2026-05-25.md).
+
 ## 1. Purpose & scope
 
 Validate that Sovereign Vault works for its real job: an AI agent stores and uses a user's secrets (project `.env` files, financial data, personal notes) **without the user losing data and without the agent ever seeing more than it should**. Scope covers the full stack end to end — crypto → storage → keyring → custody → MCP server → `mcp-stdio` proxy → desktop UI — exercised the way a real user and a real MCP client (Claude Desktop / Cursor) drive it.

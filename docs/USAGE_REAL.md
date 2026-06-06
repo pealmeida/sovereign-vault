@@ -1,19 +1,22 @@
 # Real-usage guide — Sovereign Vault
 
-Last updated: 2026-05-29. Layout scaffolded on this machine; populate it yourself.
+How to use the vault for real work: container layout, per-agent scoped tokens,
+the `.env` migration playbook, the OTP flow, the session cache, and backups.
 
-## 1. Container layout (already created, empty)
+Examples below use placeholder names like `env-myproject`. Replace them with
+your own. Paths are shown for macOS/Linux; Windows equivalents are noted inline.
+
+## 1. Suggested container layout
+
+Create these in the desktop app (**Vault → New vault**) — pick a mode per
+container based on how sensitive the data is:
 
 | Container | Mode | Purpose |
 |---|---|---|
-| `env-publimatch` | APPROVAL | `.env*` files for the publimatch codebase |
-| `env-sovereign-vault` | APPROVAL | `.env*` files for the sovereign-vault codebase |
+| `env-myproject` | APPROVAL | `.env*` files for a codebase |
 | `secrets-cloud` | APPROVAL | Cloud-provider keys (AWS, GCP, DO, Vercel…) |
 | `secrets-api` | APPROVAL | 3rd-party API keys (Stripe, OpenAI, Anthropic, Supabase…) |
 | `personal-id` | **OTP** | IDs, passports, recovery codes — high friction by design |
-| `finance` | OTP | Pre-existing financial container |
-
-Pre-existing test containers (`approval-test`, `claude-test`, `mcp-demo`, `otp-demo`) are still there. Delete them in the desktop UI once you don't need them.
 
 Mode cheatsheet:
 - **DIRECT**: no prompt. Use only for working data that isn't sensitive.
@@ -23,58 +26,72 @@ Mode cheatsheet:
 
 ## 2. Wire an MCP client (any project)
 
-The vault's MCP server binds on unlock at `ws://127.0.0.1:9944` and exposes pairing on `http://127.0.0.1:9943/.well-known/mcp-pairing`. Every client uses the same stdio proxy: `sovereign-vault.exe mcp-stdio`. The proxy auto-fetches the per-launch pairing secret.
+The vault's MCP server binds on unlock at `ws://127.0.0.1:9944` and exposes
+pairing on `http://127.0.0.1:9943/.well-known/mcp-pairing`. Every client uses the
+same stdio proxy: `sovereign-vault mcp-stdio` (the proxy auto-fetches the
+per-launch pairing secret).
 
-**Claude Code** (`%APPDATA%\Claude\claude_desktop_config.json` or per-project `.mcp.json`):
+Ready-to-paste configs live in [`examples/`](../examples/). For Claude Desktop:
 
 ```jsonc
+// macOS:   ~/Library/Application Support/Claude/claude_desktop_config.json
+// Windows: %APPDATA%\Claude\claude_desktop_config.json
 {
   "mcpServers": {
     "sovereign-vault": {
-      "command": "C:\\Users\\pealm\\Code\\sovereign-vault\\target\\release\\sovereign-vault.exe",
+      "command": "/ABSOLUTE/PATH/TO/sovereign-vault/target/release/sovereign-vault",
       "args": ["mcp-stdio"]
     }
   }
 }
 ```
 
-**Cursor / Continue.dev**: copy from the desktop app, **Settings → MCP server → Copy Cursor config / Copy Continue.dev config**. Same idea.
+> On Windows the binary is `…\target\release\sovereign-vault.exe`. The desktop
+> app's **Settings → MCP server** page has "Copy config" buttons that fill in
+> your real binary path for Claude Desktop / Cursor / Continue.dev.
 
-The vault must be **unlocked** before the client can call any tool. Lock = MCP servers stop binding.
+The vault must be **unlocked** before any tool call. Lock = MCP servers stop binding.
 
 ## 3. Recommended: per-agent scoped tokens
 
-Don't reuse the `Default` agent across every project — mint a scoped agent per project so a compromised client can only touch its own container:
+Don't reuse the `Default` agent across every project — mint a scoped agent per
+project so a compromised client can only touch its own container:
 
 1. Desktop → **Settings → Agents → New agent**
-2. Name: e.g. `publimatch-prod`
+2. Name: e.g. `myproject-prod`
 3. Copy the **one-time token** (shown ONCE).
-4. In that project's MCP client config, pass the token instead of using the default secret. (When using `sovereign-vault.exe mcp-stdio` the proxy reads `SV_PAIRING_TOKEN` from env if set; otherwise it falls back to the Default agent's per-launch secret. Set `SV_PAIRING_TOKEN=<the token>` in that project's env so its agent is bound to its scoped identity.)
-5. Add scopes (in the Agents panel): glob `env-publimatch/*`, actions `read,list`.
+4. In that project's MCP client config, pass the token instead of the default
+   secret. The `mcp-stdio` proxy reads `SV_PAIRING_TOKEN` from the environment
+   if set; otherwise it falls back to the Default agent's per-launch secret. Set
+   `SV_PAIRING_TOKEN=<the token>` in that project's env so its agent binds to its
+   scoped identity.
+5. Add scopes (in the Agents panel): glob `env-myproject/*`, actions `read,list`.
 
 Revoke any time from the Agents panel. The token never appears in the UI again.
 
 ## 4. Move an `.env` into the vault — playbook
 
-From the project directory:
+From the project directory (vault unlocked; you'll approve in the desktop):
 
 ```bash
-# 1. Encode (Windows Git Bash):
-B64=$(base64 -w0 < .env)
+# 1. Encode the file (macOS/Linux):
+B64=$(base64 < .env | tr -d '\n')
 
-# 2. Write via MCP proxy (vault must be unlocked, you'll approve in desktop):
-WRITE="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"vault.write\",\"arguments\":{\"container\":\"env-publimatch\",\"file_name\":\".env\",\"content_b64\":\"$B64\"}}}"
-{ printf '%s\n' "$WRITE"; sleep 5; } | sovereign-vault.exe mcp-stdio
+# 2. Write via the MCP proxy:
+WRITE="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"vault.write\",\"arguments\":{\"container\":\"env-myproject\",\"file_name\":\".env\",\"content_b64\":\"$B64\"}}}"
+{ printf '%s\n' "$WRITE"; sleep 5; } | sovereign-vault mcp-stdio
 
-# 3. Verify, then DELETE the plaintext .env:
+# 3. Verify the read-back, then DELETE the plaintext .env:
 rm .env
 git rm --cached .env 2>/dev/null
 echo ".env" >> .gitignore && git add .gitignore
 ```
 
-For an OTP container (e.g. `personal-id`), the first `vault.write` returns `otp_required` and shows a code on the desktop; resend with `otp=<that code>`.
+For an OTP container (e.g. `personal-id`), the first `vault.write` returns
+`otp_required` and shows a code on the desktop; resend with `otp=<that code>`.
 
-In dev, your app reads the secret back at startup via the MCP client (an agent tool call to `vault.read`). Don't echo it to logs.
+In dev, your app reads the secret back at startup via the MCP client (an agent
+tool call to `vault.read`). Don't echo it to logs.
 
 ## 5. Daily safety habits
 
@@ -82,13 +99,13 @@ In dev, your app reads the secret back at startup via the MCP client (an agent t
 - **Approve carefully**: every modal shows the agent id, action, container, file. If something asks for `secrets-cloud` and you didn't initiate it, deny.
 - **OTP for blast-radius data**: financial, ID, recovery phrases. Cross-channel typing is your friend.
 - **Audit log** (`Settings → Open audit folder`) is append-only + hash-chained. Skim it weekly.
-- **Backups**: copy the entire vault root and the OS-keychain entry (or recovery phrase) to a cold offline medium (USB stick, encrypted). Pre-alpha — keep independent copies.
+- **Backups**: copy the entire vault root and the OS-keychain entry (or recovery phrase) to a cold offline medium. Pre-alpha — keep independent copies.
 
 ## 6. Known limits (today)
 
 - ANONYMIZED / ZKP / NATIVE modes are stubs (`"...not implemented for live MCP access"`).
 - Container `delete` is destructive and not yet undo-able — confirm twice.
-- Broker (`vault.broker_request`) is off by default. Enable with `SV_ENABLE_BROKER=1` if you want to inject secrets into outbound HTTP without exposing them.
+- Broker (`vault.broker_request`) is off by default. Enable with `SV_ENABLE_BROKER=1` to inject secrets into outbound HTTP without exposing them.
 
 ## 7. Vault-as-primary with `.env` redundancy (the safe switch)
 
@@ -109,7 +126,7 @@ project or reference it directly.
 
 ```js
 import { loadSecrets } from "./sv-secrets.mjs";
-const { source, vars } = await loadSecrets({ container: "env-publimatch" });
+const { source, vars } = await loadSecrets({ container: "env-myproject" });
 Object.assign(process.env, vars);
 console.error(`[secrets] ${Object.keys(vars).length} keys via ${source}`);
 ```
@@ -117,13 +134,14 @@ console.error(`[secrets] ${Object.keys(vars).length} keys via ${source}`);
 **CLI (materialize a runtime file or pipe):**
 
 ```bash
-node sv-secrets.mjs --container env-publimatch --out .env.runtime   # writes 0600 file
-SECRETS_SOURCE=env node sv-secrets.mjs --container env-publimatch   # force local
+node sv-secrets.mjs --container env-myproject --out .env.runtime   # writes 0600 file
+SECRETS_SOURCE=env node sv-secrets.mjs --container env-myproject   # force local
 ```
 
-Knobs: `SV_BIN` (path to `sovereign-vault.exe`), `SV_TIMEOUT_MS` (approval wait,
-default 30000), `SV_OTP` (code for OTP containers), `SV_CACHE_TTL_MS` (session
-cache, default 0 = off).
+Knobs: `SV_BIN` (path to the `sovereign-vault` binary — auto-discovered from the
+repo build or your `PATH` if unset), `SV_TIMEOUT_MS` (approval wait, default
+30000), `SV_OTP` (code for OTP containers), `SV_CACHE_TTL_MS` (session cache,
+default 0 = off).
 
 **Session cache (opt-in) — stop re-prompting on every dev restart.** With
 `SV_CACHE_TTL_MS` > 0 (or `--cache-ttl <ms>`), a successful **vault** read is
@@ -131,35 +149,20 @@ cached to a `0600` temp file; subsequent runs within the TTL return
 `source: "cache"` with **no approval prompt**. Clear it with `--clear-cache`.
 
 ```bash
-SV_CACHE_TTL_MS=1800000 node sv-secrets.mjs --container env-publimatch  # 30-min cache
-node sv-secrets.mjs --clear-cache                                       # wipe all cached secrets
+SV_CACHE_TTL_MS=1800000 node sv-secrets.mjs --container env-myproject  # 30-min cache
+node sv-secrets.mjs --clear-cache                                      # wipe all cached secrets
 ```
 
 ⚠️ **Tradeoff:** the cache writes *decrypted* secrets to your temp dir for the
 TTL window — that partially defeats the vault. Off by default. Use short TTLs,
-`--clear-cache` when done, and never enable it on shared machines. **Verified
-live:** first read prompted once + cached; second read served from cache with no
-prompt; `--clear-cache` forced the next read back through the vault.
-
-**Verified live 2026-05-29** on `env-publimatch`:
-- `source=vault` → 3 keys pulled from vault (after one desktop Approve);
-- `source=env` → 3 keys from local `.env`;
-- `source=auto` with the vault unreachable → automatic fallback to `.env` + warning.
+`--clear-cache` when done, and never enable it on shared machines.
 
 **Other languages (same behavior, same env knobs):**
-- **Python** `clients/python/sv_secrets.py` — `from sv_secrets import load_secrets; src, vars = load_secrets(container="env-publimatch")`. CLI identical to Node. Stdlib only (≥3.8).
-- **Shell** `clients/shell/sv-secrets.sh` — `source sv-secrets.sh; sv_load env-publimatch [auto|vault|env]` loads into the current shell; or `eval "$(bash sv-secrets.sh env-publimatch --export)"`. Wraps the Node loader by default (`SV_RUNNER=python SV_LOADER=…/sv_secrets.py` to use Python).
-
-All three verified live: vault read (one Approve), `.env` fallback, `source=env`, and auto-fallback when the vault is unreachable.
+- **Python** `clients/python/sv_secrets.py` — `from sv_secrets import load_secrets; src, vars = load_secrets(container="env-myproject")`. CLI identical to Node. Stdlib only (≥3.8).
+- **Shell** `clients/shell/sv-secrets.sh` — `source sv-secrets.sh; sv_load env-myproject [auto|vault|env]` loads into the current shell; or `eval "$(bash sv-secrets.sh env-myproject --export)"`. Wraps the Node loader by default (`SV_RUNNER=python SV_LOADER=…/sv_secrets.py` to use Python).
 
 Migration path: keep both in sync while you trust-build (`SECRETS_SOURCE=auto`),
 then drop the local `.env` (or set `SECRETS_SOURCE=vault`) once confident.
 APPROVAL containers prompt on every read — for hands-off dev boots either keep a
 session-cached `.env.runtime`, use a DIRECT dev container, or pre-load once per
 session.
-
-## 8. What I did NOT touch on your behalf
-
-- No real secrets typed by the agent. Empty container shells only.
-- `finance` and any user data left unread.
-- Agent identities: only the `Default` agent was used by the scaffolding. You decide which per-project agents to mint.
