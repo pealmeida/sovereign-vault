@@ -44,19 +44,21 @@ thiserror    = "2.0"
 anyhow       = "1.0"
 tokio        = { version = "1.41", features = ["macros", "rt-multi-thread", "fs", "io-util", "sync", "net", "time"] }
 chrono       = { version = "0.4",  features = ["serde"] }
-sha2         = "0.10"
-hkdf         = "0.12"
-hmac         = "0.12"
+sha2         = "0.11"
+hkdf         = "0.13"
+hmac         = "0.13"
 subtle       = "2.6"
 zeroize      = { version = "1.8",  features = ["derive"] }
 tracing      = "0.1"
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
 futures-util = "0.3"
 hyper        = { version = "1.10", features = ["server", "http1"] }
 hyper-util   = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 http-body-util = "0.1"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 reqwest      = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rand         = "0.9"
+getrandom    = "0.4"
 
 [profile.release]
 lto = "thin"
