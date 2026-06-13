@@ -15,7 +15,7 @@
     "@tauri-apps/plugin-dialog": "^2.0.0",
     "@tauri-apps/plugin-fs": "^2.0.0",
     "@tsconfig/svelte": "^5.0.0",
-    "svelte": "^5.56.2",
+    "svelte": "^5.56.3",
     "svelte-check": "^4.6.0",
     "tslib": "^2.6.0",
     "typescript": "^6.0.0",
@@ -24,7 +24,7 @@
   "dependencies": {
     "@fontsource/fira-mono": "^5.2.7",
     "@fontsource/space-grotesk": "^5.2.10",
-    "dompurify": "^3.4.8",
+    "dompurify": "^3.4.10",
     "highlight.js": "^11.11.1",
     "lucide-svelte": "^1.0.1",
     "marked": "^18.0.5",
