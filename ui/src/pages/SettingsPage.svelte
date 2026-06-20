@@ -192,6 +192,14 @@
           <strong>{vaultStore.status?.has_keychain_entry ? 'Present' : 'None'}</strong>
         </div>
         <div class="detail-row">
+          <span>OS Keychain backend</span>
+          <strong>
+            {vaultStore.status?.keychain_available
+              ? vaultStore.status?.keychain_backend
+              : vaultStore.status?.keychain_error ?? 'Unavailable'}
+          </strong>
+        </div>
+        <div class="detail-row">
           <span>Recovery bundle</span>
           <strong>{vaultStore.status?.has_recovery_bundle ? 'Present' : 'None'}</strong>
         </div>

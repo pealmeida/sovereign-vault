@@ -21,6 +21,9 @@ export interface VaultStatus {
   unlocked: boolean;
   custody: Custody | null;
   has_keychain_entry: boolean;
+  keychain_backend: string;
+  keychain_available: boolean;
+  keychain_error: string | null;
   has_passphrase_salt: boolean;
   has_recovery_bundle: boolean;
   has_keyring: boolean;

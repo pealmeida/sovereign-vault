@@ -135,6 +135,34 @@ pub fn create(root: &Path, kek: &MasterKey, dek: &MasterKey) -> Result<()> {
     write_keyring(root, &kr)
 }
 
+/// Replace the keyring with a single active DEK wrapped under `kek`.
+///
+/// Used by recovery repair when the existing KEK is lost: the recovery bundle
+/// restores the active DEK directly, so older wrapped entries cannot be
+/// unwrapped and must be discarded.
+pub fn replace_with_single_active_dek(
+    root: &Path,
+    kek: &MasterKey,
+    active_version: u32,
+    dek: &MasterKey,
+) -> Result<()> {
+    if active_version == 0 {
+        return Err(CoreError::Misuse(
+            "keyring active version must be greater than zero".into(),
+        ));
+    }
+    let kr = KeyringFile {
+        version: KEYRING_SCHEMA,
+        active_dek_version: active_version,
+        min_decryption_version: active_version,
+        entries: vec![WrappedDek {
+            dek_version: active_version,
+            wrapped_b64: wrap(kek, dek)?,
+        }],
+    };
+    write_keyring(root, &kr)
+}
+
 /// Migrate a legacy vault (no keyring) whose files were sealed directly with
 /// `legacy_key`. The legacy key becomes DEK v1 and is wrapped under itself as
 /// the KEK — `seal(K, K)` — so the existing custody artefact (keychain entry

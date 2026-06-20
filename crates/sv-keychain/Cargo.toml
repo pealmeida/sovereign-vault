@@ -10,7 +10,7 @@ description = "OS keychain abstraction for Sovereign Vault master-key custody."
 [dependencies]
 thiserror = { workspace = true }
 zeroize   = { workspace = true }
-keyring   = { version = "3.6", features = ["apple-native", "windows-native", "linux-native-sync-persistent"] }
+keyring   = { version = "3.6", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust", "vendored"] }
 
 [lints]
 workspace = true

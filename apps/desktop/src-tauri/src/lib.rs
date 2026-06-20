@@ -274,6 +274,9 @@ struct VaultStatus {
     unlocked: bool,
     custody: Option<String>,
     has_keychain_entry: bool,
+    keychain_backend: String,
+    keychain_available: bool,
+    keychain_error: Option<String>,
     has_passphrase_salt: bool,
     has_recovery_bundle: bool,
     has_keyring: bool,
@@ -534,6 +537,9 @@ async fn vault_status(app: AppHandle, state: State<'_, VaultState>) -> Result<Va
         unlocked: guard.is_some(),
         custody,
         has_keychain_entry: probe.has_keychain_entry,
+        keychain_backend: probe.keychain_backend.to_string(),
+        keychain_available: probe.keychain_available,
+        keychain_error: probe.keychain_error,
         has_passphrase_salt: probe.has_passphrase_salt,
         has_recovery_bundle: probe.has_recovery_bundle,
         has_keyring: probe.has_keyring,
@@ -635,7 +641,19 @@ async fn vault_unlock(
 ) -> Result<(), String> {
     let mode = parse_custody(&custody)?;
     let root = vault_root(&app)?;
-    let handle = match VaultHandle::unlock(&root, mode, passphrase.as_deref()) {
+    let probe = sv_core::probe(&root).map_err(estr)?;
+    let handle_result = if mode == CustodyMode::OsKeychain && probe.has_passphrase_salt {
+        let pass = passphrase.as_deref().ok_or_else(|| {
+            "current passphrase is required to move this vault to OS Keychain".to_string()
+        })?;
+        VaultHandle::unlock(&root, CustodyMode::Passphrase, Some(pass)).and_then(|mut handle| {
+            handle.move_to_os_keychain(&root, pass)?;
+            Ok(handle)
+        })
+    } else {
+        VaultHandle::unlock(&root, mode, passphrase.as_deref())
+    };
+    let handle = match handle_result {
         Ok(handle) => handle,
         Err(error) => {
             record_desktop_event(

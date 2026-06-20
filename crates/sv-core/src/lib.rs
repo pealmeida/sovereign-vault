@@ -31,7 +31,11 @@ pub mod transit;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64_URL},
+    Engine as _,
+};
+use sha2::{Digest, Sha256};
 use sv_crypto::{MasterKey, MASTER_KEY_LEN, SALT_LEN};
 use sv_storage::{ContainerInfo, FileInfo, SecurityMode, Vault};
 use thiserror::Error;
@@ -128,18 +132,20 @@ impl VaultHandle {
             fs::create_dir_all(root)?;
         }
 
+        if root.join("manifest.json").exists() || keyring::exists(root) {
+            return Err(CoreError::Misuse(
+                "vault already initialised on disk - call unlock instead".into(),
+            ));
+        }
+
         match custody {
             CustodyMode::OsKeychain => {
-                if sv_keychain::load_master_key()?.is_some() {
-                    return Err(CoreError::Misuse(
-                        "OS keychain already holds a key — call unlock instead".into(),
-                    ));
-                }
+                sv_keychain::ensure_available()?;
                 // Keychain holds the KEK; a fresh random DEK seals the data and
                 // is wrapped under the KEK in the keyring.
                 let kek = MasterKey::generate();
                 let dek = MasterKey::generate();
-                sv_keychain::store_master_key(&B64.encode(kek.as_bytes()))?;
+                store_scoped_keychain_kek(root, &kek)?;
                 keyring::create(root, &kek, &dek)?;
                 let recovery_key = dek.clone();
                 let vault = Vault::open_or_init(root, dek)?;
@@ -154,12 +160,6 @@ impl VaultHandle {
                     CoreError::Misuse("passphrase custody requires a passphrase".into())
                 })?;
                 let salt_path = root.join(SALT_FILENAME);
-                if salt_path.exists() {
-                    return Err(CoreError::Misuse(
-                        "vault already initialised (master.salt exists) — call unlock instead"
-                            .into(),
-                    ));
-                }
                 // Passphrase derives the KEK; a fresh random DEK seals the data.
                 let salt = sv_crypto::random_salt()?;
                 fs::write(&salt_path, salt)?;
@@ -186,14 +186,18 @@ impl VaultHandle {
     /// legacy (pre-keyring) vault on first unlock, then unwraps the DEK(s)
     /// from the keyring and opens the vault.
     pub fn unlock(root: &Path, custody: CustodyMode, passphrase: Option<&str>) -> Result<Self> {
+        if custody == CustodyMode::OsKeychain {
+            return unlock_with_keychain(root);
+        }
+
         let kek = match custody {
-            CustodyMode::OsKeychain => load_keychain_kek()?,
             CustodyMode::Passphrase => {
                 let pass = passphrase.ok_or_else(|| {
                     CoreError::Misuse("passphrase custody requires a passphrase".into())
                 })?;
                 derive_passphrase_kek(root, pass)?
             }
+            CustodyMode::OsKeychain => unreachable!("handled above"),
             CustodyMode::Recovery => {
                 return Err(CoreError::Misuse(
                     "use unlock_with_recovery for recovery custody".into(),
@@ -216,6 +220,19 @@ impl VaultHandle {
         let dek = sv_recovery::restore_master_key(root, phrase)?;
         let vault = if keyring::exists(root) {
             let active = keyring::active_version(root)?;
+            if should_repair_keychain_after_recovery(root) {
+                sv_keychain::ensure_available()?;
+                let kek = MasterKey::generate();
+                store_scoped_keychain_kek(root, &kek)?;
+                keyring::replace_with_single_active_dek(root, &kek, active, &dek)?;
+                let mut keys = std::collections::BTreeMap::new();
+                keys.insert(active, dek);
+                let vault = Vault::open_existing_with_keys(root, keys, active)?;
+                return Ok(Self {
+                    vault,
+                    custody: CustodyMode::OsKeychain,
+                });
+            }
             let mut keys = std::collections::BTreeMap::new();
             keys.insert(active, dek);
             Vault::open_existing_with_keys(root, keys, active)?
@@ -439,6 +456,31 @@ impl VaultHandle {
         Ok(())
     }
 
+    /// Move a passphrase-custody vault to OS keychain custody.
+    ///
+    /// This re-wraps the keyring under a fresh random KEK stored in the native
+    /// OS keychain. The passphrase salt is removed only after the new keychain
+    /// entry has been stored and verified against the re-wrapped keyring.
+    pub fn move_to_os_keychain(&mut self, root: &Path, current_passphrase: &str) -> Result<()> {
+        if self.custody != CustodyMode::Passphrase {
+            return Err(CoreError::Misuse(
+                "move_to_os_keychain is only valid for passphrase custody".into(),
+            ));
+        }
+
+        sv_keychain::ensure_available()?;
+        let old_kek = derive_passphrase_kek(root, current_passphrase)?;
+        keyring::load(root, &old_kek)?;
+
+        let new_kek = MasterKey::generate();
+        store_scoped_keychain_kek(root, &new_kek)?;
+        keyring::rewrap_under_new_kek(root, &old_kek, &new_kek)?;
+        keyring::load(root, &new_kek)?;
+        fs::remove_file(root.join(SALT_FILENAME))?;
+        self.custody = CustodyMode::OsKeychain;
+        Ok(())
+    }
+
     /// Rotate the data-encryption key.
     ///
     /// Generates a new DEK, re-seals every file forward to it, retires the old
@@ -448,7 +490,7 @@ impl VaultHandle {
     /// recovery phrase.
     pub fn rotate_key(&mut self, root: &Path, passphrase: Option<&str>) -> Result<String> {
         let kek = match self.custody {
-            CustodyMode::OsKeychain => load_keychain_kek()?,
+            CustodyMode::OsKeychain => load_verified_keychain_kek(root)?,
             CustodyMode::Passphrase => {
                 let pass = passphrase.ok_or_else(|| {
                     CoreError::Misuse("passphrase custody requires a passphrase to rotate".into())
@@ -499,10 +541,198 @@ impl VaultHandle {
     }
 }
 
-fn load_keychain_kek() -> Result<MasterKey> {
-    let b64 = sv_keychain::load_master_key()?.ok_or_else(|| {
-        CoreError::Misuse("no key in OS keychain — bootstrap the vault first".into())
-    })?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeychainKekSource {
+    Scoped,
+    Legacy,
+}
+
+struct KeychainKekCandidate {
+    kek: MasterKey,
+    source: KeychainKekSource,
+}
+
+fn unlock_with_keychain(root: &Path) -> Result<VaultHandle> {
+    if root.join(SALT_FILENAME).exists() {
+        return Err(CoreError::Misuse(
+            "this vault uses passphrase custody; unlock with passphrase or recovery instead".into(),
+        ));
+    }
+
+    if !keyring::exists(root) {
+        return unlock_legacy_with_keychain(root);
+    }
+    let (_, unwrapped) = load_keychain_unwrapped(root)?;
+    let vault = Vault::open_existing_with_keys(root, unwrapped.keys, unwrapped.active_version)?;
+    Ok(VaultHandle {
+        vault,
+        custody: CustodyMode::OsKeychain,
+    })
+}
+
+fn load_verified_keychain_kek(root: &Path) -> Result<MasterKey> {
+    let (kek, _) = load_keychain_unwrapped(root)?;
+    Ok(kek)
+}
+
+fn should_repair_keychain_after_recovery(root: &Path) -> bool {
+    if !keyring::exists(root) || root.join(SALT_FILENAME).exists() {
+        return false;
+    }
+
+    match load_keychain_unwrapped(root) {
+        Ok(_) => false,
+        Err(CoreError::Keychain(sv_keychain::KeychainError::Unavailable(_))) => false,
+        Err(_) => sv_keychain::availability().available,
+    }
+}
+
+fn load_keychain_unwrapped(root: &Path) -> Result<(MasterKey, keyring::Unwrapped)> {
+    let candidates = load_keychain_kek_candidates(root)?;
+    if candidates.is_empty() {
+        return Err(CoreError::Misuse(
+            "no key in OS keychain - bootstrap the vault first".into(),
+        ));
+    }
+
+    for candidate in candidates {
+        if let Ok(unwrapped) = keyring::load(root, &candidate.kek) {
+            if candidate.source == KeychainKekSource::Legacy {
+                store_scoped_keychain_kek(root, &candidate.kek)?;
+            }
+            return Ok((candidate.kek, unwrapped));
+        }
+    }
+
+    Err(CoreError::Misuse(
+        "OS keychain key could not unwrap this vault's keyring; use recovery unlock or restore the original OS keychain credential".into(),
+    ))
+}
+
+fn unlock_legacy_with_keychain(root: &Path) -> Result<VaultHandle> {
+    let mut candidates = load_keychain_kek_candidates(root)?;
+    if candidates.is_empty() {
+        return Err(CoreError::Misuse(
+            "no key in OS keychain - bootstrap the vault first".into(),
+        ));
+    }
+    candidates.sort_by_key(|candidate| match candidate.source {
+        KeychainKekSource::Legacy => 0,
+        KeychainKekSource::Scoped => 1,
+    });
+
+    for candidate in candidates {
+        let legacy_vault = match Vault::open_existing(root, candidate.kek.clone()) {
+            Ok(vault) => vault,
+            Err(_) => continue,
+        };
+        if validate_legacy_vault_key(&legacy_vault).is_err() {
+            continue;
+        }
+
+        keyring::migrate_legacy(root, &candidate.kek)?;
+        let unwrapped = keyring::load(root, &candidate.kek)?;
+        if candidate.source == KeychainKekSource::Legacy {
+            store_scoped_keychain_kek(root, &candidate.kek)?;
+        }
+        let vault = Vault::open_existing_with_keys(root, unwrapped.keys, unwrapped.active_version)?;
+        return Ok(VaultHandle {
+            vault,
+            custody: CustodyMode::OsKeychain,
+        });
+    }
+
+    Err(CoreError::Misuse(
+        "OS keychain key could not open this legacy vault; use recovery unlock or restore the original OS keychain credential".into(),
+    ))
+}
+
+fn validate_legacy_vault_key(vault: &Vault) -> Result<()> {
+    for container in vault.list_containers()? {
+        for file in vault.list_files(&container.name)? {
+            vault.read_file(&container.name, &file.name)?;
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn load_keychain_kek_candidates(root: &Path) -> Result<Vec<KeychainKekCandidate>> {
+    let mut candidates = Vec::new();
+    let mut decode_error: Option<CoreError> = None;
+    let scoped = load_scoped_keychain_b64(root)?;
+    if let Some(b64) = scoped.as_deref() {
+        match decode_keychain_kek(b64) {
+            Ok(kek) => candidates.push(KeychainKekCandidate {
+                kek,
+                source: KeychainKekSource::Scoped,
+            }),
+            Err(error) => decode_error = Some(error),
+        }
+    }
+
+    if let Some(b64) = sv_keychain::load_master_key()? {
+        if scoped.as_deref() != Some(b64.as_str()) {
+            match decode_keychain_kek(&b64) {
+                Ok(kek) => candidates.push(KeychainKekCandidate {
+                    kek,
+                    source: KeychainKekSource::Legacy,
+                }),
+                Err(error) => decode_error = Some(error),
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        if let Some(error) = decode_error {
+            return Err(error);
+        }
+    }
+
+    Ok(candidates)
+}
+
+fn load_scoped_keychain_b64(root: &Path) -> Result<Option<String>> {
+    sv_keychain::load_master_key_for_account(&keychain_account_for_root(root))
+        .map_err(CoreError::from)
+}
+
+fn store_scoped_keychain_kek(root: &Path, kek: &MasterKey) -> Result<()> {
+    sv_keychain::store_master_key_for_account(
+        &keychain_account_for_root(root),
+        &B64.encode(kek.as_bytes()),
+    )
+    .map_err(CoreError::from)
+}
+
+fn has_keychain_kek(root: &Path) -> Result<bool> {
+    if load_scoped_keychain_b64(root)?.is_some() {
+        return Ok(true);
+    }
+
+    let has_manifest = root.join("manifest.json").exists();
+    let has_passphrase_salt = root.join(SALT_FILENAME).exists();
+    if has_manifest && !has_passphrase_salt {
+        return Ok(sv_keychain::load_master_key()?.is_some());
+    }
+
+    Ok(false)
+}
+
+fn keychain_account_for_root(root: &Path) -> String {
+    let mut normalized = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    if cfg!(windows) {
+        normalized = normalized.to_ascii_lowercase();
+    }
+    let digest = Sha256::digest(normalized.as_bytes());
+    format!("master-key-{}", B64_URL.encode(&digest[..16]))
+}
+
+fn decode_keychain_kek(b64: &str) -> Result<MasterKey> {
     let raw = B64
         .decode(b64.as_bytes())
         .map_err(|e| CoreError::Base64(e.to_string()))?;
@@ -647,6 +877,12 @@ pub struct InitState {
     pub has_passphrase_salt: bool,
     /// True if the OS keychain has a key entry (the KEK).
     pub has_keychain_entry: bool,
+    /// Native keychain backend selected for this target.
+    pub keychain_backend: &'static str,
+    /// True if the current OS session can write, read, and delete keychain entries.
+    pub keychain_available: bool,
+    /// Human-readable keychain availability failure, when unavailable.
+    pub keychain_error: Option<String>,
     /// True if the recovery bundle exists.
     pub has_recovery_bundle: bool,
     /// True if the keyring (`keyring.svault`) is present. False for legacy
@@ -658,10 +894,21 @@ pub struct InitState {
 pub fn probe(root: &Path) -> Result<InitState> {
     let manifest = root.join("manifest.json");
     let salt = root.join(SALT_FILENAME);
+    let keychain = sv_keychain::availability();
+    let (has_keychain_entry, keychain_error) = match has_keychain_kek(root) {
+        Ok(has_entry) => (has_entry, keychain.error.clone()),
+        Err(CoreError::Keychain(sv_keychain::KeychainError::Unavailable(error))) => {
+            (false, Some(error))
+        }
+        Err(error) => return Err(error),
+    };
     Ok(InitState {
         initialized: manifest.exists(),
         has_passphrase_salt: salt.exists(),
-        has_keychain_entry: sv_keychain::load_master_key()?.is_some(),
+        has_keychain_entry,
+        keychain_backend: keychain.backend,
+        keychain_available: keychain.available,
+        keychain_error,
         has_recovery_bundle: sv_recovery::has_recovery_bundle(root),
         has_keyring: keyring::exists(root),
     })
@@ -680,4 +927,25 @@ pub fn ensure_root(root: &Path) -> Result<PathBuf> {
 /// Crate version string for logging and the `app_version` Tauri command.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keychain_account_is_scoped_by_vault_root() {
+        let base = std::env::temp_dir().join("sovereign-vault-keychain-account-test");
+        let first = base.join("first");
+        let second = base.join("second");
+
+        let first_account = keychain_account_for_root(&first);
+        let same_first_account = keychain_account_for_root(&first);
+        let second_account = keychain_account_for_root(&second);
+
+        assert_eq!(first_account, same_first_account);
+        assert_ne!(first_account, second_account);
+        assert!(first_account.starts_with("master-key-"));
+        assert!(second_account.starts_with("master-key-"));
+    }
 }

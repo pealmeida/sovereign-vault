@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use sv_core::sv_crypto::{random_bytes, MasterKey};
 use sv_core::sv_storage::{SecurityMode, Vault};
-use sv_core::{transit, CustodyMode, VaultHandle};
+use sv_core::{keyring, sv_recovery, transit, CustodyMode, VaultHandle};
 
 fn tmp_dir(label: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -44,6 +44,127 @@ fn passphrase_bootstrap_then_unlock_roundtrip() {
 
     let h = VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
     assert_eq!(h.read_file("notes", "a.txt").unwrap(), b"secret");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn bootstrap_refuses_existing_vault_disk_state() {
+    let root = tmp_dir("bootstrap-refuses-disk");
+    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    drop(boot);
+
+    let err = match VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("new-pass")) {
+        Ok(_) => panic!("bootstrap must not overwrite an initialized vault"),
+        Err(error) => error,
+    };
+    assert!(
+        err.to_string().contains("already initialised on disk"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn stale_passphrase_salt_without_vault_state_does_not_block_bootstrap() {
+    let root = tmp_dir("bootstrap-stale-salt");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("master.salt"),
+        [7u8; sv_core::sv_crypto::SALT_LEN],
+    )
+    .unwrap();
+
+    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    boot.handle
+        .create_container("notes", SecurityMode::Direct, None)
+        .unwrap();
+    boot.handle.write_file("notes", "a.txt", b"secret").unwrap();
+    drop(boot.handle);
+
+    let h = VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    assert_eq!(h.read_file("notes", "a.txt").unwrap(), b"secret");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn passphrase_probe_does_not_report_unrelated_keychain_entry() {
+    let root = tmp_dir("probe-passphrase-keychain");
+    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    drop(boot);
+
+    let probe = sv_core::probe(&root).unwrap();
+    assert!(probe.initialized);
+    assert!(probe.has_passphrase_salt);
+    assert!(!probe.has_keychain_entry);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn passphrase_vault_rejects_os_keychain_unlock_with_clear_error() {
+    let root = tmp_dir("passphrase-rejects-keychain");
+    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    drop(boot);
+
+    let err = match VaultHandle::unlock(&root, CustodyMode::OsKeychain, None) {
+        Ok(_) => panic!("passphrase vault must not unlock through OS keychain"),
+        Err(error) => error,
+    };
+    assert!(err.to_string().contains("uses passphrase custody"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fresh_vault_roundtrips_multiple_modes_and_file_extensions() {
+    let root = tmp_dir("mode-extension-matrix");
+    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("matrix-pass")).unwrap();
+    let handle = boot.handle;
+
+    let modes = [
+        ("direct", SecurityMode::Direct),
+        ("approval", SecurityMode::Approval),
+        ("otp", SecurityMode::Otp),
+        ("anonymized", SecurityMode::Anonymized),
+        ("zkp", SecurityMode::Zkp),
+        ("native", SecurityMode::Native),
+    ];
+    let files = [
+        (".env", b"API_KEY=fake-test-key\n".as_slice()),
+        ("config.json", br#"{"enabled":true,"level":3}"#.as_slice()),
+        ("notes.md", b"# Notes\nprivate local context\n".as_slice()),
+        ("plain.txt", b"hello vault".as_slice()),
+        ("table.csv", b"id,value\n1,alpha\n2,beta\n".as_slice()),
+        ("blob.bin", &[0, 1, 2, 3, 250, 251, 252, 253][..]),
+        (
+            "private.pem",
+            b"-----BEGIN TEST KEY-----\nfake\n-----END TEST KEY-----\n".as_slice(),
+        ),
+    ];
+
+    for (container, mode) in modes {
+        handle
+            .create_container(container, mode, Some(format!("{mode:?} mode")))
+            .unwrap();
+        assert_eq!(handle.container_mode(container).unwrap(), mode);
+
+        for (file_name, plaintext) in files {
+            handle.write_file(container, file_name, plaintext).unwrap();
+            assert_eq!(handle.read_file(container, file_name).unwrap(), plaintext);
+        }
+    }
+    drop(handle);
+
+    let unlocked =
+        VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("matrix-pass")).unwrap();
+    for (container, mode) in modes {
+        assert_eq!(unlocked.container_mode(container).unwrap(), mode);
+        let listed = unlocked.list_files(container).unwrap();
+        assert_eq!(listed.len(), files.len());
+
+        for (file_name, plaintext) in files {
+            assert_eq!(unlocked.read_file(container, file_name).unwrap(), plaintext);
+        }
+    }
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -224,6 +345,31 @@ fn recovery_unlock_after_bootstrap() {
     drop(boot.handle);
 
     let h = VaultHandle::unlock_with_recovery(&root, &phrase).unwrap();
+    assert_eq!(h.custody(), CustodyMode::Recovery);
     assert_eq!(h.read_file("c", "f.txt").unwrap(), b"recover-me");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn keyring_can_be_repaired_from_recovered_active_dek() {
+    let root = tmp_dir("repair-keyring");
+    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("pw")).unwrap();
+    let phrase = boot.recovery_phrase.clone();
+    boot.handle
+        .create_container("c", SecurityMode::Direct, None)
+        .unwrap();
+    boot.handle.write_file("c", "f.txt", b"recover-me").unwrap();
+    drop(boot.handle);
+
+    let active = keyring::active_version(&root).unwrap();
+    let recovered_dek = sv_recovery::restore_master_key(&root, &phrase).unwrap();
+    let repaired_kek = MasterKey::generate();
+    keyring::replace_with_single_active_dek(&root, &repaired_kek, active, &recovered_dek).unwrap();
+
+    assert!(VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("pw")).is_err());
+    let unwrapped = keyring::load(&root, &repaired_kek).unwrap();
+    let vault =
+        Vault::open_existing_with_keys(&root, unwrapped.keys, unwrapped.active_version).unwrap();
+    assert_eq!(vault.read_file("c", "f.txt").unwrap(), b"recover-me");
     let _ = std::fs::remove_dir_all(&root);
 }
