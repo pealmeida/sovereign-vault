@@ -79,18 +79,25 @@ pre {
 
 .app-shell {
   display: grid;
+  height: 100vh;
   min-height: 100vh;
   grid-template-columns: 280px minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .sidebar {
+  position: sticky;
+  top: 0;
   display: flex;
+  height: 100vh;
+  min-height: 0;
   flex-direction: column;
   gap: 1.25rem;
   padding: 1.5rem;
   border-right: 1px solid var(--border);
   background: rgba(7, 13, 24, 0.9);
   backdrop-filter: blur(18px);
+  overflow: auto;
 }
 
 .brand-panel,
@@ -277,10 +284,13 @@ pre {
 
 .main-shell {
   display: flex;
+  height: 100vh;
+  min-height: 0;
   min-width: 0;
   flex-direction: column;
   gap: 1.25rem;
   padding: 1.5rem;
+  overflow: auto;
 }
 
 .topbar {
@@ -840,13 +850,16 @@ pre {
 
 @media (max-width: 879px) {
   .app-shell {
+    height: auto;
     grid-template-columns: 1fr;
+    overflow: visible;
   }
 
   .sidebar {
     position: sticky;
     top: 0;
     z-index: 20;
+    height: auto;
     flex-direction: row;
     align-items: center;
     overflow: auto;
@@ -868,6 +881,11 @@ pre {
 
   .topbar-actions {
     justify-content: flex-start;
+  }
+
+  .main-shell {
+    height: auto;
+    overflow: visible;
   }
 }
 

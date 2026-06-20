@@ -55,6 +55,7 @@ coverage/
 
 # Local agent / editor config (per-developer, never commit)
 .claude/settings.local.json
+CLAUDE.md
 
 # Python
 __pycache__/

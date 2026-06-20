@@ -11,21 +11,48 @@
   let recoveryInput = $state('');
 
   let isInit = $derived(!vaultStore.status?.initialized);
+  let keychainAvailable = $derived(vaultStore.status?.keychain_available ?? true);
+  let passphraseVault = $derived(!isInit && !!vaultStore.status?.has_passphrase_salt);
+  let availableTabs = $derived(
+    ([
+      ['passphrase', 'Passphrase'],
+      ['keychain', 'OS Keychain'],
+      ['recovery', 'Recovery'],
+    ] as const)
+      .filter(([id]) => {
+        if (isInit) return true;
+        if (id === 'passphrase') return vaultStore.status?.has_passphrase_salt;
+        if (id === 'keychain') return keychainAvailable;
+        return vaultStore.status?.has_recovery_bundle;
+      })
+      .filter(([id]) => id !== 'keychain' || keychainAvailable)
+  );
+
+  $effect(() => {
+    if (!availableTabs.some(([id]) => id === tab)) {
+      tab = availableTabs[0]?.[0] ?? 'passphrase';
+    }
+  });
 
   async function submit() {
     try {
+      const wasInit = isInit;
+      let repairedKeychain = false;
       const custody: Custody =
         tab === 'keychain' ? 'OsKeychain'
         : tab === 'recovery' ? 'Recovery'
         : 'Passphrase';
 
       const phrase = tab === 'recovery' ? recoveryInput.trim() : null;
-      const pass = tab === 'passphrase' ? passphrase : null;
+      const pass = tab === 'passphrase' || (tab === 'keychain' && passphraseVault)
+        ? passphrase
+        : null;
 
-      if (isInit) {
+      if (wasInit) {
         await vaultStore.init(custody, pass);
       } else if (tab === 'recovery') {
         await vaultStore.unlockRecovery(phrase!);
+        repairedKeychain = vaultStore.status?.custody === 'OsKeychain';
       } else {
         await vaultStore.unlock(custody, pass);
       }
@@ -33,7 +60,11 @@
       if (vaultStore.status?.unlocked) {
         await containerStore.refresh();
         await mcpStore.refresh();
-        toastStore.setNotice(isInit ? 'Vault initialised and unlocked.' : 'Vault unlocked.');
+        toastStore.setNotice(
+          wasInit ? 'Vault initialised and unlocked.'
+          : repairedKeychain ? 'Vault recovered and OS Keychain repaired.'
+          : 'Vault unlocked.'
+        );
       }
     } catch (e) {
       toastStore.setError(e);
@@ -52,21 +83,21 @@
     </div>
 
     <div class="tab-row" style="display:flex;gap:0.5rem;margin-bottom:1rem">
-      {#each [['passphrase','Passphrase'], ['keychain','OS Keychain'], ['recovery','Recovery']] as [id, label]}
+      {#each availableTabs as [id, label]}
         <button
           class="filter-chip"
           class:active={tab === id}
-          onclick={() => tab = id as typeof tab}
+          onclick={() => tab = id}
         >{label}</button>
       {/each}
     </div>
 
-    {#if tab === 'passphrase'}
+    {#if tab === 'passphrase' || (tab === 'keychain' && passphraseVault)}
       <label class="field">
-        <span>Passphrase</span>
+        <span>{tab === 'keychain' ? 'Current passphrase' : 'Passphrase'}</span>
         <input
           type="password"
-          placeholder="Enter passphrase…"
+          placeholder="Enter passphrase..."
           bind:value={passphrase}
         />
       </label>
@@ -77,15 +108,30 @@
         <span>Recovery phrase (24 words)</span>
         <textarea
           rows={3}
-          placeholder="word1 word2 word3…"
+          placeholder="word1 word2 word3..."
           bind:value={recoveryInput}
         ></textarea>
       </label>
+      {#if !isInit && vaultStore.status?.has_keyring && !vaultStore.status?.has_passphrase_salt}
+        <p style="color:var(--muted);font-size:0.85rem">
+          Recovery unlock can repair a broken OS Keychain wrapper for this vault.
+        </p>
+      {/if}
     {/if}
 
     {#if tab === 'keychain'}
       <p style="color:var(--muted);font-size:0.85rem">
-        OS Keychain will be used — no passphrase entry needed.
+        {#if passphraseVault}
+          Enter the current passphrase once to move this vault to {vaultStore.status?.keychain_backend ?? 'OS Keychain'}.
+        {:else}
+          {vaultStore.status?.keychain_backend ?? 'OS Keychain'} will be used; no passphrase entry needed.
+        {/if}
+      </p>
+    {/if}
+
+    {#if !keychainAvailable && vaultStore.status?.keychain_error}
+      <p style="color:var(--danger);font-size:0.85rem">
+        OS Keychain unavailable: {vaultStore.status.keychain_error}
       </p>
     {/if}
 
