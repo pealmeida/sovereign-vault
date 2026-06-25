@@ -65,6 +65,23 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo build --workspace --release
 
+  gateway-validation:
+    # End-to-end production-readiness check: drives the REAL MCP gateway
+    # (sv_mcp::McpServer over a loopback WebSocket, backed by a real VaultHandle)
+    # as an AI agent through every tool and security scenario. The binary exits
+    # non-zero on any behavioural regression (scope bypass, secret leak, missing
+    # consent gate, etc.). Has no Tauri/GUI deps, so it runs without apt setup.
+    name: Gateway validation (live MCP)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: Run live gateway validation
+        run: cargo run -p sv-validate --release
+
   msrv:
     # Real MSRV is 1.88, set by transitive deps (time, darling, serde_with,
     # plist, …). base64ct also needs the edition2024 feature (Rust >= 1.85).
