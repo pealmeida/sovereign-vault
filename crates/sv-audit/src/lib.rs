@@ -94,14 +94,26 @@ pub enum AuditAction {
     CreateContainer,
     /// Delete a container.
     DeleteContainer,
+    /// Create a transit key.
+    CreateTransitKey,
+    /// List transit keys.
+    ListTransitKeys,
     /// Encrypt with a transit key.
     Encrypt,
     /// Decrypt with a transit key.
     Decrypt,
+    /// Create a signing key.
+    CreateSigningKey,
+    /// List signing keys.
+    ListSigningKeys,
     /// Sign with a signing key.
     Sign,
     /// Verify a signature.
     Verify,
+    /// Create a brokered secret.
+    CreateBrokerSecret,
+    /// List brokered secrets.
+    ListBrokerSecrets,
     /// Broker an outbound request with a stored secret.
     Broker,
 }

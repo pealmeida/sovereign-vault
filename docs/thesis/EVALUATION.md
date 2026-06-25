@@ -17,6 +17,16 @@ Outputs: `latency.csv`, `latency.md`, `adversarial.csv`, `adversarial.md`. The
 numbers below were captured in a **release** build (`--release`, 1000 reads per
 cell) on the development host — rerun on your own machine and report its specs.
 
+For a live-project feature-status run with fake AI-provider keys, use:
+
+```bash
+node examples/mock-ai-project/scripts/validate-sovereign-vault.mjs
+```
+
+That fixture writes `target/mock-ai-project/<run-id>/feature-status.{json,md}`.
+Use it as operational evidence alongside this controlled evaluation harness;
+do not replace the release-mode `thesis-eval` measurements with it.
+
 ---
 
 ## 1. Latency decomposition (§3.9.1, Equation 1)

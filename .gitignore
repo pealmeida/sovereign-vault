@@ -57,6 +57,9 @@ coverage/
 .claude/settings.local.json
 CLAUDE.md
 
+# Generated agent command packs (produced by `sovereign-vault agents install`)
+.codex/
+
 # Python
 __pycache__/
 *.pyc

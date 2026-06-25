@@ -1,0 +1,86 @@
+name: sovereign-vault
+summary: >
+  Thin command facade over Sovereign Vault's MCP tools. Parse the remainder of
+  the user input after `/sovereign-vault`, map it to the matching MCP tool, and
+  keep secret values out of the conversation unless the user explicitly asks to
+  reveal them.
+prerequisites:
+  - The local Sovereign Vault desktop app must be running and unlocked.
+  - The MCP client must be configured to launch `sovereign-vault mcp-stdio`.
+  - Use the MCP server name `sovereign-vault` when the client requires an explicit server selection.
+environment:
+  - name: SV_PAIRING_TOKEN
+    description: Optional override for shared-secret pairing. When used without `SV_AGENT_ID`, it pairs as the Default agent.
+  - name: SV_AGENT_ID
+    description: Optional per-agent identity. Requires `SV_PAIRING_TOKEN`; when both are present the proxy sends `vault.pair { agent_id, token }`.
+behaviors:
+  - Validate the command shape before calling any tool. If the input is ambiguous, ask one concise follow-up question.
+  - Prefer `vault.create_broker_secret`, `vault.create_transit_key`, and `vault.create_signing_key` when the task is to use a secret without exposing it later.
+  - For `save file`, read the local file bytes first, then send those bytes through `vault.write` as `content_b64`.
+  - For OTP-mode containers, resend the same tool call with `otp` when the desktop app shows a one-time code.
+  - Do not print stored secret values back to the user unless they explicitly request a reveal.
+commands:
+  - syntax: /sovereign-vault list vaults
+    purpose: List containers in the vault.
+    tool: vault.list
+    mapping: Call `vault.list` with no arguments.
+  - syntax: /sovereign-vault list files <vault> [--otp <code>]
+    purpose: List files in one vault container.
+    tool: vault.list
+    mapping: >
+      Call `vault.list` with `{ "container": "<vault>" }` and include `otp` only when provided.
+  - syntax: /sovereign-vault save key <name> <value> [--vault <vault>] [--file-name <file>] [--otp <code>]
+    purpose: Store one secret value as an encrypted file when the user wants plain retrieval semantics.
+    tool: vault.write
+    mapping: Base64-encode `<value>` and call `vault.write` with container `<vault>` or default `secrets-api`, plus `file_name` from `--file-name` or `<name>.secret`.
+    notes:
+      - Prefer this command for simple key/value storage that is meant to be read back later.
+      - If the user instead wants outbound-use-only semantics, steer them to `create broker-secret`.
+  - syntax: /sovereign-vault save file <vault> <path> [--as <file_name>] [--otp <code>]
+    purpose: Import a local file into the vault.
+    tool: vault.write
+    mapping: Read `<path>` as bytes, base64-encode them, and call `vault.write` with container `<vault>` and `file_name` from `--as` or the path basename.
+  - syntax: /sovereign-vault create vault <name> [--mode <mode>] [--description <text>] [--otp <code>]
+    purpose: Create a new vault container.
+    tool: vault.create_container
+    mapping: Call `vault.create_container` with `name`, optional `mode`, optional `description`, and `otp` when present.
+  - syntax: /sovereign-vault create transit-key <name>
+    purpose: Create a symmetric transit key that never leaves the vault.
+    tool: vault.create_transit_key
+    mapping: >
+      Call `vault.create_transit_key` with `{ "name": "<name>" }`.
+  - syntax: /sovereign-vault list transit-keys
+    purpose: List transit-key metadata.
+    tool: vault.list_transit_keys
+    mapping: Call `vault.list_transit_keys` with no arguments.
+  - syntax: /sovereign-vault create signing-key <name>
+    purpose: Create a signing key that keeps the private key inside the vault.
+    tool: vault.create_signing_key
+    mapping: >
+      Call `vault.create_signing_key` with `{ "name": "<name>" }`.
+  - syntax: /sovereign-vault list signing-keys
+    purpose: List signing-key metadata and public keys.
+    tool: vault.list_signing_keys
+    mapping: Call `vault.list_signing_keys` with no arguments.
+  - syntax: /sovereign-vault create broker-secret <name> <value> --host <host> --path <prefix> --method <METHOD> [--method <METHOD> ...] [--header <header_name>]
+    purpose: Create a brokered secret plus its destination allowlist so the secret can be injected without being returned to the agent.
+    tool: vault.create_broker_secret
+    mapping: >
+      Build `allow` from the repeated `--method` values, `--host`, and `--path`. Use default injection
+      `{ "type": "bearer_auth" }` unless `--header` is present, in which case set
+      `{ "type": "header", "name": "<header_name>" }`.
+    notes:
+      - Use this for API keys that should only be used through `vault.broker_request`.
+  - syntax: /sovereign-vault list broker-secrets
+    purpose: List broker-secret metadata without revealing secret values.
+    tool: vault.list_broker_secrets
+    mapping: Call `vault.list_broker_secrets` with no arguments.
+suggestions:
+  - /sovereign-vault status
+  - /sovereign-vault search <query>
+  - /sovereign-vault read file <vault> <file_name>
+  - /sovereign-vault delete file <vault> <file_name>
+  - /sovereign-vault move file <from_vault>/<file> <to_vault>/<file>
+  - /sovereign-vault rename file <vault> <old> <new>
+  - /sovereign-vault export file <vault> <file> --to <path>
+  - /sovereign-vault broker request <secret_ref> <method> <url>

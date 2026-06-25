@@ -90,6 +90,65 @@ pub struct BrokerOutcome {
     pub method: String,
 }
 
+/// Agent-safe metadata for a transit key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransitKeyInfo {
+    /// Key name.
+    pub name: String,
+    /// Active version.
+    pub version: u32,
+}
+
+/// Agent-safe metadata for a signing key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SigningKeyInfo {
+    /// Key name.
+    pub name: String,
+    /// Active version.
+    pub version: u32,
+    /// Exportable base64 public key.
+    pub public_key_b64: String,
+}
+
+/// One destination allowlist entry for a brokered secret.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrokerAllow {
+    /// Exact lowercase host the request may target.
+    pub host: String,
+    /// Path prefix the request path must start with.
+    pub path_prefix: String,
+    /// Uppercase HTTP methods permitted.
+    pub methods: Vec<String>,
+    /// Allow otherwise-refused private or loopback targets.
+    #[serde(default)]
+    pub allow_private_ip: bool,
+}
+
+/// How a brokered secret is injected into one outbound request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BrokerInjection {
+    /// `Authorization: Bearer <secret>`.
+    #[default]
+    BearerAuth,
+    /// Put the raw secret into one custom header.
+    Header {
+        /// Header name to set.
+        name: String,
+    },
+}
+
+/// Agent-safe metadata for a brokered secret.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrokerSecretInfo {
+    /// Secret name used as `secret_ref`.
+    pub name: String,
+    /// Destination allowlist.
+    pub allow: Vec<BrokerAllow>,
+    /// Injection strategy.
+    pub injection: BrokerInjection,
+}
+
 /// Abstracts over the underlying vault so this crate doesn't depend on
 /// `sv-core` (which would form a dependency cycle). `sv-core` implements
 /// this trait for `VaultHandle`.
@@ -119,6 +178,10 @@ pub trait VaultFacade: Send + Sync {
     ) -> std::result::Result<(), String>;
     /// Effective mode for a container.
     fn container_mode(&self, container: &str) -> std::result::Result<SecurityMode, String>;
+    /// Create a new symmetric transit key.
+    fn transit_create_key(&self, name: &str) -> std::result::Result<TransitKeyInfo, String>;
+    /// List symmetric transit keys.
+    fn transit_list(&self) -> std::result::Result<Vec<TransitKeyInfo>, String>;
 
     /// Encrypt `plaintext` under a transit `key_ref`, returning base64 ciphertext.
     fn transit_encrypt(
@@ -136,6 +199,20 @@ pub trait VaultFacade: Send + Sync {
     fn sign(&self, key_ref: &str, payload: &[u8]) -> std::result::Result<String, String>;
     /// Exportable base64 public key for a signing `key_ref`.
     fn signing_public_key(&self, key_ref: &str) -> std::result::Result<String, String>;
+    /// Create a new signing key.
+    fn signing_create_key(&self, name: &str) -> std::result::Result<SigningKeyInfo, String>;
+    /// List signing keys.
+    fn signing_list(&self) -> std::result::Result<Vec<SigningKeyInfo>, String>;
+    /// Create a brokered secret.
+    fn broker_create(
+        &self,
+        name: &str,
+        secret: &str,
+        allow: Vec<BrokerAllow>,
+        injection: BrokerInjection,
+    ) -> std::result::Result<BrokerSecretInfo, String>;
+    /// List brokered secrets.
+    fn broker_list(&self) -> std::result::Result<Vec<BrokerSecretInfo>, String>;
     /// Whether brokering is enabled (default-off feature flag).
     fn broker_enabled(&self) -> bool;
     /// Broker an outbound request injecting the secret named `secret_ref`. The
@@ -188,14 +265,26 @@ pub enum AccessAction {
     DeleteFile,
     /// Create a container.
     CreateContainer,
+    /// Create a symmetric transit key.
+    CreateTransitKey,
+    /// List symmetric transit keys.
+    ListTransitKeys,
     /// Encrypt with a transit key.
     Encrypt,
     /// Decrypt with a transit key.
     Decrypt,
+    /// Create a signing key.
+    CreateSigningKey,
+    /// List signing keys.
+    ListSigningKeys,
     /// Sign a payload with a signing key.
     Sign,
     /// Verify a signature (needs only the public key).
     Verify,
+    /// Create a brokered secret.
+    CreateBrokerSecret,
+    /// List brokered secrets.
+    ListBrokerSecrets,
     /// Broker an outbound request injecting a stored secret.
     Broker,
 }
@@ -209,10 +298,16 @@ impl AccessAction {
             Self::WriteFile => AuditAction::WriteFile,
             Self::DeleteFile => AuditAction::DeleteFile,
             Self::CreateContainer => AuditAction::CreateContainer,
+            Self::CreateTransitKey => AuditAction::CreateTransitKey,
+            Self::ListTransitKeys => AuditAction::ListTransitKeys,
             Self::Encrypt => AuditAction::Encrypt,
             Self::Decrypt => AuditAction::Decrypt,
+            Self::CreateSigningKey => AuditAction::CreateSigningKey,
+            Self::ListSigningKeys => AuditAction::ListSigningKeys,
             Self::Sign => AuditAction::Sign,
             Self::Verify => AuditAction::Verify,
+            Self::CreateBrokerSecret => AuditAction::CreateBrokerSecret,
+            Self::ListBrokerSecrets => AuditAction::ListBrokerSecrets,
             Self::Broker => AuditAction::Broker,
         }
     }
@@ -1008,6 +1103,13 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .map(|s| s.to_string()),
                 })
             }
+            "vault.create_transit_key" => {
+                let _ = required_str(args, "name")?;
+                Ok(simple_request(transport, AccessAction::CreateTransitKey))
+            }
+            "vault.list_transit_keys" => {
+                Ok(simple_request(transport, AccessAction::ListTransitKeys))
+            }
             "vault.encrypt" => {
                 let _ = required_str(args, "key_ref")?;
                 let _ = required_str(args, "plaintext_b64")?;
@@ -1023,11 +1125,28 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 let _ = required_str(args, "payload_b64")?;
                 Ok(simple_request(transport, AccessAction::Sign))
             }
+            "vault.create_signing_key" => {
+                let _ = required_str(args, "name")?;
+                Ok(simple_request(transport, AccessAction::CreateSigningKey))
+            }
+            "vault.list_signing_keys" => {
+                Ok(simple_request(transport, AccessAction::ListSigningKeys))
+            }
             "vault.verify" => {
                 let _ = required_str(args, "public_key_b64")?;
                 let _ = required_str(args, "payload_b64")?;
                 let _ = required_str(args, "signature_b64")?;
                 Ok(simple_request(transport, AccessAction::Verify))
+            }
+            "vault.create_broker_secret" => {
+                let _ = required_str(args, "name")?;
+                let _ = required_str(args, "secret")?;
+                let _ = required_broker_allow(args)?;
+                let _ = parse_broker_injection(args)?;
+                Ok(simple_request(transport, AccessAction::CreateBrokerSecret))
+            }
+            "vault.list_broker_secrets" => {
+                Ok(simple_request(transport, AccessAction::ListBrokerSecrets))
             }
             "vault.broker_request" => {
                 let _ = required_str(args, "secret_ref")?;
@@ -1094,6 +1213,15 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 handle.create_container(name, mode, description)?;
                 Ok(json!({ "ok": true, "name": name, "mode": mode }))
             }
+            "vault.create_transit_key" => {
+                let name = required_str(args, "name")?;
+                let info = handle.transit_create_key(name)?;
+                Ok(serde_json::to_value(info).map_err(|e| e.to_string())?)
+            }
+            "vault.list_transit_keys" => {
+                let info = handle.transit_list()?;
+                Ok(serde_json::to_value(info).map_err(|e| e.to_string())?)
+            }
             "vault.encrypt" => {
                 let key_ref = required_str(args, "key_ref")?;
                 let plaintext = B64
@@ -1121,6 +1249,15 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     "public_key_b64": public_key_b64,
                 }))
             }
+            "vault.create_signing_key" => {
+                let name = required_str(args, "name")?;
+                let info = handle.signing_create_key(name)?;
+                Ok(serde_json::to_value(info).map_err(|e| e.to_string())?)
+            }
+            "vault.list_signing_keys" => {
+                let info = handle.signing_list()?;
+                Ok(serde_json::to_value(info).map_err(|e| e.to_string())?)
+            }
             "vault.verify" => {
                 let public_key_b64 = required_str(args, "public_key_b64")?;
                 let payload = B64
@@ -1135,6 +1272,30 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 let valid = sv_crypto::ed25519_verify(&public, &payload, &signature)
                     .map_err(|e| e.to_string())?;
                 Ok(json!({ "valid": valid }))
+            }
+            "vault.create_broker_secret" => {
+                if !handle.broker_enabled() {
+                    return Err(
+                        "broker disabled: set SV_ENABLE_BROKER to enable broker secret management"
+                            .into(),
+                    );
+                }
+                let name = required_str(args, "name")?;
+                let secret = required_str(args, "secret")?;
+                let allow = required_broker_allow(args)?;
+                let injection = parse_broker_injection(args)?;
+                let info = handle.broker_create(name, secret, allow, injection)?;
+                Ok(serde_json::to_value(info).map_err(|e| e.to_string())?)
+            }
+            "vault.list_broker_secrets" => {
+                if !handle.broker_enabled() {
+                    return Err(
+                        "broker disabled: set SV_ENABLE_BROKER to enable broker secret management"
+                            .into(),
+                    );
+                }
+                let info = handle.broker_list()?;
+                Ok(serde_json::to_value(info).map_err(|e| e.to_string())?)
             }
             other => Err(format!("unknown tool: {other}")),
         }
@@ -1178,10 +1339,44 @@ fn enforce_scopes(
     if agent.scopes.is_empty() {
         return Ok(());
     }
-    // Requests without a container (e.g. list all containers) are always
-    // allowed for scoped agents; per-container reads/writes are gated below.
     let Some(container) = request.container.as_deref() else {
-        return Ok(());
+        match request.action {
+            AccessAction::ListContainers => {
+                return Err(format!(
+                    "agent {} may not enumerate all containers",
+                    agent.agent_id
+                ));
+            }
+            AccessAction::Verify => return Ok(()),
+            AccessAction::CreateTransitKey
+            | AccessAction::ListTransitKeys
+            | AccessAction::Encrypt
+            | AccessAction::Decrypt
+            | AccessAction::CreateSigningKey
+            | AccessAction::ListSigningKeys
+            | AccessAction::Sign
+            | AccessAction::CreateBrokerSecret
+            | AccessAction::ListBrokerSecrets
+            | AccessAction::Broker => {
+                if agent
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.actions.contains(&request.action))
+                {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "agent {} is not scoped for {:?}",
+                    agent.agent_id, request.action
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "agent {} is not scoped for {:?}",
+                    agent.agent_id, request.action
+                ));
+            }
+        }
     };
     for scope in &agent.scopes {
         if !glob_match(&scope.container_glob, container) {
@@ -1280,6 +1475,25 @@ fn required_str<'a>(value: &'a Value, key: &str) -> std::result::Result<&'a str,
         .ok_or_else(|| format!("missing required string field: {key}"))
 }
 
+fn required_broker_allow(value: &Value) -> std::result::Result<Vec<BrokerAllow>, String> {
+    serde_json::from_value(
+        value
+            .get("allow")
+            .cloned()
+            .ok_or_else(|| "missing required array field: allow".to_string())?,
+    )
+    .map_err(|e| format!("invalid allow list: {e}"))
+}
+
+fn parse_broker_injection(value: &Value) -> std::result::Result<BrokerInjection, String> {
+    match value.get("injection") {
+        Some(raw) => {
+            serde_json::from_value(raw.clone()).map_err(|e| format!("invalid injection: {e}"))
+        }
+        None => Ok(BrokerInjection::default()),
+    }
+}
+
 #[derive(Debug)]
 enum PairState {
     Unpaired,
@@ -1353,6 +1567,8 @@ fn tool_descriptors(broker_enabled: bool) -> Value {
     let mut tools = base_tool_descriptors();
     if let Value::Array(items) = &mut tools {
         if broker_enabled {
+            items.push(broker_secret_create_descriptor());
+            items.push(broker_secret_list_descriptor());
             items.push(broker_tool_descriptor());
         }
     }
@@ -1376,6 +1592,63 @@ fn broker_tool_descriptor() -> Value {
                 "headers":    { "type": "object", "description": "Optional extra request headers (auth headers are ignored)." },
                 "body":       { "type": "string", "description": "Optional request body." }
             },
+            "additionalProperties": false
+        }
+    })
+}
+
+fn broker_secret_create_descriptor() -> Value {
+    json!({
+        "name": "vault.create_broker_secret",
+        "description":
+            "Create a brokered secret plus its destination allowlist. The secret value is stored \
+             wrapped in the vault and is never returned to the caller.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["name", "secret", "allow"],
+            "properties": {
+                "name":   { "type": "string", "description": "Brokered secret name, used later as `secret_ref`." },
+                "secret": { "type": "string", "description": "The cleartext secret value to wrap and store." },
+                "allow": {
+                    "type": "array",
+                    "description": "Destination allowlist entries for the brokered secret.",
+                    "items": {
+                        "type": "object",
+                        "required": ["host", "path_prefix", "methods"],
+                        "properties": {
+                            "host": { "type": "string" },
+                            "path_prefix": { "type": "string" },
+                            "methods": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "allow_private_ip": { "type": "boolean", "default": false }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                "injection": {
+                    "type": "object",
+                    "description": "Optional injection strategy. Omit for bearer auth.",
+                    "properties": {
+                        "type": { "type": "string", "enum": ["bearer_auth", "header"] },
+                        "name": { "type": "string", "description": "Required when `type` is `header`." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
+fn broker_secret_list_descriptor() -> Value {
+    json!({
+        "name": "vault.list_broker_secrets",
+        "description": "List brokered-secret metadata and allowlists without returning secret values.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
             "additionalProperties": false
         }
     })
@@ -1460,6 +1733,27 @@ fn base_tool_descriptors() -> Value {
             }
         },
         {
+            "name": "vault.create_transit_key",
+            "description": "Create a symmetric transit key held by the vault.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": { "type": "string", "description": "Transit key name." }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "vault.list_transit_keys",
+            "description": "List transit-key metadata without revealing key bytes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "vault.encrypt",
             "description":
                 "Encrypt plaintext under a named transit key held by the vault. The key never \
@@ -1485,6 +1779,27 @@ fn base_tool_descriptors() -> Value {
                     "key_ref":        { "type": "string" },
                     "ciphertext_b64": { "type": "string" }
                 },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "vault.create_signing_key",
+            "description": "Create an Ed25519 signing key held by the vault.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": { "type": "string", "description": "Signing key name." }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "vault.list_signing_keys",
+            "description": "List signing-key metadata including exportable public keys.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
                 "additionalProperties": false
             }
         },
@@ -1546,6 +1861,7 @@ mod tests {
         files: std::sync::Mutex<std::collections::HashMap<(String, String), Vec<u8>>>,
         transit_keys: std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>,
         signing_keys: std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>,
+        broker_secrets: std::sync::Mutex<std::collections::HashMap<String, BrokerSecretInfo>>,
         broker_enabled: bool,
     }
 
@@ -1569,6 +1885,31 @@ mod tests {
 
     #[async_trait]
     impl VaultFacade for StubVault {
+        fn transit_create_key(&self, name: &str) -> std::result::Result<TransitKeyInfo, String> {
+            self.transit_keys
+                .lock()
+                .unwrap()
+                .entry(name.to_string())
+                .or_insert([7u8; 32]);
+            Ok(TransitKeyInfo {
+                name: name.to_string(),
+                version: 1,
+            })
+        }
+
+        fn transit_list(&self) -> std::result::Result<Vec<TransitKeyInfo>, String> {
+            let mut items: Vec<_> = self
+                .transit_keys
+                .lock()
+                .unwrap()
+                .keys()
+                .cloned()
+                .map(|name| TransitKeyInfo { name, version: 1 })
+                .collect();
+            items.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(items)
+        }
+
         fn transit_encrypt(
             &self,
             key_ref: &str,
@@ -1599,6 +1940,57 @@ mod tests {
             let seed = self.signing_seed(key_ref)?;
             let public = sv_crypto::ed25519_public(&seed).map_err(|e| e.to_string())?;
             Ok(B64.encode(public))
+        }
+        fn signing_create_key(&self, name: &str) -> std::result::Result<SigningKeyInfo, String> {
+            let _ = self.signing_seed(name)?;
+            let public = self.signing_public_key(name)?;
+            Ok(SigningKeyInfo {
+                name: name.to_string(),
+                version: 1,
+                public_key_b64: public,
+            })
+        }
+        fn signing_list(&self) -> std::result::Result<Vec<SigningKeyInfo>, String> {
+            let keys: Vec<String> = self.signing_keys.lock().unwrap().keys().cloned().collect();
+            let mut items = Vec::with_capacity(keys.len());
+            for name in keys {
+                items.push(SigningKeyInfo {
+                    public_key_b64: self.signing_public_key(&name)?,
+                    name,
+                    version: 1,
+                });
+            }
+            items.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(items)
+        }
+        fn broker_create(
+            &self,
+            name: &str,
+            _secret: &str,
+            allow: Vec<BrokerAllow>,
+            injection: BrokerInjection,
+        ) -> std::result::Result<BrokerSecretInfo, String> {
+            let info = BrokerSecretInfo {
+                name: name.to_string(),
+                allow,
+                injection,
+            };
+            self.broker_secrets
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), info.clone());
+            Ok(info)
+        }
+        fn broker_list(&self) -> std::result::Result<Vec<BrokerSecretInfo>, String> {
+            let mut items: Vec<_> = self
+                .broker_secrets
+                .lock()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect();
+            items.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(items)
         }
         fn broker_enabled(&self) -> bool {
             self.broker_enabled
@@ -1722,6 +2114,7 @@ mod tests {
             files: Default::default(),
             transit_keys: Default::default(),
             signing_keys: Default::default(),
+            broker_secrets: Default::default(),
             broker_enabled,
         }
     }
@@ -1759,11 +2152,13 @@ mod tests {
             .await
             .unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
-        // 5 file tools + encrypt/decrypt/sign/verify, broker omitted.
-        assert_eq!(tools.len(), 9);
+        // 5 file tools + transit create/list/encrypt/decrypt + signing create/list/sign/verify.
+        assert_eq!(tools.len(), 13);
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"vault.encrypt"));
         assert!(names.contains(&"vault.sign"));
+        assert!(names.contains(&"vault.create_transit_key"));
+        assert!(names.contains(&"vault.list_signing_keys"));
         assert!(!names.contains(&"vault.broker_request"));
     }
 
@@ -1780,9 +2175,11 @@ mod tests {
             .await
             .unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 16);
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"vault.broker_request"));
+        assert!(names.contains(&"vault.create_broker_secret"));
+        assert!(names.contains(&"vault.list_broker_secrets"));
     }
 
     #[tokio::test]
@@ -1815,6 +2212,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transit_key_create_then_list_roundtrip() {
+        let server = server();
+        let mut pair = PairState::AlreadyPaired(None);
+        let create = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vault.create_transit_key","arguments":{"name":"demo"}}}"#;
+        let resp = server
+            .dispatch(create, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let inner: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["name"], "demo");
+
+        let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"vault.list_transit_keys","arguments":{}}}"#;
+        let resp = server
+            .dispatch(list, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let inner: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(inner
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "demo"));
+    }
+
+    #[tokio::test]
     async fn sign_then_verify_true() {
         let server = server();
         let mut pair = PairState::AlreadyPaired(None);
@@ -1840,6 +2264,36 @@ mod tests {
         let inner: Value =
             serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(inner["valid"], true);
+    }
+
+    #[tokio::test]
+    async fn broker_secret_create_then_list_roundtrip() {
+        let server = McpServer::new(Arc::new(Mutex::new(Some(make_vault(true)))), "test-secret");
+        let mut pair = PairState::AlreadyPaired(None);
+        let create = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vault.create_broker_secret","arguments":{"name":"stripe","secret":"sk_live","allow":[{"host":"api.example.com","path_prefix":"/v1","methods":["GET"]}],"injection":{"type":"bearer_auth"}}}}"#;
+        let resp = server
+            .dispatch(create, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let inner: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["name"], "stripe");
+        assert!(resp.to_string().contains("stripe"));
+        assert!(!resp.to_string().contains("sk_live"));
+
+        let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"vault.list_broker_secrets","arguments":{}}}"#;
+        let resp = server
+            .dispatch(list, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let inner: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(inner
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "stripe"));
+        assert!(!resp.to_string().contains("sk_live"));
     }
 
     #[tokio::test]
@@ -2132,6 +2586,114 @@ mod tests {
         );
         let resp = server
             .dispatch(&write, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn scoped_agent_cannot_enumerate_all_containers() {
+        let server = authed_server(vec![ResolvedScope {
+            container_glob: "notes".into(),
+            actions: vec![AccessAction::ReadFile],
+            mode_ceiling: None,
+        }]);
+        let mut pair = PairState::Unpaired;
+        server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":1,"method":"vault.pair","params":{"agent_id":"ag_1","token":"tok-1"}}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
+            .await
+            .unwrap();
+        let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"vault.list","arguments":{}}}"#;
+        let resp = server
+            .dispatch(list, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn scoped_agent_cannot_use_transit_without_grant() {
+        let server = authed_server(vec![ResolvedScope {
+            container_glob: "notes".into(),
+            actions: vec![AccessAction::ReadFile],
+            mode_ceiling: None,
+        }]);
+        let mut pair = PairState::Unpaired;
+        server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":1,"method":"vault.pair","params":{"agent_id":"ag_1","token":"tok-1"}}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
+            .await
+            .unwrap();
+        let pt = B64.encode(b"top secret");
+        let enc = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"vault.encrypt","arguments":{{"key_ref":"k1","plaintext_b64":"{pt}"}}}}}}"#
+        );
+        let resp = server
+            .dispatch(&enc, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn scoped_agent_can_use_transit_with_grant() {
+        let server = authed_server(vec![ResolvedScope {
+            container_glob: "notes".into(),
+            actions: vec![AccessAction::ReadFile, AccessAction::Encrypt],
+            mode_ceiling: None,
+        }]);
+        let mut pair = PairState::Unpaired;
+        server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":1,"method":"vault.pair","params":{"agent_id":"ag_1","token":"tok-1"}}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
+            .await
+            .unwrap();
+        let pt = B64.encode(b"top secret");
+        let enc = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"vault.encrypt","arguments":{{"key_ref":"k1","plaintext_b64":"{pt}"}}}}}}"#
+        );
+        let resp = server
+            .dispatch(&enc, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn unscoped_agent_can_enumerate_and_use_keys() {
+        let server = authed_server(vec![]);
+        let mut pair = PairState::Unpaired;
+        server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":1,"method":"vault.pair","params":{"agent_id":"ag_1","token":"tok-1"}}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
+            .await
+            .unwrap();
+        let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"vault.list","arguments":{}}}"#;
+        let resp = server
+            .dispatch(list, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], false);
+
+        let pt = B64.encode(b"top secret");
+        let enc = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"vault.encrypt","arguments":{{"key_ref":"k1","plaintext_b64":"{pt}"}}}}}}"#
+        );
+        let resp = server
+            .dispatch(&enc, &mut pair, AccessTransport::McpWs)
             .await
             .unwrap();
         assert_eq!(resp["result"]["isError"], false);

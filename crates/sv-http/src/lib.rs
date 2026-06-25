@@ -185,7 +185,16 @@ fn agent_card() -> serde_json::Value {
             { "name": "vault.list",   "description": "List containers, or files in a single container." },
             { "name": "vault.read",   "description": "Read and decrypt a file. Returns base64." },
             { "name": "vault.write",  "description": "Encrypt and write a file (base64 input)." },
-            { "name": "vault.delete", "description": "Delete a file." }
+            { "name": "vault.delete", "description": "Delete a file." },
+            { "name": "vault.create_container", "description": "Create a container." },
+            { "name": "vault.create_transit_key", "description": "Create a transit key held by the vault." },
+            { "name": "vault.list_transit_keys", "description": "List transit-key metadata." },
+            { "name": "vault.encrypt", "description": "Encrypt with a vault-held transit key." },
+            { "name": "vault.decrypt", "description": "Decrypt with a vault-held transit key." },
+            { "name": "vault.create_signing_key", "description": "Create a vault-held signing key." },
+            { "name": "vault.list_signing_keys", "description": "List signing-key metadata." },
+            { "name": "vault.sign", "description": "Sign with a vault-held Ed25519 key." },
+            { "name": "vault.verify", "description": "Verify an Ed25519 signature." }
         ],
         "contact": { "type": "local", "host": "127.0.0.1", "ws_port": 9944, "http_port": 9943 }
     })

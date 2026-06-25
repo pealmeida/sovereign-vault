@@ -48,7 +48,7 @@ Built for the single-developer and single-agent-fleet case that server-grade too
 
 - **Single root vault** per OS user, with sub-containers and per-container security modes.
 - **Security modes:** `DIRECT`, `APPROVAL`, `OTP`, and `ANONYMIZED`.
-- **9 MCP tools:** `vault.list`, `read`, `write`, `delete`, `create_container`, plus transit `encrypt`, `decrypt`, `sign`, and `verify`. Optional `vault.broker_request` is gated behind `SV_ENABLE_BROKER=1`.
+- **13 default MCP tools:** file/container operations plus transit-key and signing-key management, encryption/decryption, signing, and verification. Optional broker-secret management and `vault.broker_request` are gated behind `SV_ENABLE_BROKER=1`.
 - **Key hierarchy:** an OS-keychain key or passphrase wraps a rotatable data key.
 - **Keychain custody hardening:** vault-root-scoped keychain entries, backend availability probing, passphrase-to-keychain migration, and recovery-based repair of broken keychain wrappers.
 - **Per-agent identity and scopes** managed from the desktop.
@@ -116,6 +116,16 @@ Installers land under `target/release/bundle/`.
 
 The vault must be unlocked for clients to connect.
 
+**4. Install an agent command pack.**
+
+```bash
+sovereign-vault agents list-targets
+sovereign-vault agents install --target claude-code
+```
+
+Generated command packs live from the canonical definitions under
+[`integrations/agents/`](./integrations/agents/README.md).
+
 **3. Read secrets in your app, with `.env` fallback.**
 
 ```js
@@ -152,7 +162,7 @@ crates/
   sv-core        integration crate consumed by apps
 
 apps/desktop     Tauri 2 app (Rust commands + approval state)
-apps/cli         headless `sovereign-vault` binary, including `mcp-stdio`
+apps/cli         headless `sovereign-vault` binary, including `mcp-stdio` and agent-pack install/export commands
 apps/thesis-eval DSR evaluation harness
 ui/              Svelte 5 + Vite frontend
 clients/         Node / Python / shell secret loaders

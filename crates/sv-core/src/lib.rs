@@ -649,7 +649,7 @@ fn unlock_legacy_with_keychain(root: &Path) -> Result<VaultHandle> {
 
 fn validate_legacy_vault_key(vault: &Vault) -> Result<()> {
     for container in vault.list_containers()? {
-        for file in vault.list_files(&container.name)? {
+        if let Some(file) = vault.list_files(&container.name)?.into_iter().next() {
             vault.read_file(&container.name, &file.name)?;
             return Ok(());
         }
@@ -800,6 +800,31 @@ impl sv_mcp::VaultFacade for VaultHandle {
         VaultHandle::container_mode(self, container).map_err(|e| e.to_string())
     }
 
+    fn transit_create_key(
+        &self,
+        name: &str,
+    ) -> std::result::Result<sv_mcp::TransitKeyInfo, String> {
+        let info = VaultHandle::transit_create_key(self, name).map_err(|e| e.to_string())?;
+        Ok(sv_mcp::TransitKeyInfo {
+            name: info.name,
+            version: info.version,
+        })
+    }
+
+    fn transit_list(&self) -> std::result::Result<Vec<sv_mcp::TransitKeyInfo>, String> {
+        VaultHandle::transit_list(self)
+            .map_err(|e| e.to_string())
+            .map(|items| {
+                items
+                    .into_iter()
+                    .map(|info| sv_mcp::TransitKeyInfo {
+                        name: info.name,
+                        version: info.version,
+                    })
+                    .collect()
+            })
+    }
+
     fn transit_encrypt(
         &self,
         key_ref: &str,
@@ -822,6 +847,107 @@ impl sv_mcp::VaultFacade for VaultHandle {
 
     fn signing_public_key(&self, key_ref: &str) -> std::result::Result<String, String> {
         VaultHandle::signing_public_key(self, key_ref).map_err(|e| e.to_string())
+    }
+
+    fn signing_create_key(
+        &self,
+        name: &str,
+    ) -> std::result::Result<sv_mcp::SigningKeyInfo, String> {
+        let info = VaultHandle::signing_create_key(self, name).map_err(|e| e.to_string())?;
+        Ok(sv_mcp::SigningKeyInfo {
+            name: info.name,
+            version: info.version,
+            public_key_b64: info.public_b64,
+        })
+    }
+
+    fn signing_list(&self) -> std::result::Result<Vec<sv_mcp::SigningKeyInfo>, String> {
+        VaultHandle::signing_list(self)
+            .map_err(|e| e.to_string())
+            .map(|items| {
+                items
+                    .into_iter()
+                    .map(|info| sv_mcp::SigningKeyInfo {
+                        name: info.name,
+                        version: info.version,
+                        public_key_b64: info.public_b64,
+                    })
+                    .collect()
+            })
+    }
+
+    fn broker_create(
+        &self,
+        name: &str,
+        secret: &str,
+        allow: Vec<sv_mcp::BrokerAllow>,
+        injection: sv_mcp::BrokerInjection,
+    ) -> std::result::Result<sv_mcp::BrokerSecretInfo, String> {
+        let allow = allow
+            .into_iter()
+            .map(|entry| transit::BrokerAllow {
+                host: entry.host,
+                path_prefix: entry.path_prefix,
+                methods: entry.methods,
+                allow_private_ip: entry.allow_private_ip,
+            })
+            .collect();
+        let injection = match injection {
+            sv_mcp::BrokerInjection::BearerAuth => transit::BrokerInjection::BearerAuth,
+            sv_mcp::BrokerInjection::Header { name } => transit::BrokerInjection::Header { name },
+        };
+        let info = VaultHandle::broker_create(self, name, secret, allow, injection)
+            .map_err(|e| e.to_string())?;
+        Ok(sv_mcp::BrokerSecretInfo {
+            name: info.name,
+            allow: info
+                .allow
+                .into_iter()
+                .map(|entry| sv_mcp::BrokerAllow {
+                    host: entry.host,
+                    path_prefix: entry.path_prefix,
+                    methods: entry.methods,
+                    allow_private_ip: entry.allow_private_ip,
+                })
+                .collect(),
+            injection: match info.injection {
+                transit::BrokerInjection::BearerAuth => sv_mcp::BrokerInjection::BearerAuth,
+                transit::BrokerInjection::Header { name } => {
+                    sv_mcp::BrokerInjection::Header { name }
+                }
+            },
+        })
+    }
+
+    fn broker_list(&self) -> std::result::Result<Vec<sv_mcp::BrokerSecretInfo>, String> {
+        VaultHandle::broker_list(self)
+            .map_err(|e| e.to_string())
+            .map(|items| {
+                items
+                    .into_iter()
+                    .map(|info| sv_mcp::BrokerSecretInfo {
+                        name: info.name,
+                        allow: info
+                            .allow
+                            .into_iter()
+                            .map(|entry| sv_mcp::BrokerAllow {
+                                host: entry.host,
+                                path_prefix: entry.path_prefix,
+                                methods: entry.methods,
+                                allow_private_ip: entry.allow_private_ip,
+                            })
+                            .collect(),
+                        injection: match info.injection {
+                            transit::BrokerInjection::BearerAuth => {
+                                sv_mcp::BrokerInjection::BearerAuth
+                            }
+                            transit::BrokerInjection::Header { name } => {
+                                sv_mcp::BrokerInjection::Header { name }
+                            }
+                        },
+                    })
+                    .collect()
+            })
     }
 
     fn broker_enabled(&self) -> bool {

@@ -26,6 +26,7 @@ Out of scope: load/perf, multi-machine sync, mobile.
 | **L2 MCP simulation** | `scripts/e2e_mcp_usage.sh` → real `mcp-stdio` proxy → live vault | the exact agent path: pair → tools/call write/read/encrypt over WS | live, vault unlocked |
 | **L3 Desktop GUI** | computer-use against installed app | bootstrap/unlock, container modes, file view, agents, transit/signing, approvals | live install |
 | **L4 Lifecycle/ops** | mixed | passphrase change, key rotation, recovery, backup/restore, migration of an old vault | live |
+| **L5 Mock live project** | `examples/mock-ai-project/scripts/validate-sovereign-vault.mjs` | fake AI-provider project with feature-status JSON/Markdown evidence | live, vault unlocked |
 
 ## 4. Preconditions
 
@@ -33,6 +34,7 @@ Out of scope: load/perf, multi-machine sync, mobile.
 - Launch + unlock (OS keychain = one click; passphrase = human types it).
 - For L2, the vault must be **unlocked** (MCP servers start on `127.0.0.1:9944`/`:9943` only after unlock).
 - For broker cases, launch with `SV_ENABLE_BROKER=1`.
+- For L5, use only `examples/mock-ai-project/.env.fake`; never replace it with real provider keys.
 
 ## 5. Realistic usage scenarios (happy path)
 
@@ -90,6 +92,7 @@ Out of scope: load/perf, multi-machine sync, mobile.
 - L2: `scripts/e2e_mcp_usage.sh` pairs and returns successful results for create/write/read/encrypt; read round-trips the written plaintext.
 - L3: each S/N row observed in the UI as specified.
 - L4: each lifecycle row passes; **no data loss** at any step.
+- L5: `node examples/mock-ai-project/scripts/validate-sovereign-vault.mjs` writes `target/mock-ai-project/<run-id>/feature-status.{json,md}` and all non-skipped rows are either `pass` or explicitly marked `needs_human_approval_or_timeout`.
 
 ## 9. Known limitations / findings (track to closure)
 

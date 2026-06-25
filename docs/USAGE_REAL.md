@@ -52,6 +52,15 @@ Ready-to-paste configs live in [`examples/`](../examples/). For Claude Desktop:
 
 The vault must be **unlocked** before any tool call. Lock = MCP servers stop binding.
 
+You can also install the generated `/sovereign-vault` command packs for
+supported agents:
+
+```bash
+sovereign-vault agents list-targets
+sovereign-vault agents install --target claude-code
+sovereign-vault agents install --target codex
+```
+
 ## 3. Recommended: per-agent scoped tokens
 
 Don't reuse the `Default` agent across every project — mint a scoped agent per
@@ -60,11 +69,11 @@ project so a compromised client can only touch its own container:
 1. Desktop → **Settings → Agents → New agent**
 2. Name: e.g. `myproject-prod`
 3. Copy the **one-time token** (shown ONCE).
-4. In that project's MCP client config, pass the token instead of the default
-   secret. The `mcp-stdio` proxy reads `SV_PAIRING_TOKEN` from the environment
-   if set; otherwise it falls back to the Default agent's per-launch secret. Set
-   `SV_PAIRING_TOKEN=<the token>` in that project's env so its agent binds to its
-   scoped identity.
+4. In that project's MCP client environment, set `SV_AGENT_ID=<agent id>` and
+   `SV_PAIRING_TOKEN=<the token>`. The `mcp-stdio` proxy sends
+   `vault.pair { agent_id, token }` when both are present; with only
+   `SV_PAIRING_TOKEN` set it falls back to shared-secret pairing as the Default
+   agent.
 5. Add scopes (in the Agents panel): glob `env-myproject/*`, actions `read,list`.
 
 Revoke any time from the Agents panel. The token never appears in the UI again.
@@ -105,7 +114,9 @@ tool call to `vault.read`). Don't echo it to logs.
 
 - ANONYMIZED / ZKP / NATIVE modes are stubs (`"...not implemented for live MCP access"`).
 - Container `delete` is destructive and not yet undo-able — confirm twice.
-- Broker (`vault.broker_request`) is off by default. Enable with `SV_ENABLE_BROKER=1` to inject secrets into outbound HTTP without exposing them.
+- Broker tools are off by default. Enable with `SV_ENABLE_BROKER=1` to create
+  brokered secrets and use `vault.broker_request` without exposing credentials
+  to the agent.
 
 ## 7. Vault-as-primary with `.env` redundancy (the safe switch)
 
