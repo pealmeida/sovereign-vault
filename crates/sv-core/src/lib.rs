@@ -1023,9 +1023,15 @@ pub fn probe(root: &Path) -> Result<InitState> {
     let keychain = sv_keychain::availability();
     let (has_keychain_entry, keychain_error) = match has_keychain_kek(root) {
         Ok(has_entry) => (has_entry, keychain.error.clone()),
-        Err(CoreError::Keychain(sv_keychain::KeychainError::Unavailable(error))) => {
-            (false, Some(error))
-        }
+        // The keychain is unreachable (no backend on this platform/session) or
+        // the backend itself errored (e.g. no D-Bus Secret Service on a headless
+        // Linux box). Either way we cannot observe an entry: report none and
+        // surface the reason, rather than failing the whole probe. A passphrase
+        // vault must remain probe-able without a working OS keychain.
+        Err(CoreError::Keychain(
+            sv_keychain::KeychainError::Unavailable(error)
+            | sv_keychain::KeychainError::Backend(error),
+        )) => (false, Some(error)),
         Err(error) => return Err(error),
     };
     Ok(InitState {
