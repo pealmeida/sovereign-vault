@@ -1,0 +1,28 @@
+[package]
+name        = "sv-validate"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+description = "Production-readiness validation harness: drives the real Sovereign Vault MCP gateway over a loopback WebSocket as an AI agent, exercising every tool and security scenario."
+publish     = false
+
+[[bin]]
+name = "sv-validate"
+path = "src/main.rs"
+
+[dependencies]
+sv-core           = { workspace = true }
+sv-mcp            = { workspace = true }
+sv-storage        = { workspace = true }
+sv-audit          = { workspace = true }
+serde_json        = { workspace = true }
+tokio             = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util      = { workspace = true }
+base64            = "0.22"
+async-trait       = "0.1"
+
+[lints]
+workspace = true

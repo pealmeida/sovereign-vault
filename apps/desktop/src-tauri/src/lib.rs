@@ -340,10 +340,16 @@ fn parse_access_action(s: &str) -> Option<sv_mcp::AccessAction> {
         "write" | "write_file" => Some(sv_mcp::AccessAction::WriteFile),
         "delete" | "delete_file" => Some(sv_mcp::AccessAction::DeleteFile),
         "create_container" => Some(sv_mcp::AccessAction::CreateContainer),
+        "create_transit_key" => Some(sv_mcp::AccessAction::CreateTransitKey),
+        "list_transit_keys" => Some(sv_mcp::AccessAction::ListTransitKeys),
         "encrypt" => Some(sv_mcp::AccessAction::Encrypt),
         "decrypt" => Some(sv_mcp::AccessAction::Decrypt),
+        "create_signing_key" => Some(sv_mcp::AccessAction::CreateSigningKey),
+        "list_signing_keys" => Some(sv_mcp::AccessAction::ListSigningKeys),
         "sign" => Some(sv_mcp::AccessAction::Sign),
         "verify" => Some(sv_mcp::AccessAction::Verify),
+        "create_broker_secret" => Some(sv_mcp::AccessAction::CreateBrokerSecret),
+        "list_broker_secrets" => Some(sv_mcp::AccessAction::ListBrokerSecrets),
         "broker" | "broker_request" => Some(sv_mcp::AccessAction::Broker),
         _ => None,
     }
@@ -464,9 +470,16 @@ fn approval_requirement(request: &sv_mcp::AccessRequest) -> Result<ApprovalPromp
     // Transit + signing carry no container mode; gate them on a click, except
     // verify (public-key only, no secret material involved).
     match request.action {
-        sv_mcp::AccessAction::Encrypt
+        sv_mcp::AccessAction::CreateTransitKey
+        | sv_mcp::AccessAction::ListTransitKeys
+        | sv_mcp::AccessAction::Encrypt
         | sv_mcp::AccessAction::Decrypt
+        | sv_mcp::AccessAction::CreateSigningKey
+        | sv_mcp::AccessAction::ListSigningKeys
         | sv_mcp::AccessAction::Sign => return Ok(ApprovalPromptKind::Click),
+        sv_mcp::AccessAction::CreateBrokerSecret | sv_mcp::AccessAction::ListBrokerSecrets => {
+            return Ok(ApprovalPromptKind::Click)
+        }
         sv_mcp::AccessAction::Verify => return Ok(ApprovalPromptKind::NotRequired),
         _ => {}
     }

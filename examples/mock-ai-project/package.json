@@ -1,0 +1,14 @@
+{
+  "name": "sovereign-vault-mock-ai-project",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Fake-key mock AI project for live Sovereign Vault validation and research evidence.",
+  "scripts": {
+    "mock:app": "node src/mock-provider-client.mjs",
+    "vault:validate": "node scripts/validate-sovereign-vault.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

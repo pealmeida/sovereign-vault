@@ -13,6 +13,7 @@ members = [
     "apps/cli",
     "apps/desktop/src-tauri",
     "apps/thesis-eval",
+    "apps/sv-validate",
 ]
 
 [workspace.package]
