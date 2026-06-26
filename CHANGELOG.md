@@ -10,6 +10,12 @@ follow [Semantic Versioning](https://semver.org/) once it reaches `0.1.0`.
 ## [Unreleased]
 
 ### Fixed
+- **DIRECT-mode MCP ops no longer block on the desktop approval queue.** The
+  consent gate now keys on the request's security mode: only APPROVAL, OTP, and
+  ZKP containers wait for a human click. DIRECT containers, listing all
+  containers (`vault.list {}`), and transit/signing key operations execute
+  immediately. Found by driving the live MCP gateway as an agent, where DIRECT
+  writes and key ops timed out waiting for a click they never needed.
 - **Key rotation no longer orphans transit/signing/broker material.** Rotation
   re-wraps every transit key, signing seed, and broker secret forward to the new
   DEK instead of leaving them sealed under the retired one. Adds a regression
@@ -33,6 +39,13 @@ follow [Semantic Versioning](https://semver.org/) once it reaches `0.1.0`.
 - Documentation made platform-neutral (macOS/Linux/Windows) and de-personalized.
 
 ### Added
+- **`vault.destroy` MCP tool** — permanently delete a container and its contents
+  via MCP (gated by the container's mode, like every other write).
+- **`vault.info` MCP tool** — returns vault version, custody mode, and container
+  count; no approval required.
+- **US SSN masking in ANONYMIZED mode** — `\d{3}-\d{2}-\d{4}` is redacted to
+  `[REDACTED:SSN]`, alongside the existing email/phone/credit-card/CPF/CNPJ
+  detectors.
 - `docs/threat-model.md`, `docs/ARCHITECTURE.md`, and this `CHANGELOG.md`.
 - `examples/` — ready-to-paste MCP client configs (Claude Desktop / Cursor /
   Continue) and a runnable `end-to-end.sh`.

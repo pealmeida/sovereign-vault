@@ -178,6 +178,8 @@ pub trait VaultFacade: Send + Sync {
     ) -> std::result::Result<(), String>;
     /// Effective mode for a container.
     fn container_mode(&self, container: &str) -> std::result::Result<SecurityMode, String>;
+    /// Destroy (delete) a container and all its contents.
+    fn destroy_container(&self, name: &str) -> std::result::Result<(), String>;
     /// Create a new symmetric transit key.
     fn transit_create_key(&self, name: &str) -> std::result::Result<TransitKeyInfo, String>;
     /// List symmetric transit keys.
@@ -215,6 +217,10 @@ pub trait VaultFacade: Send + Sync {
     fn broker_list(&self) -> std::result::Result<Vec<BrokerSecretInfo>, String>;
     /// Whether brokering is enabled (default-off feature flag).
     fn broker_enabled(&self) -> bool;
+    /// Custody mode label for this vault (e.g. "passphrase", "os_keychain").
+    fn custody_mode_label(&self) -> &'static str {
+        "unknown"
+    }
     /// Broker an outbound request injecting the secret named `secret_ref`. The
     /// returned outcome never contains the secret or injected auth header.
     async fn broker_request(
@@ -287,6 +293,10 @@ pub enum AccessAction {
     ListBrokerSecrets,
     /// Broker an outbound request injecting a stored secret.
     Broker,
+    /// Destroy (permanently delete) a container.
+    DestroyContainer,
+    /// Return vault metadata (version, custody mode, container count).
+    VaultInfo,
 }
 
 impl AccessAction {
@@ -309,6 +319,8 @@ impl AccessAction {
             Self::CreateBrokerSecret => AuditAction::CreateBrokerSecret,
             Self::ListBrokerSecrets => AuditAction::ListBrokerSecrets,
             Self::Broker => AuditAction::Broker,
+            Self::DestroyContainer => AuditAction::DeleteContainer,
+            Self::VaultInfo => AuditAction::VaultInfo,
         }
     }
 }
@@ -783,18 +795,28 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         let validate = started.elapsed();
 
         let authorize_started = Instant::now();
-        if let Some(controller) = &self.access_controller {
-            if let Err(error) = controller.authorize(access.clone()).await {
-                self.record_audit(&access, AuditDecision::Denied, None, Some(error.clone()));
-                self.emit_timing(
-                    &access,
-                    false,
-                    validate,
-                    authorize_started.elapsed(),
-                    Duration::ZERO,
-                    Duration::ZERO,
-                );
-                return Err(error);
+        // DIRECT-mode containers and operations without a specific container
+        // (transit key ops, vault.list {}) bypass the GUI approval queue.
+        // Only APPROVAL / OTP / ZKP modes require physical human confirmation.
+        // NATIVE is a local-device restriction, not a GUI approval flow.
+        let needs_consent = matches!(
+            access.mode,
+            Some(SecurityMode::Approval) | Some(SecurityMode::Otp) | Some(SecurityMode::Zkp)
+        );
+        if needs_consent {
+            if let Some(controller) = &self.access_controller {
+                if let Err(error) = controller.authorize(access.clone()).await {
+                    self.record_audit(&access, AuditDecision::Denied, None, Some(error.clone()));
+                    self.emit_timing(
+                        &access,
+                        false,
+                        validate,
+                        authorize_started.elapsed(),
+                        Duration::ZERO,
+                        Duration::ZERO,
+                    );
+                    return Err(error);
+                }
             }
         }
         // The human-in-the-loop consent gate = T_hitl.
@@ -1103,6 +1125,23 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .map(|s| s.to_string()),
                 })
             }
+            "vault.destroy" => {
+                let name = required_str(args, "name")?;
+                Ok(AccessRequest {
+                    transport,
+                    action: AccessAction::DestroyContainer,
+                    container: Some(name.to_string()),
+                    file_name: None,
+                    mode: Some(handle.container_mode(name)?),
+                    byte_size: None,
+                    agent_id: None,
+                    otp: args
+                        .get("otp")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                })
+            }
+            "vault.info" => Ok(simple_request(transport, AccessAction::VaultInfo)),
             "vault.create_transit_key" => {
                 let _ = required_str(args, "name")?;
                 Ok(simple_request(transport, AccessAction::CreateTransitKey))
@@ -1212,6 +1251,19 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 let description = args.get("description").and_then(|v| v.as_str());
                 handle.create_container(name, mode, description)?;
                 Ok(json!({ "ok": true, "name": name, "mode": mode }))
+            }
+            "vault.destroy" => {
+                let name = required_str(args, "name")?;
+                handle.destroy_container(name)?;
+                Ok(json!({ "ok": true, "name": name }))
+            }
+            "vault.info" => {
+                let containers = handle.list_containers()?;
+                Ok(json!({
+                    "version": crate::version(),
+                    "custody_mode": handle.custody_mode_label(),
+                    "containers": containers.len(),
+                }))
             }
             "vault.create_transit_key" => {
                 let name = required_str(args, "name")?;
@@ -1733,6 +1785,32 @@ fn base_tool_descriptors() -> Value {
             }
         },
         {
+            "name": "vault.destroy",
+            "description":
+                "Permanently destroy a container and all its contents. This is irreversible. \
+                 Requires desktop approval for APPROVAL/OTP/ZKP containers.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": { "type": "string", "description": "Container name to destroy." },
+                    "otp": { "type": "string", "description": "One-time code shown on the trusted desktop (OTP-mode only)." }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "vault.info",
+            "description":
+                "Return vault metadata: version, custody mode, and number of containers. \
+                 No parameters required. Safe to call without any approval.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "vault.create_transit_key",
             "description": "Create a symmetric transit key held by the vault.",
             "inputSchema": {
@@ -2055,6 +2133,10 @@ mod tests {
             Ok(())
         }
 
+        fn destroy_container(&self, _name: &str) -> std::result::Result<(), String> {
+            Ok(())
+        }
+
         fn create_container(
             &self,
             _name: &str,
@@ -2152,8 +2234,9 @@ mod tests {
             .await
             .unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
-        // 5 file tools + transit create/list/encrypt/decrypt + signing create/list/sign/verify.
-        assert_eq!(tools.len(), 13);
+        // 5 file tools + vault.destroy + vault.info + transit create/list/encrypt/decrypt
+        // + signing create/list/sign/verify.
+        assert_eq!(tools.len(), 15);
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"vault.encrypt"));
         assert!(names.contains(&"vault.sign"));
@@ -2175,7 +2258,7 @@ mod tests {
             .await
             .unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 18);
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"vault.broker_request"));
         assert!(names.contains(&"vault.create_broker_secret"));

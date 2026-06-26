@@ -59,18 +59,21 @@ pub enum PiiCategory {
     Ipv4,
     /// Telephone number (explicitly formatted).
     Phone,
+    /// US Social Security Number (`\d{3}-\d{2}-\d{4}`).
+    Ssn,
 }
 
 impl PiiCategory {
     /// Every detectable category, in detector-precedence order (earlier wins an
     /// overlap tie — see [`redact`]).
-    pub const ALL: [PiiCategory; 6] = [
+    pub const ALL: [PiiCategory; 7] = [
         PiiCategory::Cnpj,
         PiiCategory::Cpf,
         PiiCategory::CreditCard,
         PiiCategory::Email,
         PiiCategory::Ipv4,
         PiiCategory::Phone,
+        PiiCategory::Ssn,
     ];
 
     /// Stable uppercase label used in the redaction placeholder, e.g. `EMAIL`
@@ -83,6 +86,7 @@ impl PiiCategory {
             PiiCategory::CreditCard => "CREDIT_CARD",
             PiiCategory::Ipv4 => "IPV4",
             PiiCategory::Phone => "PHONE",
+            PiiCategory::Ssn => "SSN",
         }
     }
 
@@ -96,6 +100,7 @@ impl PiiCategory {
             PiiCategory::Email => 3,
             PiiCategory::Ipv4 => 2,
             PiiCategory::Phone => 1,
+            PiiCategory::Ssn => 2,
         }
     }
 }
@@ -219,6 +224,9 @@ pub fn scan(input: &str, policy: &Policy) -> Vec<Finding> {
     }
     if policy.enabled(PiiCategory::Phone) {
         find_phones(bytes, &mut raw);
+    }
+    if policy.enabled(PiiCategory::Ssn) {
+        find_ssns(bytes, &mut raw);
     }
 
     resolve_overlaps(raw)
@@ -520,6 +528,61 @@ fn find_phones(b: &[u8], out: &mut Vec<Finding>) {
     }
 }
 
+/// US Social Security Number: exactly `\d{3}-\d{2}-\d{4}`, bounded on both
+/// sides by a non-digit non-hyphen character (or the string boundary).
+fn find_ssns(b: &[u8], out: &mut Vec<Finding>) {
+    let mut i = 0;
+    while i < b.len() {
+        // Must start with a digit.
+        if !is_digit(b[i]) {
+            i += 1;
+            continue;
+        }
+        // Must have a non-digit/non-hyphen boundary before.
+        let prev = i.checked_sub(1).map(|j| b[j]);
+        if !is_ssn_boundary(prev) {
+            i += 1;
+            continue;
+        }
+        // Match exactly DDD-DD-DDDD.
+        if i + 11 > b.len() {
+            i += 1;
+            continue;
+        }
+        let s = &b[i..i + 11];
+        let valid = is_digit(s[0])
+            && is_digit(s[1])
+            && is_digit(s[2])
+            && s[3] == b'-'
+            && is_digit(s[4])
+            && is_digit(s[5])
+            && s[6] == b'-'
+            && is_digit(s[7])
+            && is_digit(s[8])
+            && is_digit(s[9])
+            && is_digit(s[10]);
+        if valid && is_ssn_boundary(b.get(i + 11).copied()) {
+            out.push(Finding {
+                category: PiiCategory::Ssn,
+                start: i,
+                end: i + 11,
+            });
+            i += 11;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Boundary check for SSN: not a digit and not a hyphen (hyphens are
+/// structural within the SSN itself).
+fn is_ssn_boundary(b: Option<u8>) -> bool {
+    match b {
+        None => true,
+        Some(c) => !is_digit(c) && c != b'-',
+    }
+}
+
 // ---- checksum validators --------------------------------------------------
 
 /// Luhn (mod-10) check over a slice of single digits.
@@ -700,6 +763,29 @@ mod tests {
         assert_eq!(r.count(), 3);
         let by_cat = r.counts_by_category();
         assert!(by_cat.contains(&(PiiCategory::Email, 1)));
+    }
+
+    #[test]
+    fn masks_ssn_formatted() {
+        // Clearly fake SSN used for test purposes only.
+        let r = redact(r#""ssn":"123-45-6789""#, &Policy::all());
+        assert_eq!(cats(&r), vec![PiiCategory::Ssn]);
+        assert_eq!(r.output, r#""ssn":"[REDACTED:SSN]""#);
+    }
+
+    #[test]
+    fn ssn_not_matched_without_hyphens() {
+        // Bare digits without hyphens must NOT be matched as an SSN.
+        let r = redact("123456789", &Policy::only([PiiCategory::Ssn]));
+        assert!(r.is_clean(), "unexpected: {:?}", r.findings);
+    }
+
+    #[test]
+    fn ssn_boundary_required() {
+        // An SSN embedded mid-word (e.g. a longer digit run) must not match.
+        let r = redact("1234-56-7890", &Policy::only([PiiCategory::Ssn]));
+        // 4 leading digits disqualify the pattern starting at offset 0.
+        assert!(r.is_clean(), "unexpected: {:?}", r.findings);
     }
 
     #[test]
