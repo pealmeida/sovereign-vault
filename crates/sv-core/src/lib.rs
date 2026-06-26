@@ -800,6 +800,18 @@ impl sv_mcp::VaultFacade for VaultHandle {
         VaultHandle::container_mode(self, container).map_err(|e| e.to_string())
     }
 
+    fn destroy_container(&self, name: &str) -> std::result::Result<(), String> {
+        VaultHandle::delete_container(self, name).map_err(|e| e.to_string())
+    }
+
+    fn custody_mode_label(&self) -> &'static str {
+        match self.custody {
+            CustodyMode::OsKeychain => "os_keychain",
+            CustodyMode::Passphrase => "passphrase",
+            CustodyMode::Recovery => "recovery",
+        }
+    }
+
     fn transit_create_key(
         &self,
         name: &str,

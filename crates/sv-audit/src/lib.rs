@@ -116,6 +116,8 @@ pub enum AuditAction {
     ListBrokerSecrets,
     /// Broker an outbound request with a stored secret.
     Broker,
+    /// Query vault metadata (version, custody mode, container count).
+    VaultInfo,
 }
 
 /// Final outcome for an audited action.
