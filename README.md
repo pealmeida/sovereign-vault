@@ -48,14 +48,14 @@ Built for the single-developer and single-agent-fleet case that server-grade too
 
 - **Single root vault** per OS user, with sub-containers and per-container security modes.
 - **Security modes:** `DIRECT`, `APPROVAL`, `OTP`, and `ANONYMIZED`.
-- **13 default MCP tools:** file/container operations plus transit-key and signing-key management, encryption/decryption, signing, and verification. Optional broker-secret management and `vault.broker_request` are gated behind `SV_ENABLE_BROKER=1`.
+- **15 default MCP tools:** file/container operations (including `vault.destroy` and a read-only `vault.info`) plus transit-key and signing-key management, encryption/decryption, signing, and verification. Operations are gated by their container's security mode — only `APPROVAL`/`OTP`/`ZKP` raise a desktop prompt; `DIRECT` and key operations run without one. Optional broker-secret management and `vault.broker_request` are gated behind `SV_ENABLE_BROKER=1`.
 - **Key hierarchy:** an OS-keychain key or passphrase wraps a rotatable data key.
 - **Keychain custody hardening:** vault-root-scoped keychain entries, backend availability probing, passphrase-to-keychain migration, and recovery-based repair of broken keychain wrappers.
 - **Per-agent identity and scopes** managed from the desktop.
 - **Hash-chained audit log** covering desktop and MCP operations.
 - **BIP39 24-word recovery phrase** generated at first launch.
 - **Drop-in client loaders** in [`clients/`](./clients/) for Node, Python, and shell with vault-first and `.env` fallback behavior.
-- **PII privacy mediation** in `sv-privacy` for `ANONYMIZED` containers.
+- **PII privacy mediation** in `sv-privacy` for `ANONYMIZED` containers — masks email, phone, credit-card, US SSN, CPF, and CNPJ values on read.
 
 ## Not implemented yet
 
