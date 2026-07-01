@@ -116,7 +116,7 @@ Installers land under `target/release/bundle/`.
 
 The vault must be unlocked for clients to connect.
 
-**4. Install an agent command pack.**
+**3. Install an agent command pack.**
 
 ```bash
 sovereign-vault agents list-targets
@@ -126,7 +126,7 @@ sovereign-vault agents install --target claude-code
 Generated command packs live from the canonical definitions under
 [`integrations/agents/`](./integrations/agents/README.md).
 
-**3. Read secrets in your app, with `.env` fallback.**
+**4. Read secrets in your app, with `.env` fallback.**
 
 ```js
 import { loadSecrets } from "./clients/node/sv-secrets.mjs";

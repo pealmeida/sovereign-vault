@@ -752,7 +752,14 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         if let Some(authenticator) = &self.agent_authenticator {
             return authenticator.authenticate(agent_id, token).map(Some);
         }
-        if agent_id.is_none() && token == self.pairing_secret {
+        let token_matches: bool = {
+            use subtle::ConstantTimeEq as _;
+            token
+                .as_bytes()
+                .ct_eq(self.pairing_secret.as_bytes())
+                .into()
+        };
+        if agent_id.is_none() && token_matches {
             Ok(None)
         } else {
             Err("Unpaired connection".into())
