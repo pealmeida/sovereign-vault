@@ -515,6 +515,13 @@ async fn run_adversarial(out: &Path) {
     handle
         .write_file("personal-id", "cpf.txt", b"529.982.247-25")
         .unwrap();
+    // Reserved mode: live access must be rejected, never treated as DIRECT.
+    handle
+        .create_container("device-bound", SecurityMode::Native, None)
+        .unwrap();
+    handle
+        .write_file("device-bound", "hw.key", b"device-bound secret")
+        .unwrap();
 
     // A least-privilege agent: read-only on `public` only.
     let (agent_id, token) = handle
@@ -622,6 +629,22 @@ async fn run_adversarial(out: &Path) {
             creds: Creds::Default,
             tool: "vault.read",
             arguments: r("secrets", "api.key"),
+        },
+        Probe {
+            id: "A9",
+            class: Class::Attack,
+            description: "read NATIVE (reserved-mode) container",
+            creds: Creds::Default,
+            tool: "vault.read",
+            arguments: r("device-bound", "hw.key"),
+        },
+        Probe {
+            id: "A10",
+            class: Class::Attack,
+            description: "create NATIVE (reserved-mode) container",
+            creds: Creds::Default,
+            tool: "vault.create_container",
+            arguments: json!({"name":"native-new","mode":"NATIVE"}),
         },
         Probe {
             id: "C1",
