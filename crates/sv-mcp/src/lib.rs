@@ -752,7 +752,14 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         if let Some(authenticator) = &self.agent_authenticator {
             return authenticator.authenticate(agent_id, token).map(Some);
         }
-        if agent_id.is_none() && token == self.pairing_secret {
+        let token_matches: bool = {
+            use subtle::ConstantTimeEq as _;
+            token
+                .as_bytes()
+                .ct_eq(self.pairing_secret.as_bytes())
+                .into()
+        };
+        if agent_id.is_none() && token_matches {
             Ok(None)
         } else {
             Err("Unpaired connection".into())
@@ -797,11 +804,16 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         let authorize_started = Instant::now();
         // DIRECT-mode containers and operations without a specific container
         // (transit key ops, vault.list {}) bypass the GUI approval queue.
-        // Only APPROVAL / OTP / ZKP modes require physical human confirmation.
-        // NATIVE is a local-device restriction, not a GUI approval flow.
+        // APPROVAL / OTP / ZKP route through the controller for human
+        // confirmation. NATIVE must also route through it so the controller
+        // can reject it as unimplemented — leaving it out lets NATIVE
+        // containers silently degrade to DIRECT (no prompt, no rejection).
         let needs_consent = matches!(
             access.mode,
-            Some(SecurityMode::Approval) | Some(SecurityMode::Otp) | Some(SecurityMode::Zkp)
+            Some(SecurityMode::Approval)
+                | Some(SecurityMode::Otp)
+                | Some(SecurityMode::Zkp)
+                | Some(SecurityMode::Native)
         );
         if needs_consent {
             if let Some(controller) = &self.access_controller {
@@ -2151,6 +2163,10 @@ mod tests {
             if container == "anon" {
                 return Ok(SecurityMode::Anonymized);
             }
+            // A dedicated container exercises the NATIVE consent-gate path.
+            if container == "native" {
+                return Ok(SecurityMode::Native);
+            }
             if self.containers.iter().any(|c| c.name == container) {
                 Ok(SecurityMode::Approval)
             } else {
@@ -2515,6 +2531,30 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].decision, AuditDecision::Denied);
         assert_eq!(events[0].action, AuditAction::ReadFile);
+    }
+
+    #[tokio::test]
+    async fn native_mode_routes_through_access_controller() {
+        // NATIVE is reserved/unimplemented: it must reach the controller (which
+        // rejects it) rather than silently degrading to promptless DIRECT access.
+        let server = server().with_access_controller(Arc::new(DenyController));
+        let mut pair = PairState::AlreadyPaired(None);
+        let payload = B64.encode(b"secret");
+        let write = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.write","arguments":{{"container":"native","file_name":"a.txt","content_b64":"{payload}"}}}}}}"#
+        );
+        let response = server
+            .dispatch(&write, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+
+        let read = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"vault.read","arguments":{"container":"native","file_name":"a.txt"}}}"#;
+        let response = server
+            .dispatch(read, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
     }
 
     struct FakeAuthenticator {

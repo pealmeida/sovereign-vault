@@ -22,7 +22,8 @@ Mode cheatsheet:
 - **DIRECT**: no prompt. Use only for working data that isn't sensitive.
 - **APPROVAL**: every access raises a desktop modal (Approve / Deny). Daily-use secrets.
 - **OTP**: cross-channel — desktop shows a 6-digit code, agent resends with `otp=<code>`. Single-use, 120s TTL. For irreversible/regulated data.
-- ANONYMIZED / ZKP / NATIVE: enum reserved, not implemented yet — don't use.
+- **ANONYMIZED**: reads return content with PII masked (email, phone, credit card, US SSN, CPF, CNPJ). Binary content passes through unscanned.
+- ZKP / NATIVE: enum reserved, not implemented yet — don't use.
 
 ## 2. Wire an MCP client (any project)
 

@@ -93,6 +93,12 @@ cargo tauri build --manifest-path apps/desktop/src-tauri/Cargo.toml
 
 Installers land under `target/release/bundle/`.
 
+> Build the desktop app with `cargo tauri build`, not plain `cargo build`.
+> A plain `cargo build --release` binary loads the dev-server URL instead of
+> the embedded UI and shows a connection error. If you must skip the Tauri
+> CLI, build the UI first and add
+> `--features sovereign-vault-desktop/custom-protocol`.
+
 > First launch walks you through custody (OS keychain or passphrase) and shows the recovery phrase once. Write it down.
 
 > macOS Gatekeeper may block the unsigned bundle. Clear the quarantine flag with `xattr -dr com.apple.quarantine "target/release/bundle/macos/Sovereign Vault.app"`.
@@ -116,7 +122,7 @@ Installers land under `target/release/bundle/`.
 
 The vault must be unlocked for clients to connect.
 
-**4. Install an agent command pack.**
+**3. Install an agent command pack.**
 
 ```bash
 sovereign-vault agents list-targets
@@ -126,7 +132,7 @@ sovereign-vault agents install --target claude-code
 Generated command packs live from the canonical definitions under
 [`integrations/agents/`](./integrations/agents/README.md).
 
-**3. Read secrets in your app, with `.env` fallback.**
+**4. Read secrets in your app, with `.env` fallback.**
 
 ```js
 import { loadSecrets } from "./clients/node/sv-secrets.mjs";
