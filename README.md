@@ -93,6 +93,12 @@ cargo tauri build --manifest-path apps/desktop/src-tauri/Cargo.toml
 
 Installers land under `target/release/bundle/`.
 
+> Build the desktop app with `cargo tauri build`, not plain `cargo build`.
+> A plain `cargo build --release` binary loads the dev-server URL instead of
+> the embedded UI and shows a connection error. If you must skip the Tauri
+> CLI, build the UI first and add
+> `--features sovereign-vault-desktop/custom-protocol`.
+
 > First launch walks you through custody (OS keychain or passphrase) and shows the recovery phrase once. Write it down.
 
 > macOS Gatekeeper may block the unsigned bundle. Clear the quarantine flag with `xattr -dr com.apple.quarantine "target/release/bundle/macos/Sovereign Vault.app"`.

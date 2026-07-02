@@ -34,11 +34,12 @@ tauri-plugin-shell = "2"
 
 # Without `custom-protocol`, a release binary loads `devUrl` (localhost:1420)
 # instead of the embedded UI and shows a connection error. `cargo tauri build`
-# enables it implicitly; defaulting it on makes plain `cargo build --release`
-# produce a working binary too. `cargo tauri dev` passes
-# `--no-default-features`, so dev mode is unaffected.
+# enables it implicitly. Not a default feature: embedding requires `ui/dist`
+# to exist at compile time, which would break `cargo check`/CI on a fresh
+# clone before the UI is built. To build a working binary without the Tauri
+# CLI: build the UI first, then `cargo build --release --features
+# sovereign-vault-desktop/custom-protocol`.
 [features]
-default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
 [lints]
