@@ -44,23 +44,26 @@ opt-in `TimingSink` (`sv-mcp`); the harness aggregates it. Mapping:
 | `T_hitl` | `authorize` | consent gate (see caveat) |
 | `T_wan`, `T_inference` | — | external; not gateway-observable |
 
-**Sample results** (release build, 1000 reads/cell, microseconds, mean; p95 of total in parentheses):
+**Sample results** (release build, 1000 reads/cell, microseconds, mean; p95 of
+total in parentheses; Windows 11, captured 2026-07-01 after the NATIVE
+consent-gate fix):
 
 | Mode | Bytes | T_filter (validate) | T_filter (PII) | T_hitl (authorize) | T_vault (execute) | **T_total** |
 |---|---|---|---|---|---|---|
-| direct | 128 | 39.5 | 0.07 | 0.71 | 33.3 | **73.6** (p95 116.5) |
-| direct | 16384 | 49.3 | 0.08 | 0.74 | 66.9 | **117.1** (p95 177.8) |
-| approval | 16384 | 52.7 | 0.08 | 0.80 | 70.4 | **123.9** (p95 204.6) |
-| anon | 128 | 39.2 | 6.65 | 0.74 | 32.2 | **78.8** (p95 131.4) |
-| anon | 1024 | 44.5 | 29.4 | 0.78 | 37.3 | **112.0** (p95 196.3) |
-| anon | 16384 | 76.4 | 432.9 | 1.22 | 83.6 | **594.1** (p95 879.2) |
+| direct | 128 | 81.0 | 0.04 | 0.03 | 50.7 | **131.8** (p95 198.5) |
+| direct | 16384 | 87.7 | 0.04 | 0.04 | 84.8 | **172.5** (p95 269.4) |
+| approval | 16384 | 85.5 | 0.04 | 0.43 | 72.5 | **158.4** (p95 235.9) |
+| otp | 16384 | 85.0 | 0.04 | 0.49 | 71.5 | **157.0** (p95 247.1) |
+| anon | 128 | 77.9 | 4.61 | 0.03 | 49.4 | **132.0** (p95 185.1) |
+| anon | 1024 | 78.2 | 18.1 | 0.03 | 49.1 | **145.4** (p95 198.1) |
+| anon | 16384 | 88.8 | 208.1 | 0.03 | 72.9 | **369.8** (p95 468.4) |
 
-**Reading it.** A read through the full gateway costs ≈74 µs for a small file,
-split between local retrieval (`T_vault` ≈33 µs) and request validation/scope
-(`T_filter` validate ≈40 µs); `T_vault` grows with payload size. The PII filter
-is effectively free for non-anonymised modes (~0.07 µs — just the mode check)
+**Reading it.** A read through the full gateway costs ≈132 µs for a small file,
+split between request validation/scope (`T_filter` validate ≈80 µs) and local
+retrieval (`T_vault` ≈50 µs); `T_vault` grows with payload size. The PII filter
+is effectively free for non-anonymised modes (~0.04 µs — just the mode check)
 but becomes the dominant added cost for `ANONYMIZED` reads, scaling with content
-length (≈6.6 µs at 128 B → ≈433 µs at 16 KB). This is the central §3.9.1
+length (≈4.6 µs at 128 B → ≈208 µs at 16 KB). This is the central §3.9.1
 finding: *the security barrier the gateway introduces is sub-millisecond and
 small relative to local retrieval, except for PII sanitisation, whose cost is
 content-proportional and quantifiable* — exactly the trade-off the thesis sets
@@ -84,8 +87,9 @@ headless mirror of the desktop consent policy — not mocks. A least-privilege
 agent (read-only on `public`) and the unscoped Default agent issue the probes.
 "Blocked" = the tool call returns an error.
 
-**Result:** **8 / 8 attacks blocked (100 %)**, 2 / 2 legitimate controls allowed
-(100 % availability), every event recorded to the tamper-evident audit log.
+**Result:** **10 / 10 attacks blocked (100 %)**, 2 / 2 legitimate controls
+allowed (100 % availability), every event recorded to the tamper-evident audit
+log.
 
 | Probe | Class | Description | Real control exercised | Verdict |
 |---|---|---|---|---|
@@ -97,8 +101,20 @@ agent (read-only on `public`) and the unscoped Default agent issue the probes.
 | A6 | attack | enumerate all containers | HITL consent policy | blocked ✓ |
 | A7 | attack | delete a secret outside scope | `enforce_scopes` | blocked ✓ |
 | A8 | attack | unscoped Default agent reads a secret | HITL consent policy | blocked ✓ |
+| A9 | attack | read a `NATIVE` (reserved-mode) container | consent gate + HITL policy | blocked ✓ |
+| A10 | attack | create a `NATIVE` (reserved-mode) container | consent gate + HITL policy | blocked ✓ |
 | C1 | control | read own `public` file (in scope) | — | allowed ✓ |
 | C2 | control | list files in `public` (in scope) | — | allowed ✓ |
+
+**Provenance of A9/A10 (worth a paragraph in the paper).** Live desktop testing
+(2026-07-01) found that `NATIVE`-mode containers silently degraded to promptless
+`DIRECT` access: the gateway's consent gate matched only `APPROVAL`/`OTP`/`ZKP`,
+so the controller that rejects reserved modes was never consulted. The battery
+did not model reserved modes and therefore missed it. The fix routes `NATIVE`
+through the consent gate (`sv-mcp`, regression-tested), and A9/A10 plus four
+`sv-validate` scenarios now guard it in CI. This is a concrete DSR
+build-evaluate iteration: evaluation gap → field finding → design correction →
+expanded evaluation battery.
 
 Block rate is reported as **coverage of the modelled threat set**, not a proof
 of the absence of all bypasses. Broader fuzzing of the JSON-RPC surface is

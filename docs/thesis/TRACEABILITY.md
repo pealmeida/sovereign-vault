@@ -41,7 +41,7 @@ Defined at [`sv-storage/src/lib.rs:100`](../../crates/sv-storage/src/lib.rs#L100
 
 | # | Objective | Evidence | Status |
 |---|---|---|---|
-| 1 | Investigate MCP as a decoupling interface | Rust-native MCP server, stdio + WS, 9 tools, pairing ([ADR-0002](../adr/0002-rust-native-mcp-server.md), [ADR-0006](../adr/0006-mcp-integration.md)) | ✅ |
+| 1 | Investigate MCP as a decoupling interface | Rust-native MCP server, stdio + WS, 15 tools, pairing ([ADR-0002](../adr/0002-rust-native-mcp-server.md), [ADR-0006](../adr/0006-mcp-integration.md)) | ✅ |
 | 2 | Local context vault in a memory-safe language | `forbid(unsafe_code)` workspace-wide ([`Cargo.toml:26`](../../Cargo.toml#L26)); whole vault in Rust | ✅ |
 | 3 | Human-in-the-loop layer for runtime auditing/approval | `apps/desktop` approval/OTP modals + hash-chained `sv-audit` | ✅ |
 | 4 | Evaluate latency + exfiltration-blocking vs. cloud | `apps/thesis-eval` (`latency`, `adversarial`) — see [EVALUATION.md](EVALUATION.md) | ✅ **(new)** |
@@ -67,7 +67,7 @@ Defined at [`sv-storage/src/lib.rs:100`](../../crates/sv-storage/src/lib.rs#L100
 
 | Reference | In the artifact |
 |---|---|
-| MCP (Anthropic, 2024) | `sv-mcp` server, JSON-RPC 2024-11-05, 9 tools |
+| MCP (Anthropic, 2024) | `sv-mcp` server, JSON-RPC 2024-11-05, 15 tools |
 | Local-First (Kleppmann, 2019) | single-machine, no server; data + processing on the device |
 | Memory safety (NSA, 2022) | Rust + `forbid(unsafe_code)` (RQ3 evidence) |
 | Privacy by Design (Cavoukian, 2011) | privacy controls native to the code: `ANONYMIZED` masking, no-key-return transit |
