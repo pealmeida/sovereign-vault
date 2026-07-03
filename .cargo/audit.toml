@@ -1,0 +1,17 @@
+# cargo-audit configuration. CI runs `cargo audit` (see .github/workflows/ci.yml);
+# it reads this file automatically. Keep the ignore list in sync with the
+# [advisories] section of deny.toml, each entry justified.
+
+[advisories]
+ignore = [
+    # quick-xml XML-parsing DoS (RUSTSEC-2026-0194 quadratic attribute scan,
+    # RUSTSEC-2026-0195 unbounded namespace allocation). Reachable ONLY
+    # transitively via plist -> tauri-build / tauri-utils, which parse trusted
+    # build-time config and the macOS Info.plist — never agent-supplied or
+    # network input at runtime. plist 1.9.0 (latest) hard-pins quick-xml
+    # ^0.39.2, so no fixed release exists yet; forcing 0.41 via [patch] breaks
+    # plist's build (0.40 renamed the API). Remove once plist ships a version
+    # on quick-xml >= 0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
