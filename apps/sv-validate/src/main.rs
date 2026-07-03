@@ -87,6 +87,14 @@ async fn main() {
         FAKE_PII,
         "profile.txt",
     );
+    // Reserved mode: any live access must be rejected, never treated as DIRECT.
+    seed_container(
+        &handle,
+        "reserved-native",
+        SecurityMode::Native,
+        "device-bound secret",
+        "secret.txt",
+    );
 
     // A scoped agent: read/list on the `project` container only (containers are
     // flat names, so the glob is the bare name; `project/**` would match only
@@ -413,6 +421,40 @@ async fn main() {
             "APPROVAL read blocked without consent",
             &read,
         ));
+    }
+
+    // ── 7b. Reserved modes — rejected at runtime, never silently DIRECT ──────
+    section("7b. Reserved modes (NATIVE/ZKP) — rejected, not downgraded");
+    {
+        // Regression guard: NATIVE once bypassed the consent gate entirely and
+        // behaved as promptless DIRECT (sv-mcp `needs_consent` omitted it).
+        let read = call!(
+            &default_creds,
+            "vault.read",
+            json!({"container":"reserved-native","file_name":"secret.txt"})
+        );
+        results.push(check_blocked("NATIVE read blocked", &read));
+
+        let write = call!(
+            &default_creds,
+            "vault.write",
+            json!({"container":"reserved-native","file_name":"planted.txt","content_b64": B64.encode(b"x")})
+        );
+        results.push(check_blocked("NATIVE write blocked", &write));
+
+        let create_native = call!(
+            &default_creds,
+            "vault.create_container",
+            json!({"name":"native-new","mode":"NATIVE"})
+        );
+        results.push(check_blocked("NATIVE create blocked", &create_native));
+
+        let create_zkp = call!(
+            &default_creds,
+            "vault.create_container",
+            json!({"name":"zkp-new","mode":"ZKP"})
+        );
+        results.push(check_blocked("ZKP create blocked", &create_zkp));
     }
 
     // ── 8. Outbound brokering (opt-in, secret never returned) ────────────────

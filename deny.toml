@@ -7,7 +7,17 @@
 [advisories]
 # Fail on known-vulnerable / yanked crates. Add IDs here only with a written
 # justification if a fix is genuinely unavailable.
-ignore = []
+ignore = [
+  # quick-xml XML-parsing DoS (quadratic attribute scan / unbounded namespace
+  # alloc). Reachable ONLY transitively via plist -> tauri-build / tauri-utils,
+  # which parse trusted build-time config and macOS Info.plist — never agent-
+  # supplied or network input at runtime. plist 1.9.0 (latest) hard-pins
+  # quick-xml ^0.39.2, so no fixed release exists yet; a [patch] to 0.41 breaks
+  # plist's build (0.40 renamed the API). Remove when plist ships a fix.
+  # Tracked for re-review.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
 
 [bans]
 # Duplicate versions are a warning, not a hard failure (common in large trees).

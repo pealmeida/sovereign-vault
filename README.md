@@ -48,7 +48,7 @@ Built for the single-developer and single-agent-fleet case that server-grade too
 
 - **Single root vault** per OS user, with sub-containers and per-container security modes.
 - **Security modes:** `DIRECT`, `APPROVAL`, `OTP`, and `ANONYMIZED`.
-- **15 default MCP tools:** file/container operations (including `vault.destroy` and a read-only `vault.info`) plus transit-key and signing-key management, encryption/decryption, signing, and verification. Operations are gated by their container's security mode — only `APPROVAL`/`OTP`/`ZKP` raise a desktop prompt; `DIRECT` and key operations run without one. Optional broker-secret management and `vault.broker_request` are gated behind `SV_ENABLE_BROKER=1`.
+- **15 default MCP tools:** file/container operations (including `vault.destroy` and a read-only `vault.info`) plus transit-key and signing-key management, encryption/decryption, signing, and verification. Operations are gated by their container's security mode — `APPROVAL`/`OTP` raise a desktop prompt; `DIRECT` and key operations run without one; the reserved `ZKP`/`NATIVE` modes are rejected at runtime. Optional broker-secret management and `vault.broker_request` are gated behind `SV_ENABLE_BROKER=1`.
 - **Key hierarchy:** an OS-keychain key or passphrase wraps a rotatable data key.
 - **Keychain custody hardening:** vault-root-scoped keychain entries, backend availability probing, passphrase-to-keychain migration, and recovery-based repair of broken keychain wrappers.
 - **Per-agent identity and scopes** managed from the desktop.
