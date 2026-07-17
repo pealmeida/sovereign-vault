@@ -31,6 +31,9 @@ export interface VaultStatus {
 
 export interface VaultInitResponse {
   recovery_phrase: string;
+  /** Non-sensitive warning when the vault is initialised but local
+   *  MCP/HTTP servers could not be started. `undefined` otherwise. */
+  gateway_warning?: string;
 }
 
 export interface ApprovalPrompt {

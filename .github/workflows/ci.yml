@@ -152,6 +152,10 @@ jobs:
         working-directory: ui
         run: npm ci
 
+      - name: Audit UI dependencies
+        working-directory: ui
+        run: npm audit --audit-level=moderate
+
       - name: svelte-check
         working-directory: ui
         run: npm run check

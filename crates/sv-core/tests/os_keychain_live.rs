@@ -169,7 +169,7 @@ fn passphrase_vault_can_move_to_os_keychain() {
     };
 
     let bootstrap =
-        VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("move-me")).unwrap();
+        VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("move-me-passphrase")).unwrap();
     let mut handle = bootstrap.handle;
     handle
         .create_container("direct", SecurityMode::Direct, None)

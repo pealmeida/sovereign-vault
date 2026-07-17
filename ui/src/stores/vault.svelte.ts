@@ -3,14 +3,17 @@ import type { VaultStatus, Custody, VaultInitResponse } from '../lib/types';
 
 let status = $state<VaultStatus | null>(null);
 let recoveryPhrase = $state('');
+let gatewayWarning = $state<string | undefined>(undefined);
 let loading = $state(false);
 
 export const vaultStore = {
   get status() { return status; },
   get recoveryPhrase() { return recoveryPhrase; },
+  get gatewayWarning() { return gatewayWarning; },
   get loading() { return loading; },
 
   clearRecoveryPhrase() { recoveryPhrase = ''; },
+  clearGatewayWarning() { gatewayWarning = undefined; },
 
   async refresh() {
     status = await invoke<VaultStatus>('vault_status');
@@ -21,7 +24,9 @@ export const vaultStore = {
     try {
       const res = await invoke<VaultInitResponse>('vault_init', { custody, passphrase });
       recoveryPhrase = res.recovery_phrase;
+      gatewayWarning = res.gateway_warning;
       await this.refresh();
+      return res.gateway_warning;
     } finally {
       loading = false;
     }
@@ -48,8 +53,13 @@ export const vaultStore = {
   },
 
   async lock() {
-    await invoke<void>('vault_lock');
-    await this.refresh();
+    try {
+      await invoke<void>('vault_lock');
+      await this.refresh();
+    } finally {
+      recoveryPhrase = '';
+      gatewayWarning = undefined;
+    }
   },
 
   async changePassphrase(current: string, next: string) {
@@ -66,6 +76,7 @@ export const vaultStore = {
     try {
       const res = await invoke<VaultInitResponse>('vault_rotate_key', { passphrase });
       recoveryPhrase = res.recovery_phrase;
+      gatewayWarning = res.gateway_warning;
       await this.refresh();
       return res.recovery_phrase;
     } finally {

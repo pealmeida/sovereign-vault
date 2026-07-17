@@ -20,16 +20,23 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
-use hyper::header::CONTENT_TYPE;
+use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::json;
 use thiserror::Error;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
+
+const MAX_HTTP_CONNECTIONS: usize = 32;
+const MAX_HTTP_HEADERS: usize = 32;
+const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// HTTP layer errors.
 #[derive(Debug, Error)]
@@ -85,6 +92,7 @@ impl HttpServer {
         }
         tracing::info!(%addr, "HTTP listening");
         let secret = self.pairing_secret.clone();
+        let connection_limit = Arc::new(Semaphore::new(MAX_HTTP_CONNECTIONS));
         loop {
             tokio::select! {
                 _ = &mut shutdown => {
@@ -100,18 +108,40 @@ impl HttpServer {
                         tracing::warn!(?peer, "rejecting non-loopback peer");
                         continue;
                     }
+                    let permit = match connection_limit.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            tracing::warn!(?peer, "rejecting HTTP connection: limit reached");
+                            continue;
+                        }
+                    };
                     let secret = secret.clone();
                     let io = TokioIo::new(stream);
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let svc = service_fn(move |req| {
                             let secret = secret.clone();
                             async move { Ok::<_, Infallible>(handle(req, &secret).await) }
                         });
-                        if let Err(e) = hyper::server::conn::http1::Builder::new()
-                            .serve_connection(io, svc)
-                            .await
+                        let mut builder = hyper::server::conn::http1::Builder::new();
+                        builder
+                            .timer(TokioTimer::new())
+                            .header_read_timeout(HTTP_HEADER_TIMEOUT)
+                            .max_headers(MAX_HTTP_HEADERS)
+                            .keep_alive(false);
+                        match tokio::time::timeout(
+                            HTTP_CONNECTION_TIMEOUT,
+                            builder.serve_connection(io, svc),
+                        )
+                        .await
                         {
-                            tracing::debug!(error=%e, "http conn closed");
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                tracing::debug!(%error, "http conn closed");
+                            }
+                            Err(_) => {
+                                tracing::debug!("http connection timed out");
+                            }
                         }
                     });
                 }
@@ -121,6 +151,12 @@ impl HttpServer {
 }
 
 async fn handle(req: Request<Incoming>, pairing_secret: &str) -> Response<Full<Bytes>> {
+    if !host_is_loopback(&req) {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &json!({ "error": "forbidden: non-loopback host" }),
+        );
+    }
     if req.method() != Method::GET {
         return json_response(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -139,14 +175,6 @@ async fn handle(req: Request<Incoming>, pairing_secret: &str) -> Response<Full<B
         ),
         "/.well-known/agent.json" => json_response(StatusCode::OK, &agent_card()),
         "/.well-known/mcp-pairing" => {
-            // Defence in depth: even though we bound to loopback, double-check
-            // the Host header is loopback-y.
-            if !host_is_loopback(&req) {
-                return json_response(
-                    StatusCode::FORBIDDEN,
-                    &json!({ "error": "forbidden: non-loopback host" }),
-                );
-            }
             json_response(StatusCode::OK, &json!({ "secret": pairing_secret }))
         }
         _ => json_response(StatusCode::NOT_FOUND, &json!({ "error": "not found" })),
@@ -154,15 +182,37 @@ async fn handle(req: Request<Incoming>, pairing_secret: &str) -> Response<Full<B
 }
 
 fn host_is_loopback(req: &Request<Incoming>) -> bool {
-    match req
-        .headers()
-        .get(hyper::header::HOST)
-        .and_then(|h| h.to_str().ok())
-    {
-        Some(host) => host.starts_with("localhost") || host.starts_with("127.0.0.1"),
+    let mut hosts = req.headers().get_all(hyper::header::HOST).iter();
+    let Some(host) = hosts.next().and_then(|value| value.to_str().ok()) else {
         // No Host header = HTTP/1.0 client; reject for safety.
-        None => false,
-    }
+        return false;
+    };
+    hosts.next().is_none() && authority_is_loopback(host)
+}
+
+fn authority_is_loopback(authority: &str) -> bool {
+    let authority = authority.trim();
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, suffix)) = rest.split_once(']') else {
+            return false;
+        };
+        if !suffix.is_empty() && (!suffix.starts_with(':') || suffix[1..].parse::<u16>().is_err()) {
+            return false;
+        }
+        host
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if port.parse::<u16>().is_err() {
+            return false;
+        }
+        host
+    } else {
+        authority
+    };
+
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn json_response(status: StatusCode, body: &serde_json::Value) -> Response<Full<Bytes>> {
@@ -170,6 +220,8 @@ fn json_response(status: StatusCode, body: &serde_json::Value) -> Response<Full<
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "application/json")
+        .header(CACHE_CONTROL, "no-store")
+        .header(X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(Full::new(Bytes::from(bytes)))
         .unwrap()
 }
@@ -203,4 +255,77 @@ fn agent_card() -> serde_json::Value {
 /// Crate version string.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn loopback_authority_requires_an_exact_host() {
+        for allowed in [
+            "localhost",
+            "localhost:9943",
+            "127.0.0.1:9943",
+            "[::1]:9943",
+        ] {
+            assert!(authority_is_loopback(allowed), "{allowed}");
+        }
+        for denied in [
+            "localhost.example.com",
+            "localhost.example.com:9943",
+            "127.0.0.1.example.com",
+            "[::1]example.com",
+            "localhost:",
+            "https://localhost:9943",
+            "user@localhost:9943",
+        ] {
+            assert!(!authority_is_loopback(denied), "{denied}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prebound_non_loopback_listener_is_rejected() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let error = HttpServer::new("secret")
+            .serve_listener(listener, shutdown_rx)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HttpError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn every_endpoint_rejects_a_rebinding_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            HttpServer::new("never-expose")
+                .serve_listener(listener, shutdown_rx)
+                .await
+                .unwrap();
+        });
+
+        for path in [
+            "/health",
+            "/.well-known/agent.json",
+            "/.well-known/mcp-pairing",
+        ] {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let request = format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost.attacker.example\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 403"), "{path}: {response}");
+            assert!(!response.contains("never-expose"));
+        }
+
+        let _ = shutdown_tx.send(());
+        task.await.unwrap();
+    }
 }

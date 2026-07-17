@@ -1,6 +1,6 @@
 # Threat model — Sovereign Vault
 
-Status: living document · pre-alpha (v0.0.0). This describes what Sovereign
+Status: living document · early release (v0.1.0). This describes what Sovereign
 Vault defends against, what it explicitly does **not**, and the residual risks
 you accept by using it today.
 
@@ -23,8 +23,9 @@ you accept by using it today.
    desktop Approve (or a cross-channel OTP) before they complete.
 4. **Use-without-exposure** — transit `encrypt`/`decrypt`/`sign` and the broker
    let an agent *use* a key without ever receiving its bytes.
-5. **Tamper-evidence** — every operation is recorded in an append-only,
-   hash-chained log; tampering breaks the chain at a detectable index.
+5. **Tamper-evidence** — security-sensitive operations are recorded in an
+   HMAC-authenticated log and checkpoint; modification, deletion, or truncation
+   causes verification to fail before an unlocked desktop session is accepted.
 
 ## 2. Trust boundaries
 
@@ -54,20 +55,30 @@ The headline threat: an agent the user connected turns hostile or is hijacked.
 - **Audit** — every call is logged with the agent id.
 
 ### B. Another local process / local malware (vault unlocked)
-- Servers are loopback-bound and require the per-launch pairing secret; a random
-  local process cannot pair without it.
+- Loopback binding and browser-origin checks block remote and cross-origin web
+  callers. However, `/.well-known/mcp-pairing` exposes the per-launch shared
+  secret without authentication to support `mcp-stdio`, so an arbitrary local
+  process can fetch it and pair while the vault is unlocked.
+- Scoped agent tokens provide identity, least privilege, and revocation for
+  configured agents; they do not turn the local same-user process boundary into
+  an untrusted boundary.
 - **Residual risk:** a process running as the same OS user with the vault
   unlocked is largely inside the trust boundary (it can read the keychain entry,
   scrape memory, or read a session-cached `.env`). Sovereign Vault does not
   defend a fully-compromised local account. Lock when away.
 
 ### C. Disk / backup theft (vault locked)
-- All container files and material are sealed with XChaCha20-Poly1305; keys are
-  wrapped by a KEK derived via Argon2id (passphrase) or stored in the OS
-  keychain. Without the passphrase/keychain/recovery phrase, the ciphertext is
-  not recoverable.
+- All container file contents and secret key material are sealed with
+  XChaCha20-Poly1305; keys are wrapped by a KEK derived via Argon2id
+  (passphrase) or stored in the OS keychain. Without the
+  passphrase/keychain/recovery phrase, the ciphertext is not recoverable.
+- **Metadata is not confidential:** logical container/file names are visible in
+  paths, modes and descriptions are plaintext in `manifest.json`, and encrypted
+  blob sizes and filesystem timestamps remain visible.
 - Audit log container/file names are **HMAC hashes**, not plaintext, so the log
-  doesn't leak which containers/files exist.
+  does not directly disclose those names. Other audit metadata (actions,
+  outcomes, transport, mode, sizes, and timestamps) is authenticated but not
+  encrypted.
 
 ### D. SSRF / exfiltration via the broker
 - The broker is **off by default** (`SV_ENABLE_BROKER=1` to enable; the tool is
@@ -78,8 +89,13 @@ The headline threat: an agent the user connected turns hostile or is hijacked.
   headers are never returned to the agent (ADR-0009).
 
 ### E. Audit-log tampering
-- The log is append-only and hash-chained; `verify_chain` reports the first
-  broken index. Editing or deleting a line is detectable.
+- Records and the durable checkpoint are HMAC-SHA256 authenticated and form one
+  MAC chain across active and rotated segments. Desktop unlock opens and fully
+  verifies this state; missing, edited, deleted, or truncated state fails closed.
+- A checkpoint stored beside the log cannot distinguish a complete, internally
+  consistent rollback of the entire audit directory. Rollback detection needs
+  an external trusted anchor such as the OS keychain or a remote transparency
+  service.
 
 ### F. Supply chain
 - CI runs `cargo audit` (RUSTSEC) and `cargo deny` on every change and weekly;
@@ -102,11 +118,20 @@ The headline threat: an agent the user connected turns hostile or is hijacked.
 
 - **Session cache** (`clients/*`, opt-in) writes *decrypted* secrets to a `0600`
   temp file for its TTL — partially defeats the vault. Off by default; documented.
-- **UI-origin audit events** (`record_desktop_event`) are not yet HMAC-keyed like
-  the MCP path — follow-up.
+- **Failed credential attempts** cannot enter the trusted audit stream because
+  its authentication key is available only after successful credential or
+  recovery verification. Host authentication telemetry is required to monitor
+  those failures.
+- **Bootstrap pre-key activity** cannot be authenticated until initial key
+  establishment creates the audit identity key. The bootstrap audit intent is
+  therefore recorded immediately after that key becomes available.
+- **Metadata confidentiality** is not provided for logical path names, manifest
+  modes/descriptions, ciphertext sizes, or filesystem timestamps.
+- **Complete audit snapshot rollback** is not detectable without an external
+  trusted checkpoint anchor.
 - **Unsigned builds** (pre-1.0): no code-signing/notarization yet; verify your
   build provenance. Tracked for the first signed release.
-- **No independent security audit** has been performed. Pre-alpha.
+- **No independent security audit** has been performed. Early release.
 
 ## 6. Reporting
 

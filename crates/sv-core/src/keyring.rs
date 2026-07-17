@@ -16,11 +16,16 @@
 //! bytes are encrypted under the KEK.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64_URL},
+    Engine as _,
+};
 use serde::{Deserialize, Serialize};
 use sv_crypto::{open as aead_open, seal as aead_seal, MasterKey, MASTER_KEY_LEN};
 
@@ -28,6 +33,9 @@ use crate::CoreError;
 
 /// Filename of the keyring inside the vault root.
 pub const KEYRING_FILE: &str = "keyring.svault";
+
+/// Staged keyring used by custody transactions before the commit rename.
+pub const STAGED_KEYRING_FILE: &str = ".keyring.svault.next";
 
 /// AAD bound into every wrapped-DEK envelope.
 const KEYRING_AAD: &[u8] = b"sv-keyring-v1";
@@ -53,7 +61,7 @@ struct KeyringFile {
 
 /// Whether a `keyring.svault` is present at `root`.
 pub fn exists(root: &Path) -> bool {
-    root.join(KEYRING_FILE).exists()
+    fs::symlink_metadata(root.join(KEYRING_FILE)).is_ok()
 }
 
 /// The unwrapped contents of a keyring: every DEK version available, plus the
@@ -79,24 +87,98 @@ fn keyring_path(root: &Path) -> PathBuf {
     root.join(KEYRING_FILE)
 }
 
-fn read_keyring(root: &Path) -> Result<KeyringFile> {
-    let raw = fs::read(keyring_path(root))?;
+fn read_keyring_file(path: &Path) -> Result<KeyringFile> {
+    ensure_regular_file(path, "keyring")?;
+    let raw = fs::read(path)?;
     let kr: KeyringFile =
         serde_json::from_slice(&raw).map_err(|e| CoreError::Misuse(format!("keyring: {e}")))?;
+    if kr.version != KEYRING_SCHEMA {
+        return Err(CoreError::Misuse(format!(
+            "unsupported keyring schema: {}",
+            kr.version
+        )));
+    }
     Ok(kr)
 }
 
+fn read_keyring(root: &Path) -> Result<KeyringFile> {
+    ensure_directory(root, "vault root")?;
+    read_keyring_file(&keyring_path(root))
+}
+
 fn write_keyring(root: &Path, kr: &KeyringFile) -> Result<()> {
-    let path = keyring_path(root);
-    let tmp = root.join(".keyring.svault.tmp");
+    write_keyring_to(root, &keyring_path(root), kr)
+}
+
+fn write_keyring_to(root: &Path, path: &Path, kr: &KeyringFile) -> Result<()> {
+    ensure_directory(root, "vault root")?;
+    ensure_destination_is_regular_or_missing(path, "keyring destination")?;
     let bytes =
         serde_json::to_vec_pretty(kr).map_err(|e| CoreError::Misuse(format!("keyring: {e}")))?;
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| CoreError::Misuse("keyring path has an invalid filename".into()))?;
+    let (tmp, mut file) = create_secure_temp(root, name)?;
+    let result = (|| -> Result<()> {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        ensure_destination_is_regular_or_missing(path, "keyring destination")?;
+        atomicwrites::replace_atomic(&tmp, path)?;
+        sync_parent(root)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, &path)?;
+    result
+}
+
+fn write_staged_keyring(root: &Path, kr: &KeyringFile) -> Result<()> {
+    write_keyring_to(root, &root.join(STAGED_KEYRING_FILE), kr)
+}
+
+fn create_secure_temp(root: &Path, name: &str) -> Result<(PathBuf, fs::File)> {
+    for _ in 0..16 {
+        let suffix = B64_URL.encode(sv_crypto::random_bytes(12)?);
+        let path = root.join(format!(".{name}.{suffix}.tmp"));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(CoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique keyring temp file",
+    )))
+}
+
+#[cfg(unix)]
+fn sync_parent(root: &Path) -> Result<()> {
+    fs::File::open(root)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_parent(root: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root)?
+        .sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_parent(_root: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -178,6 +260,10 @@ pub fn migrate_legacy(root: &Path, legacy_key: &MasterKey) -> Result<()> {
 /// Unwrap every DEK in the keyring using `kek`.
 pub fn load(root: &Path, kek: &MasterKey) -> Result<Unwrapped> {
     let kr = read_keyring(root)?;
+    unwrap_keyring(&kr, kek)
+}
+
+fn unwrap_keyring(kr: &KeyringFile, kek: &MasterKey) -> Result<Unwrapped> {
     let mut keys = BTreeMap::new();
     for entry in &kr.entries {
         if entry.dek_version < kr.min_decryption_version {
@@ -213,6 +299,97 @@ pub fn rewrap_under_new_kek(root: &Path, old_kek: &MasterKey, new_kek: &MasterKe
     write_keyring(root, &kr)
 }
 
+/// Prepare a replacement keyring under `new_kek` without changing the live
+/// keyring. The staged file is durable before this function returns.
+pub fn stage_rewrap_under_new_kek(
+    root: &Path,
+    old_kek: &MasterKey,
+    new_kek: &MasterKey,
+) -> Result<()> {
+    let mut kr = read_keyring(root)?;
+    for entry in &mut kr.entries {
+        let dek = unwrap(old_kek, &entry.wrapped_b64)?;
+        entry.wrapped_b64 = wrap(new_kek, &dek)?;
+    }
+    write_staged_keyring(root, &kr)
+}
+
+/// Test whether the staged custody keyring unwraps under `kek`.
+pub fn load_staged(root: &Path, kek: &MasterKey) -> Result<Unwrapped> {
+    ensure_directory(root, "vault root")?;
+    let kr = read_keyring_file(&root.join(STAGED_KEYRING_FILE))?;
+    unwrap_keyring(&kr, kek)
+}
+
+/// Atomically promote the staged custody keyring to the live keyring.
+pub fn commit_staged(root: &Path) -> Result<()> {
+    ensure_directory(root, "vault root")?;
+    let staged = root.join(STAGED_KEYRING_FILE);
+    let destination = keyring_path(root);
+    ensure_regular_file(&staged, "staged keyring")?;
+    ensure_destination_is_regular_or_missing(&destination, "keyring destination")?;
+    atomicwrites::replace_atomic(&staged, &destination)?;
+    sync_parent(root)
+}
+
+/// Remove any uncommitted staged custody keyring.
+pub fn discard_staged(root: &Path) -> Result<()> {
+    ensure_directory(root, "vault root")?;
+    let staged = root.join(STAGED_KEYRING_FILE);
+    match fs::symlink_metadata(&staged) {
+        Ok(_) => ensure_regular_file(&staged, "staged keyring")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    match fs::remove_file(staged) {
+        Ok(()) => sync_parent(root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn ensure_directory(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CoreError::Misuse(format!("{label} does not exist: {}", path.display()))
+        } else {
+            error.into()
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(CoreError::Misuse(format!(
+            "{label} is not a real directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_regular_file(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CoreError::Misuse(format!("{label} does not exist: {}", path.display()))
+        } else {
+            error.into()
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(CoreError::Misuse(format!(
+            "{label} is not a regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_destination_is_regular_or_missing(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => ensure_regular_file(path, label),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Add `new_dek` as a new version and mark it active. Returns the new version
 /// number. Old versions are retained (for reading not-yet-migrated files)
 /// until [`retire_below`] is called.
@@ -234,5 +411,35 @@ pub fn retire_below(root: &Path, min: u32) -> Result<()> {
     let mut kr = read_keyring(root)?;
     kr.entries.retain(|e| e.dek_version >= min);
     kr.min_decryption_version = min;
+    write_keyring(root, &kr)
+}
+
+/// Change only the active version while retaining every DEK entry.
+pub fn set_active_version(root: &Path, version: u32) -> Result<()> {
+    let mut kr = read_keyring(root)?;
+    if !kr.entries.iter().any(|entry| entry.dek_version == version) {
+        return Err(CoreError::Misuse(format!(
+            "keyring has no DEK version {version}"
+        )));
+    }
+    kr.active_dek_version = version;
+    write_keyring(root, &kr)
+}
+
+/// Remove a non-active DEK version after a transaction rollback.
+pub fn remove_version(root: &Path, version: u32) -> Result<()> {
+    let mut kr = read_keyring(root)?;
+    if kr.active_dek_version == version {
+        return Err(CoreError::Misuse(
+            "cannot remove the active DEK version".into(),
+        ));
+    }
+    kr.entries.retain(|entry| entry.dek_version != version);
+    kr.min_decryption_version = kr
+        .entries
+        .iter()
+        .map(|entry| entry.dek_version)
+        .min()
+        .unwrap_or(1);
     write_keyring(root, &kr)
 }

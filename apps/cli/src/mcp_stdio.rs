@@ -1,10 +1,12 @@
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::codec::{FramedRead, LinesCodec};
 
 const VAULT_HTTP: &str = "http://127.0.0.1:9943";
 const VAULT_WS: &str = "ws://127.0.0.1:9944";
+const MAX_STDIO_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PairingMode {
@@ -53,15 +55,17 @@ pub async fn run_mcp_stdio() -> Result<(), String> {
         None => return Err("ws closed during pair".into()),
     }
 
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+    let mut lines = FramedRead::new(
+        tokio::io::stdin(),
+        LinesCodec::new_with_max_length(MAX_STDIO_FRAME_BYTES),
+    );
     let mut stdout = tokio::io::stdout();
 
     loop {
         tokio::select! {
-            line = lines.next_line() => {
+            line = lines.next() => {
                 match line {
-                    Ok(Some(l)) => {
+                    Some(Ok(l)) => {
                         let l = l.trim();
                         if l.is_empty() {
                             continue;
@@ -70,11 +74,11 @@ pub async fn run_mcp_stdio() -> Result<(), String> {
                             return Err(format!("ws send: {e}"));
                         }
                     }
-                    Ok(None) => {
+                    None => {
                         let _ = sink.send(Message::Close(None)).await;
                         return Ok(());
                     }
-                    Err(e) => return Err(format!("stdin: {e}")),
+                    Some(Err(e)) => return Err(format!("stdin frame rejected: {e}")),
                 }
             }
             msg = source.next() => {
@@ -228,5 +232,16 @@ mod tests {
         assert_eq!(request["params"]["agent_id"], "ag_1");
         assert_eq!(request["params"]["token"], "tok");
         assert!(request["params"].get("secret").is_none());
+    }
+
+    #[tokio::test]
+    async fn stdio_rejects_oversized_request_frame() {
+        let input = vec![b'x'; MAX_STDIO_FRAME_BYTES + 1];
+        let mut frames = FramedRead::new(
+            input.as_slice(),
+            LinesCodec::new_with_max_length(MAX_STDIO_FRAME_BYTES),
+        );
+
+        assert!(matches!(frames.next().await, Some(Err(_))));
     }
 }

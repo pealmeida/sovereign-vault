@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { Eye, EyeOff, FolderOpen } from 'lucide-svelte';
+  import { Eye, EyeOff, FolderOpen } from '@lucide/svelte';
   import CopyButton from '../components/CopyButton.svelte';
   import { vaultStore } from '../stores/vault.svelte';
   import { mcpStore } from '../stores/mcp.svelte';
@@ -91,30 +91,50 @@
 
   let currentPass = $state('');
   let newPass = $state('');
+  let confirmNewPass = $state('');
   let rotatePass = $state('');
 
+  // Mirrors sv_core::MIN_PASSPHRASE_CHARS; backend validation is authoritative.
+  const MIN_PASSPHRASE_CHARS = 16;
+
   const isPassphrase = $derived(vaultStore.status?.custody === 'Passphrase');
+  let newPassTooShort = $derived(Array.from(newPass).length < MIN_PASSPHRASE_CHARS);
+  let newPassMismatch = $derived(
+    confirmNewPass.length > 0 && newPass !== confirmNewPass
+  );
+  let showNewPassTooShort = $derived(newPass.length > 0 && newPassTooShort);
+  let canChangePassphrase = $derived(
+    !vaultStore.loading
+      && currentPass.length > 0
+      && !newPassTooShort
+      && newPass === confirmNewPass
+  );
 
   async function changePassphrase() {
+    if (!canChangePassphrase) return;
+
     try {
       await vaultStore.changePassphrase(currentPass, newPass);
-      currentPass = '';
-      newPass = '';
       toastStore.setNotice('Passphrase changed. Recovery phrase is unaffected.');
     } catch (e) {
       toastStore.setError(e);
+    } finally {
+      currentPass = '';
+      newPass = '';
+      confirmNewPass = '';
     }
   }
 
   async function rotateKey() {
     try {
       const phrase = await vaultStore.rotateKey(isPassphrase ? rotatePass : null);
-      rotatePass = '';
       recoveryData = phrase;
       revealPhrase = true;
       toastStore.setNotice('Key rotated. A new recovery phrase was issued — save it.');
     } catch (e) {
       toastStore.setError(e);
+    } finally {
+      rotatePass = '';
     }
   }
 
@@ -131,7 +151,13 @@
     }
   });
 
-  function loadRecovery() {
+  function toggleRecovery() {
+    if (revealPhrase) {
+      revealPhrase = false;
+      recoveryData = null;
+      return;
+    }
+
     if (vaultStore.recoveryPhrase) {
       recoveryData = vaultStore.recoveryPhrase;
       revealPhrase = true;
@@ -210,9 +236,9 @@
       </div>
 
       <div style="display:flex;gap:0.75rem;margin-top:1rem;flex-wrap:wrap">
-        <button class="ghost-button" onclick={loadRecovery}>
+        <button class="ghost-button" onclick={toggleRecovery}>
           {#if revealPhrase}<EyeOff size={14} />{:else}<Eye size={14} />{/if}
-          Show recovery phrase
+          {revealPhrase ? 'Hide recovery phrase' : 'Show recovery phrase'}
         </button>
       </div>
 
@@ -256,9 +282,29 @@
               bind:value={newPass}
               autocomplete="new-password"
             />
+            <input
+              class="text-input"
+              type="password"
+              placeholder="Confirm new passphrase"
+              bind:value={confirmNewPass}
+              autocomplete="new-password"
+            />
+            <p
+              style="font-size:0.8rem;margin:0.25rem 0 0"
+              class:passphrase-error={showNewPassTooShort || newPassMismatch}
+              aria-live="polite"
+            >
+              {#if showNewPassTooShort}
+                Use at least {MIN_PASSPHRASE_CHARS} characters.
+              {:else if newPassMismatch}
+                Passphrases do not match.
+              {:else}
+                Minimum {MIN_PASSPHRASE_CHARS} characters.
+              {/if}
+            </p>
             <button
               class="primary-button"
-              disabled={vaultStore.loading || !currentPass || !newPass}
+              disabled={!canChangePassphrase}
               onclick={changePassphrase}
             >
               Change passphrase
@@ -546,3 +592,9 @@
 
   </div>
 </div>
+
+<style>
+  .passphrase-error {
+    color: var(--red);
+  }
+</style>

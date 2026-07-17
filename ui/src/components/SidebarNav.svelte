@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { FolderLock, Files, Settings2, ShieldCheck, Lock } from 'lucide-svelte';
+  import { FolderLock, Files, Settings2, ShieldCheck, Lock } from '@lucide/svelte';
   import { router, push } from 'svelte-spa-router';
   import { vaultStore } from '../stores/vault.svelte';
   import { toastStore } from '../stores/toast.svelte';

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use sv_core::sv_crypto::{random_bytes, MasterKey};
 use sv_core::sv_storage::{SecurityMode, Vault};
-use sv_core::{keyring, sv_recovery, transit, CustodyMode, VaultHandle};
+use sv_core::{keyring, material_wrap_for_dek, sv_recovery, transit, CustodyMode, VaultHandle};
 
 fn tmp_dir(label: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -22,27 +22,98 @@ fn tmp_dir(label: &str) -> PathBuf {
 #[test]
 fn audit_hmac_key_stable_across_unlocks() {
     let root = tmp_dir("audithmac");
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("hunter2-is-not-a-real-password"),
+    )
+    .unwrap();
     let k1 = boot.handle.audit_hmac_key();
     drop(boot.handle);
 
-    let h = VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    let h = VaultHandle::unlock(
+        &root,
+        CustodyMode::Passphrase,
+        Some("hunter2-is-not-a-real-password"),
+    )
+    .unwrap();
     let k2 = h.audit_hmac_key();
     assert_eq!(k1, k2);
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
+fn identity_keys_and_agent_tokens_survive_all_lifecycle_changes() {
+    let root = tmp_dir("identity-stability");
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("identity-passphrase-before-change"),
+    )
+    .unwrap();
+    let mut handle = boot.handle;
+    let audit_key = handle.audit_hmac_key();
+    let agent_key = handle.agent_token_key();
+    let (agent_id, token) = handle.create_agent("stable-agent", Vec::new()).unwrap();
+
+    handle
+        .change_passphrase(
+            &root,
+            "identity-passphrase-before-change",
+            "identity-passphrase-after-change",
+        )
+        .unwrap();
+    assert_eq!(handle.audit_hmac_key(), audit_key);
+    assert_eq!(handle.agent_token_key(), agent_key);
+    handle.authenticate_agent(&agent_id, &token).unwrap();
+
+    let recovery_phrase = handle
+        .rotate_key(&root, Some("identity-passphrase-after-change"))
+        .unwrap();
+    assert_eq!(handle.audit_hmac_key(), audit_key);
+    assert_eq!(handle.agent_token_key(), agent_key);
+    handle.authenticate_agent(&agent_id, &token).unwrap();
+    drop(handle);
+
+    let unlocked = VaultHandle::unlock(
+        &root,
+        CustodyMode::Passphrase,
+        Some("identity-passphrase-after-change"),
+    )
+    .unwrap();
+    assert_eq!(unlocked.audit_hmac_key(), audit_key);
+    assert_eq!(unlocked.agent_token_key(), agent_key);
+    unlocked.authenticate_agent(&agent_id, &token).unwrap();
+    drop(unlocked);
+
+    let recovered = VaultHandle::unlock_with_recovery(&root, &recovery_phrase).unwrap();
+    assert_eq!(recovered.audit_hmac_key(), audit_key);
+    assert_eq!(recovered.agent_token_key(), agent_key);
+    recovered.authenticate_agent(&agent_id, &token).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn passphrase_bootstrap_then_unlock_roundtrip() {
     let root = tmp_dir("bootstrap");
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("hunter2-is-not-a-real-password"),
+    )
+    .unwrap();
     boot.handle
         .create_container("notes", SecurityMode::Direct, None)
         .unwrap();
     boot.handle.write_file("notes", "a.txt", b"secret").unwrap();
     drop(boot.handle);
 
-    let h = VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    let h = VaultHandle::unlock(
+        &root,
+        CustodyMode::Passphrase,
+        Some("hunter2-is-not-a-real-password"),
+    )
+    .unwrap();
     assert_eq!(h.read_file("notes", "a.txt").unwrap(), b"secret");
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -50,7 +121,12 @@ fn passphrase_bootstrap_then_unlock_roundtrip() {
 #[test]
 fn bootstrap_refuses_existing_vault_disk_state() {
     let root = tmp_dir("bootstrap-refuses-disk");
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("hunter2-is-not-a-real-password"),
+    )
+    .unwrap();
     drop(boot);
 
     let err = match VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("new-pass")) {
@@ -65,6 +141,23 @@ fn bootstrap_refuses_existing_vault_disk_state() {
 }
 
 #[test]
+fn bootstrap_rejects_short_new_passphrase_without_initializing() {
+    let root = tmp_dir("bootstrap-short-passphrase");
+    let error = match VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("too-short")) {
+        Ok(_) => panic!("short passphrase must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("at least 16 characters"),
+        "{error}"
+    );
+    assert!(!root.join("manifest.json").exists());
+    assert!(!root.join("keyring.svault").exists());
+    assert!(!root.join(".lifecycle.json").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn stale_passphrase_salt_without_vault_state_does_not_block_bootstrap() {
     let root = tmp_dir("bootstrap-stale-salt");
     std::fs::create_dir_all(&root).unwrap();
@@ -74,14 +167,24 @@ fn stale_passphrase_salt_without_vault_state_does_not_block_bootstrap() {
     )
     .unwrap();
 
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("hunter2-is-not-a-real-password"),
+    )
+    .unwrap();
     boot.handle
         .create_container("notes", SecurityMode::Direct, None)
         .unwrap();
     boot.handle.write_file("notes", "a.txt", b"secret").unwrap();
     drop(boot.handle);
 
-    let h = VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    let h = VaultHandle::unlock(
+        &root,
+        CustodyMode::Passphrase,
+        Some("hunter2-is-not-a-real-password"),
+    )
+    .unwrap();
     assert_eq!(h.read_file("notes", "a.txt").unwrap(), b"secret");
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -89,7 +192,12 @@ fn stale_passphrase_salt_without_vault_state_does_not_block_bootstrap() {
 #[test]
 fn passphrase_probe_does_not_report_unrelated_keychain_entry() {
     let root = tmp_dir("probe-passphrase-keychain");
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("hunter2-is-not-a-real-password"),
+    )
+    .unwrap();
     drop(boot);
 
     let probe = sv_core::probe(&root).unwrap();
@@ -102,7 +210,12 @@ fn passphrase_probe_does_not_report_unrelated_keychain_entry() {
 #[test]
 fn passphrase_vault_rejects_os_keychain_unlock_with_clear_error() {
     let root = tmp_dir("passphrase-rejects-keychain");
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("hunter2-is-not-a-real-password"),
+    )
+    .unwrap();
     drop(boot);
 
     let err = match VaultHandle::unlock(&root, CustodyMode::OsKeychain, None) {
@@ -116,7 +229,12 @@ fn passphrase_vault_rejects_os_keychain_unlock_with_clear_error() {
 #[test]
 fn fresh_vault_roundtrips_multiple_modes_and_file_extensions() {
     let root = tmp_dir("mode-extension-matrix");
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("matrix-pass")).unwrap();
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("matrix-passphrase-for-tests"),
+    )
+    .unwrap();
     let handle = boot.handle;
 
     let modes = [
@@ -153,8 +271,12 @@ fn fresh_vault_roundtrips_multiple_modes_and_file_extensions() {
     }
     drop(handle);
 
-    let unlocked =
-        VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("matrix-pass")).unwrap();
+    let unlocked = VaultHandle::unlock(
+        &root,
+        CustodyMode::Passphrase,
+        Some("matrix-passphrase-for-tests"),
+    )
+    .unwrap();
     for (container, mode) in modes {
         assert_eq!(unlocked.container_mode(container).unwrap(), mode);
         let listed = unlocked.list_files(container).unwrap();
@@ -184,7 +306,17 @@ fn legacy_vault_migrates_and_reads_old_files() {
     }
     assert!(!root.join("keyring.svault").exists());
 
-    // Unlock through the high-level handle: should migrate, then read.
+    // Migrate the legacy vault: first migrate manifest authentication, then unlock.
+    let digest = VaultHandle::manifest_migration_digest(&root).unwrap();
+    VaultHandle::migrate_manifest_authentication(
+        &root,
+        CustodyMode::Passphrase,
+        Some("legacy-pass"),
+        &digest,
+    )
+    .unwrap();
+
+    // Unlock through the high-level handle: should read fine after migration.
     let h = VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("legacy-pass")).unwrap();
     assert!(root.join("keyring.svault").exists());
     assert_eq!(h.read_file("c", "old.txt").unwrap(), b"legacy-data");
@@ -199,29 +331,80 @@ fn legacy_vault_migrates_and_reads_old_files() {
 #[test]
 fn change_passphrase_preserves_data_without_reencrypting() {
     let root = tmp_dir("changepass");
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("old-pass")).unwrap();
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("old-passphrase-for-tests"),
+    )
+    .unwrap();
     boot.handle
         .create_container("c", SecurityMode::Direct, None)
         .unwrap();
     boot.handle.write_file("c", "f.txt", b"keep-me").unwrap();
 
     boot.handle
-        .change_passphrase(&root, "old-pass", "new-pass")
+        .change_passphrase(
+            &root,
+            "old-passphrase-for-tests",
+            "new-passphrase-for-tests",
+        )
         .unwrap();
     drop(boot.handle);
 
     // Old passphrase no longer unwraps the keyring.
-    assert!(VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("old-pass")).is_err());
+    assert!(VaultHandle::unlock(
+        &root,
+        CustodyMode::Passphrase,
+        Some("old-passphrase-for-tests")
+    )
+    .is_err());
     // New passphrase opens the same data.
-    let h = VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("new-pass")).unwrap();
+    let h = VaultHandle::unlock(
+        &root,
+        CustodyMode::Passphrase,
+        Some("new-passphrase-for-tests"),
+    )
+    .unwrap();
     assert_eq!(h.read_file("c", "f.txt").unwrap(), b"keep-me");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rejected_short_passphrase_change_preserves_old_custody() {
+    let root = tmp_dir("change-short-passphrase");
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("existing-passphrase-for-tests"),
+    )
+    .unwrap();
+    let error = boot
+        .handle
+        .change_passphrase(&root, "existing-passphrase-for-tests", "short")
+        .unwrap_err();
+    assert!(error.to_string().contains("at least 16 characters"));
+    drop(boot.handle);
+
+    assert!(VaultHandle::unlock(
+        &root,
+        CustodyMode::Passphrase,
+        Some("existing-passphrase-for-tests")
+    )
+    .is_ok());
+    assert!(!root.join(".lifecycle.json").exists());
+    assert!(!root.join(keyring::STAGED_KEYRING_FILE).exists());
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn rotate_key_reseals_files_and_reissues_recovery() {
     let root = tmp_dir("rotate");
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("pass")).unwrap();
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("rotation-passphrase-for-tests"),
+    )
+    .unwrap();
     let old_phrase = boot.recovery_phrase.clone();
     let mut handle = boot.handle;
     handle
@@ -229,14 +412,21 @@ fn rotate_key_reseals_files_and_reissues_recovery() {
         .unwrap();
     handle.write_file("c", "f.txt", b"rotate-me").unwrap();
 
-    let new_phrase = handle.rotate_key(&root, Some("pass")).unwrap();
+    let new_phrase = handle
+        .rotate_key(&root, Some("rotation-passphrase-for-tests"))
+        .unwrap();
     assert_ne!(old_phrase, new_phrase);
     // Data still readable in the rotated session.
     assert_eq!(handle.read_file("c", "f.txt").unwrap(), b"rotate-me");
     drop(handle);
 
     // Passphrase still unlocks (KEK unchanged) and reads the re-sealed data.
-    let h = VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("pass")).unwrap();
+    let h = VaultHandle::unlock(
+        &root,
+        CustodyMode::Passphrase,
+        Some("rotation-passphrase-for-tests"),
+    )
+    .unwrap();
     assert_eq!(h.read_file("c", "f.txt").unwrap(), b"rotate-me");
     drop(h);
 
@@ -255,7 +445,12 @@ fn rotate_key_preserves_transit_signing_and_broker_material() {
     // showed the keys, so the breakage was silent. Rotation must now re-wrap
     // every entry forward so encrypt/decrypt/sign/verify/resolve all survive.
     let root = tmp_dir("rotate-material");
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("hunter2-is-not-a-real-password"),
+    )
+    .unwrap();
     let mut handle = boot.handle;
 
     // Transit key + a ciphertext produced BEFORE rotation.
@@ -289,7 +484,9 @@ fn rotate_key_preserves_transit_signing_and_broker_material() {
         .unwrap();
 
     // Rotate the DEK.
-    let new_phrase = handle.rotate_key(&root, Some("hunter2")).unwrap();
+    let new_phrase = handle
+        .rotate_key(&root, Some("hunter2-is-not-a-real-password"))
+        .unwrap();
     assert!(!new_phrase.is_empty());
 
     // Listings still show the keys (they always did — that was the trap).
@@ -323,7 +520,12 @@ fn rotate_key_preserves_transit_signing_and_broker_material() {
     drop(handle);
 
     // Material also survives a fresh unlock from disk.
-    let h = VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("hunter2")).unwrap();
+    let h = VaultHandle::unlock(
+        &root,
+        CustodyMode::Passphrase,
+        Some("hunter2-is-not-a-real-password"),
+    )
+    .unwrap();
     assert_eq!(
         h.transit_decrypt("demo-key", &pre_ct).unwrap(),
         b"rotate-me-please"
@@ -336,7 +538,12 @@ fn rotate_key_preserves_transit_signing_and_broker_material() {
 #[test]
 fn recovery_unlock_after_bootstrap() {
     let root = tmp_dir("recovery");
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("pw")).unwrap();
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("recovery-passphrase-for-tests"),
+    )
+    .unwrap();
     let phrase = boot.recovery_phrase.clone();
     boot.handle
         .create_container("c", SecurityMode::Direct, None)
@@ -353,7 +560,12 @@ fn recovery_unlock_after_bootstrap() {
 #[test]
 fn keyring_can_be_repaired_from_recovered_active_dek() {
     let root = tmp_dir("repair-keyring");
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("pw")).unwrap();
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("recovery-passphrase-for-tests"),
+    )
+    .unwrap();
     let phrase = boot.recovery_phrase.clone();
     boot.handle
         .create_container("c", SecurityMode::Direct, None)
@@ -366,10 +578,26 @@ fn keyring_can_be_repaired_from_recovered_active_dek() {
     let repaired_kek = MasterKey::generate();
     keyring::replace_with_single_active_dek(&root, &repaired_kek, active, &recovered_dek).unwrap();
 
-    assert!(VaultHandle::unlock(&root, CustodyMode::Passphrase, Some("pw")).is_err());
+    // After keyring repair, the passphrase no longer unlocks (KEK was replaced).
+    assert!(VaultHandle::unlock(
+        &root,
+        CustodyMode::Passphrase,
+        Some("recovery-passphrase-for-tests")
+    )
+    .is_err());
+
+    // Verify the repaired keyring unwraps correctly with the new KEK.
     let unwrapped = keyring::load(&root, &repaired_kek).unwrap();
+    assert_eq!(unwrapped.active_version, active);
+
+    // Open the vault with manifest authentication using the recovered DEK.
+    let identity = transit::load_identity(&root, &material_wrap_for_dek(&recovered_dek)).unwrap();
+    let manifest_auth_key = sv_core::sv_storage::derive_manifest_auth_key(&identity.root);
+    let mut keys = std::collections::BTreeMap::new();
+    keys.insert(active, recovered_dek);
     let vault =
-        Vault::open_existing_with_keys(&root, unwrapped.keys, unwrapped.active_version).unwrap();
+        Vault::open_existing_with_keys_and_manifest_key(&root, keys, active, manifest_auth_key)
+            .unwrap();
     assert_eq!(vault.read_file("c", "f.txt").unwrap(), b"recover-me");
     let _ = std::fs::remove_dir_all(&root);
 }

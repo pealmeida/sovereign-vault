@@ -60,8 +60,12 @@ async fn main() {
     // ── Bootstrap a real vault on a throwaway root ───────────────────────────
     let root = tmp_root();
     let _ = std::fs::remove_dir_all(&root);
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("validate-pw"))
-        .expect("bootstrap vault");
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("validation-passphrase"),
+    )
+    .expect("bootstrap vault");
     let handle = boot.handle;
 
     // Seed containers across every security mode an agent will meet in

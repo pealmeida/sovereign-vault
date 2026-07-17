@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Search, RefreshCcw } from 'lucide-svelte';
+  import { Search, RefreshCcw } from '@lucide/svelte';
   import { router } from 'svelte-spa-router';
   import { vaultStore } from '../stores/vault.svelte';
   import { containerStore } from '../stores/containers.svelte';

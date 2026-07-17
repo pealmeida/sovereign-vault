@@ -2,12 +2,12 @@
 
 All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
-follow [Semantic Versioning](https://semver.org/) once it reaches `0.1.0`.
+follow [Semantic Versioning](https://semver.org/).
 
-> **Pre-alpha (`0.0.0`).** The on-disk format and APIs may change between commits
-> without a version bump. Keep independent backups.
+> **v0.1.0 — early release.** The on-disk format and APIs may still change; keep
+> independent backups of anything you store.
 
-## [Unreleased]
+## [0.1.0] — 2026-07-17
 
 ### Fixed
 - **DIRECT-mode MCP ops no longer block on the desktop approval queue.** The

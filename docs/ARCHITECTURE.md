@@ -36,7 +36,7 @@ A system-level overview. For *why* decisions were made, see the ADRs in
 | `sv-storage` | Containers, envelope format, manifest, name validation |
 | `sv-keychain` | OS keychain entry (`service = "sovereign-vault"`) + passphrase fallback |
 | `sv-recovery` | BIP39 24-word recovery phrase issue/verify |
-| `sv-audit` | Append-only, hash-chained JSONL audit log; HMAC-hashed names |
+| `sv-audit` | HMAC-SHA256-authenticated JSONL records and checkpoint; continuous MAC chain across rotations; HMAC-hashed names |
 | `sv-mcp` | MCP server (stdio + WS), tool dispatch, approval hook |
 | `sv-http` | Read-only loopback HTTP: `/health`, agent card, MCP pairing |
 | `sv-core` | Integration layer: custody, key hierarchy, transit/signing/broker, agents — the `VaultHandle` consumed by `apps/` |
@@ -86,12 +86,17 @@ recovery.svault   recovery-phrase verifier
 transit.svault    wrapped transit keys
 signing.svault    wrapped signing seeds
 agents.json       agent registry (token hashes, scopes)
-audit.jsonl       append-only, hash-chained log (HMAC-hashed names)
-<container>/…     per-container encrypted file envelopes
+audit.jsonl       authenticated active audit segment (HMAC-hashed names)
+audit.head.json   authenticated audit checkpoint
+audit-*.jsonl     immutable rotated audit segments
+<container>/<file>.svault   encrypted file content; clear logical path names
 ```
 
-Container/file **contents and names on disk are encrypted**; the audit log
-records HMAC hashes of names, not plaintext.
+Container file contents and stored key material are encrypted. Logical
+container/file names remain visible in directory and blob names, while
+`manifest.json` exposes modes and descriptions and filesystem metadata exposes
+ciphertext sizes and timestamps. The audit log HMAC-hashes container/file name
+fields, but its remaining operational metadata is authenticated, not encrypted.
 
 ## Request lifecycle (an APPROVAL read)
 

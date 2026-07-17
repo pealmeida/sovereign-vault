@@ -34,6 +34,10 @@ export const fileStore = {
     return new Uint8Array(arr);
   },
 
+  async export(container: string, name: string): Promise<string | null> {
+    return invoke<string | null>('vault_export_file', { container, fileName: name });
+  },
+
   async remove(container: string, name: string) {
     await invoke<void>('vault_delete_file', { container, fileName: name });
     if (activeContainer === container) await this.refresh(container);
