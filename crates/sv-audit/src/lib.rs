@@ -1287,15 +1287,10 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_directory(path: &Path) -> Result<()> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?
-        .sync_all()?;
+fn sync_directory(_path: &Path) -> Result<()> {
+    // File contents are synced before every rename; Windows exposes no
+    // supported directory flush through this std path (fsync on a directory
+    // handle returns AccessDenied), so this is intentionally a no-op.
     Ok(())
 }
 
