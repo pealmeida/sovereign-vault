@@ -1329,37 +1329,46 @@ impl AuditWriteLock {
             }
         }
 
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-
-        // Close the check/open race on Unix with O_NOFOLLOW.
         #[cfg(unix)]
-        {
+        let file = {
             use std::os::unix::fs::OpenOptionsExt as _;
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true);
             options.mode(0o600);
             // SAFETY: libc::O_NOFOLLOW is a well-known POSIX constant; the
             // custom_flags method is a safe std API.
             options.custom_flags(libc::O_NOFOLLOW);
-        }
+            options.open(&path).map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    AuditError::Integrity(format!(
+                        "audit write lock is not a regular file: {}",
+                        path.display()
+                    ))
+                } else {
+                    AuditError::Io(error)
+                }
+            })?
+        };
 
-        // On Windows, open the reparse point itself so we can inspect it.
         #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
-            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        }
+        let file = open_existing_or_new_audit_lock(&path)?;
 
-        let file = options.open(&path).map_err(|error| {
-            if error.kind() == ErrorKind::NotFound {
-                AuditError::Integrity(format!(
-                    "audit write lock is not a regular file: {}",
-                    path.display()
-                ))
-            } else {
-                AuditError::Io(error)
-            }
-        })?;
+        #[cfg(not(any(unix, windows)))]
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    AuditError::Integrity(format!(
+                        "audit write lock is not a regular file: {}",
+                        path.display()
+                    ))
+                } else {
+                    AuditError::Io(error)
+                }
+            })?;
 
         // Validate the opened descriptor is a regular file (not a device,
         // FIFO, etc.). On Unix with O_NOFOLLOW a symlink would have caused
@@ -1403,6 +1412,47 @@ impl AuditWriteLock {
             Err(fs4::TryLockError::WouldBlock) => Err(AuditError::Busy),
             Err(fs4::TryLockError::Error(error)) => Err(error.into()),
         }
+    }
+}
+
+#[cfg(windows)]
+fn open_existing_or_new_audit_lock(path: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    // Attempt to open an existing file with the reparse-safe flag so we can
+    // inspect it. FILE_FLAG_OPEN_REPARSE_POINT is incompatible with CREATE,
+    // so creation is handled separately without any custom flags.
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            // No existing file; create a new one without the reparse flag.
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(file) => Ok(file),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    // Lost the create race; retry the existing reparse-safe open.
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                        .open(path)
+                        .map_err(Into::into)
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
