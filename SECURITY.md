@@ -4,7 +4,8 @@
 
 | Version | Supported |
 |---|---|
-| `main` (pre-1.0) | ⚠️ Pre-alpha; not yet externally audited. |
+| `v0.1.x` | ⚠️ Early release (v0.1.0); not yet externally audited. |
+| `main` | Development branch; not a supported release line. |
 
 ## Reporting a vulnerability
 
@@ -43,4 +44,4 @@ Out of scope (not vulnerabilities):
 
 ## Pre-1.0 caveat
 
-This project has not yet been externally audited. The plan is to commission an external audit (Trail of Bits / Cure53 / NCC Group) during phase M7 of the v1.0 plan, before tagging `v1.0.0`. Until then, do not use Sovereign Vault to protect data whose loss or disclosure would be unacceptable.
+This project is an early release (v0.1.0) and has not yet been externally audited. The plan is to commission an external audit (Trail of Bits / Cure53 / NCC Group) during phase M7 of the v1.0 plan, before tagging `v1.0.0`. Until then, do not use Sovereign Vault to protect data whose loss or disclosure would be unacceptable.
