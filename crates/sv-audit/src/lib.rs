@@ -1421,16 +1421,23 @@ fn open_existing_or_new_audit_lock(path: &Path) -> Result<File> {
 
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
-    // Attempt to open an existing file with the reparse-safe flag so we can
-    // inspect it. FILE_FLAG_OPEN_REPARSE_POINT is incompatible with CREATE,
-    // so creation is handled separately without any custom flags.
-    match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-    {
-        Ok(file) => Ok(file),
+    // Reparse-safe open of an existing file. FILE_FLAG_OPEN_REPARSE_POINT is
+    // incompatible with CREATE, so creation is handled separately without any
+    // custom flags.
+    let open_existing_reparse_safe = |path: &Path| -> Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(Into::into)
+    };
+
+    // Decide via metadata whether the path already exists. Opening with the
+    // reparse-safe flag on a missing path can yield AccessDenied on Windows
+    // rather than NotFound, so we never rely on the open error kind here.
+    match fs::symlink_metadata(path) {
+        Ok(_) => open_existing_reparse_safe(path),
         Err(error) if error.kind() == ErrorKind::NotFound => {
             // No existing file; create a new one without the reparse flag.
             match OpenOptions::new()
@@ -1442,12 +1449,7 @@ fn open_existing_or_new_audit_lock(path: &Path) -> Result<File> {
                 Ok(file) => Ok(file),
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     // Lost the create race; retry the existing reparse-safe open.
-                    OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                        .open(path)
-                        .map_err(Into::into)
+                    open_existing_reparse_safe(path)
                 }
                 Err(error) => Err(error.into()),
             }
