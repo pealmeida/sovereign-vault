@@ -1287,15 +1287,10 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_directory(path: &Path) -> Result<()> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?
-        .sync_all()?;
+fn sync_directory(_path: &Path) -> Result<()> {
+    // File contents are synced before every rename; Windows exposes no
+    // supported directory flush through this std path (fsync on a directory
+    // handle returns AccessDenied), so this is intentionally a no-op.
     Ok(())
 }
 
@@ -1329,37 +1324,46 @@ impl AuditWriteLock {
             }
         }
 
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-
-        // Close the check/open race on Unix with O_NOFOLLOW.
         #[cfg(unix)]
-        {
+        let file = {
             use std::os::unix::fs::OpenOptionsExt as _;
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true);
             options.mode(0o600);
             // SAFETY: libc::O_NOFOLLOW is a well-known POSIX constant; the
             // custom_flags method is a safe std API.
             options.custom_flags(libc::O_NOFOLLOW);
-        }
+            options.open(&path).map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    AuditError::Integrity(format!(
+                        "audit write lock is not a regular file: {}",
+                        path.display()
+                    ))
+                } else {
+                    AuditError::Io(error)
+                }
+            })?
+        };
 
-        // On Windows, open the reparse point itself so we can inspect it.
         #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
-            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        }
+        let file = open_existing_or_new_audit_lock(&path)?;
 
-        let file = options.open(&path).map_err(|error| {
-            if error.kind() == ErrorKind::NotFound {
-                AuditError::Integrity(format!(
-                    "audit write lock is not a regular file: {}",
-                    path.display()
-                ))
-            } else {
-                AuditError::Io(error)
-            }
-        })?;
+        #[cfg(not(any(unix, windows)))]
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    AuditError::Integrity(format!(
+                        "audit write lock is not a regular file: {}",
+                        path.display()
+                    ))
+                } else {
+                    AuditError::Io(error)
+                }
+            })?;
 
         // Validate the opened descriptor is a regular file (not a device,
         // FIFO, etc.). On Unix with O_NOFOLLOW a symlink would have caused
@@ -1403,6 +1407,49 @@ impl AuditWriteLock {
             Err(fs4::TryLockError::WouldBlock) => Err(AuditError::Busy),
             Err(fs4::TryLockError::Error(error)) => Err(error.into()),
         }
+    }
+}
+
+#[cfg(windows)]
+fn open_existing_or_new_audit_lock(path: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    // Reparse-safe open of an existing file. FILE_FLAG_OPEN_REPARSE_POINT is
+    // incompatible with CREATE, so creation is handled separately without any
+    // custom flags.
+    let open_existing_reparse_safe = |path: &Path| -> Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(Into::into)
+    };
+
+    // Decide via metadata whether the path already exists. Opening with the
+    // reparse-safe flag on a missing path can yield AccessDenied on Windows
+    // rather than NotFound, so we never rely on the open error kind here.
+    match fs::symlink_metadata(path) {
+        Ok(_) => open_existing_reparse_safe(path),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            // No existing file; create a new one without the reparse flag.
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(file) => Ok(file),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    // Lost the create race; retry the existing reparse-safe open.
+                    open_existing_reparse_safe(path)
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
