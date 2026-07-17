@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { X, Download, FileWarning, FileText } from 'lucide-svelte';
+  import { X, Download, FileWarning, FileText } from '@lucide/svelte';
   import { marked } from 'marked';
   import DOMPurify from 'dompurify';
   import hljs from 'highlight.js/lib/common';
@@ -10,8 +10,6 @@
   import { toastStore } from '../stores/toast.svelte';
   import { formatBytes } from '../lib/formatters';
   import { detectFileType, type FileTypeInfo } from '../lib/fileTypes';
-  import { save } from '@tauri-apps/plugin-dialog';
-  import { writeFile } from '@tauri-apps/plugin-fs';
 
   // 5 MB upper bound for inline preview of any kind. Binary media (pdf/image/video/audio)
   // up to this size renders inline; larger files prompt to download.
@@ -133,9 +131,8 @@
   async function doDownload() {
     if (!rawBytes) return;
     try {
-      const dest = await save({ defaultPath: file.name });
+      const dest = await fileStore.export(container, file.name);
       if (!dest) return;
-      await writeFile(dest, rawBytes);
       toastStore.setNotice(`Saved to ${dest}`);
     } catch (e) {
       toastStore.setError(e);

@@ -27,6 +27,9 @@ reqwest      = { workspace = true }
 url          = "2.5"
 async-trait  = "0.1"
 base64       = "0.22"
+fs4          = { workspace = true }
+atomicwrites = { workspace = true }
+libc         = "0.2"
 
 [lints]
 workspace = true

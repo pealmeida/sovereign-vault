@@ -1,20 +1,23 @@
 [package]
-name        = "sv-audit"
-version.workspace     = true
-edition.workspace     = true
-rust-version.workspace= true
-license.workspace     = true
-repository.workspace  = true
-description = "Append-only JSONL audit log for Sovereign Vault."
+name = "sv-audit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Authenticated append-only audit log for Sovereign Vault."
 
 [dependencies]
-serde      = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror  = { workspace = true }
-chrono     = { workspace = true }
-tokio      = { workspace = true }
-sha2       = { workspace = true }
-hmac       = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+fs4 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

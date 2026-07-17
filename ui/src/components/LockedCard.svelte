@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ShieldCheck } from 'lucide-svelte';
+  import { ShieldCheck } from '@lucide/svelte';
   import type { Custody } from '../lib/types';
   import { vaultStore } from '../stores/vault.svelte';
   import { containerStore } from '../stores/containers.svelte';
@@ -8,7 +8,12 @@
 
   let tab = $state<'passphrase' | 'keychain' | 'recovery'>('passphrase');
   let passphrase = $state('');
+  let passphraseConfirmation = $state('');
   let recoveryInput = $state('');
+
+  // Keep this aligned with sv_core::MIN_PASSPHRASE_CHARS. The backend remains
+  // authoritative so non-UI clients receive the same validation.
+  const MIN_PASSPHRASE_CHARS = 16;
 
   let isInit = $derived(!vaultStore.status?.initialized);
   let keychainAvailable = $derived(vaultStore.status?.keychain_available ?? true);
@@ -20,7 +25,7 @@
       ['recovery', 'Recovery'],
     ] as const)
       .filter(([id]) => {
-        if (isInit) return true;
+        if (isInit) return id !== 'recovery';
         if (id === 'passphrase') return vaultStore.status?.has_passphrase_salt;
         if (id === 'keychain') return keychainAvailable;
         return vaultStore.status?.has_recovery_bundle;
@@ -34,7 +39,37 @@
     }
   });
 
+  let isNewPassphrase = $derived(isInit && tab === 'passphrase');
+  let passphraseLength = $derived(Array.from(passphrase).length);
+  let passphraseTooShort = $derived(
+    isNewPassphrase && passphraseLength < MIN_PASSPHRASE_CHARS
+  );
+  let passphrasesMismatch = $derived(
+    isNewPassphrase && passphraseConfirmation.length > 0 && passphrase !== passphraseConfirmation
+  );
+  let showPassphraseTooShort = $derived(passphrase.length > 0 && passphraseTooShort);
+  let canSubmit = $derived.by(() => {
+    if (vaultStore.loading) return false;
+    if (tab === 'recovery') return recoveryInput.trim().length > 0;
+    if (isNewPassphrase) {
+      return !passphraseTooShort && passphrase === passphraseConfirmation;
+    }
+    if (tab === 'passphrase' || (tab === 'keychain' && passphraseVault)) {
+      return passphrase.length > 0;
+    }
+    return true;
+  });
+
+  function selectTab(next: typeof tab) {
+    passphrase = '';
+    passphraseConfirmation = '';
+    recoveryInput = '';
+    tab = next;
+  }
+
   async function submit() {
+    if (!canSubmit) return;
+
     try {
       const wasInit = isInit;
       let repairedKeychain = false;
@@ -60,14 +95,21 @@
       if (vaultStore.status?.unlocked) {
         await containerStore.refresh();
         await mcpStore.refresh();
-        toastStore.setNotice(
-          wasInit ? 'Vault initialised and unlocked.'
+        const baseMsg = wasInit ? 'Vault initialised and unlocked.'
           : repairedKeychain ? 'Vault recovered and OS Keychain repaired.'
-          : 'Vault unlocked.'
-        );
+          : 'Vault unlocked.';
+        if (vaultStore.gatewayWarning) {
+          toastStore.setNotice(`${baseMsg} ${vaultStore.gatewayWarning}`);
+        } else {
+          toastStore.setNotice(baseMsg);
+        }
       }
     } catch (e) {
       toastStore.setError(e);
+    } finally {
+      passphrase = '';
+      passphraseConfirmation = '';
+      recoveryInput = '';
     }
   }
 </script>
@@ -87,7 +129,7 @@
         <button
           class="filter-chip"
           class:active={tab === id}
-          onclick={() => tab = id}
+          onclick={() => selectTab(id)}
         >{label}</button>
       {/each}
     </div>
@@ -99,8 +141,33 @@
           type="password"
           placeholder="Enter passphrase..."
           bind:value={passphrase}
+          autocomplete={isNewPassphrase ? 'new-password' : 'current-password'}
         />
       </label>
+      {#if isNewPassphrase}
+        <label class="field">
+          <span>Confirm passphrase</span>
+          <input
+            type="password"
+            placeholder="Enter the same passphrase again..."
+            bind:value={passphraseConfirmation}
+            autocomplete="new-password"
+          />
+        </label>
+        <p
+          class:credential-error={showPassphraseTooShort || passphrasesMismatch}
+          class="credential-guidance"
+          aria-live="polite"
+        >
+          {#if showPassphraseTooShort}
+            Use at least {MIN_PASSPHRASE_CHARS} characters.
+          {:else if passphrasesMismatch}
+            Passphrases do not match.
+          {:else}
+            Minimum {MIN_PASSPHRASE_CHARS} characters.
+          {/if}
+        </p>
+      {/if}
     {/if}
 
     {#if tab === 'recovery'}
@@ -110,6 +177,9 @@
           rows={3}
           placeholder="word1 word2 word3..."
           bind:value={recoveryInput}
+          autocomplete="off"
+          autocapitalize="none"
+          spellcheck="false"
         ></textarea>
       </label>
       {#if !isInit && vaultStore.status?.has_keyring && !vaultStore.status?.has_passphrase_salt}
@@ -138,7 +208,7 @@
     <button
       class="primary-button"
       style="width:100%;margin-top:1rem"
-      disabled={vaultStore.loading}
+      disabled={!canSubmit}
       onclick={submit}
     >
       {isInit ? 'Initialise' : 'Unlock'}
@@ -153,5 +223,15 @@
     justify-content: center;
     flex: 1;
     padding: 2rem;
+  }
+
+  .credential-guidance {
+    margin: -0.25rem 0 0;
+    color: var(--muted);
+    font-size: 0.8rem;
+  }
+
+  .credential-error {
+    color: var(--red);
   }
 </style>

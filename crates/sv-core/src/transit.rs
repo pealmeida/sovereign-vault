@@ -18,11 +18,16 @@
 //! key/secret *names* and the broker allowlists are not secret and stored in
 //! the clear alongside the wrapped material.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64_URL},
+    Engine as _,
+};
 use serde::{Deserialize, Serialize};
 use sv_crypto::{
     ed25519_generate, ed25519_sign, open as aead_open, seal as aead_seal, MasterKey,
@@ -37,15 +42,172 @@ pub const TRANSIT_FILE: &str = "transit.svault";
 pub const SIGNING_FILE: &str = "signing.svault";
 /// Filename of the brokered-secret store.
 pub const BROKERS_FILE: &str = "brokers.svault";
+/// Filename of the persistent identity root used for stable audit and agent
+/// token subkeys.
+pub(crate) const IDENTITY_FILE: &str = "identity.svault";
 
 const TRANSIT_AAD: &[u8] = b"sv-transit-key-v1";
 const SIGNING_AAD: &[u8] = b"sv-signing-key-v1";
 const BROKER_AAD: &[u8] = b"sv-broker-secret-v1";
+const IDENTITY_AAD_V1: &[u8] = b"sv-identity-root-v1";
+const IDENTITY_AAD_V2: &[u8] = b"sv-identity-root-v2";
+const IDENTITY_SCHEMA_V1: u32 = 1;
+const IDENTITY_SCHEMA_V2: u32 = 2;
 
 const TRANSIT_KEY_LEN: usize = 32;
 const SCHEMA: u32 = 1;
 
 type Result<T> = std::result::Result<T, CoreError>;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IdentityFile {
+    schema: u32,
+    wrapped_root_b64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IdentityPayloadV2 {
+    root_b64: String,
+    manifest_auth_required: bool,
+}
+
+/// The persistent identity root and its manifest-authentication flag.
+pub struct IdentityState {
+    /// Stable identity root used for audit HMAC and agent token derivation.
+    pub root: MasterKey,
+    /// Whether manifest authentication is required (always true for v2+).
+    pub manifest_auth_required: bool,
+}
+
+/// Load the persistent identity root sealed under the current material-wrap
+/// key. Recovery unlock intentionally uses this strict form so it cannot
+/// silently create a new identity and invalidate audit/token history.
+pub fn load_identity(root: &Path, wrap_key: &MasterKey) -> Result<IdentityState> {
+    ensure_directory(root, "vault root")?;
+    let path = root.join(IDENTITY_FILE);
+    ensure_regular_file(&path, "vault identity")?;
+    let raw = fs::read(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CoreError::Misuse(
+                "vault identity root is missing; unlock with normal custody once to migrate this vault before using recovery"
+                    .into(),
+            )
+        } else {
+            error.into()
+        }
+    })?;
+    let identity: IdentityFile = serde_json::from_slice(&raw)
+        .map_err(|error| CoreError::Misuse(format!("{IDENTITY_FILE}: {error}")))?;
+    let sealed = B64
+        .decode(identity.wrapped_root_b64.as_bytes())
+        .map_err(|error| CoreError::Base64(error.to_string()))?;
+    match identity.schema {
+        IDENTITY_SCHEMA_V1 => {
+            let plaintext = aead_open(wrap_key, &sealed, IDENTITY_AAD_V1)?;
+            Ok(IdentityState {
+                root: identity_root_from_bytes(&plaintext)?,
+                manifest_auth_required: false,
+            })
+        }
+        IDENTITY_SCHEMA_V2 => {
+            let plaintext = aead_open(wrap_key, &sealed, IDENTITY_AAD_V2)?;
+            let payload: IdentityPayloadV2 =
+                serde_json::from_slice(&plaintext).map_err(|error| {
+                    CoreError::Misuse(format!("{IDENTITY_FILE} protected payload: {error}"))
+                })?;
+            if !payload.manifest_auth_required {
+                return Err(CoreError::Misuse(
+                    "identity v2 does not require manifest authentication".into(),
+                ));
+            }
+            let raw = B64
+                .decode(payload.root_b64.as_bytes())
+                .map_err(|error| CoreError::Base64(error.to_string()))?;
+            Ok(IdentityState {
+                root: identity_root_from_bytes(&raw)?,
+                manifest_auth_required: true,
+            })
+        }
+        schema => Err(CoreError::Misuse(format!(
+            "unsupported identity schema: {schema}"
+        ))),
+    }
+}
+
+fn identity_root_from_bytes(plaintext: &[u8]) -> Result<MasterKey> {
+    if plaintext.len() != sv_crypto::MASTER_KEY_LEN {
+        return Err(CoreError::Misuse(format!(
+            "identity root has wrong length: {}",
+            plaintext.len()
+        )));
+    }
+    let mut bytes = [0u8; sv_crypto::MASTER_KEY_LEN];
+    bytes.copy_from_slice(plaintext);
+    Ok(MasterKey::from_bytes(bytes))
+}
+
+/// Load an existing identity root or create it atomically.
+///
+/// `legacy_root` preserves the historical audit/token derivation when
+/// migrating an existing vault. New vaults pass `None` and receive an
+/// independent random root.
+pub(crate) fn load_or_create_identity(
+    root: &Path,
+    wrap_key: &MasterKey,
+    legacy_root: Option<&MasterKey>,
+) -> Result<IdentityState> {
+    ensure_directory(root, "vault root")?;
+    let identity_path = root.join(IDENTITY_FILE);
+    match fs::symlink_metadata(&identity_path) {
+        Ok(_) => return load_identity(root, wrap_key),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let identity_root = legacy_root.cloned().unwrap_or_else(MasterKey::generate);
+    write_authenticated_identity(root, wrap_key, &identity_root)?;
+    load_identity(root, wrap_key)
+}
+
+pub(crate) fn load_identity_if_present(
+    root: &Path,
+    wrap_key: &MasterKey,
+) -> Result<Option<IdentityState>> {
+    let path = root.join(IDENTITY_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => load_identity(root, wrap_key).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn enable_manifest_authentication(
+    root: &Path,
+    wrap_key: &MasterKey,
+    identity_root: &MasterKey,
+) -> Result<()> {
+    write_authenticated_identity(root, wrap_key, identity_root)
+}
+
+fn write_authenticated_identity(
+    root: &Path,
+    wrap_key: &MasterKey,
+    identity_root: &MasterKey,
+) -> Result<()> {
+    let payload = serde_json::to_vec(&IdentityPayloadV2 {
+        root_b64: B64.encode(identity_root.as_bytes()),
+        manifest_auth_required: true,
+    })
+    .map_err(|error| CoreError::Misuse(format!("{IDENTITY_FILE} payload: {error}")))?;
+    let wrapped = aead_seal(wrap_key, &payload, IDENTITY_AAD_V2)?;
+    write_json(
+        root,
+        IDENTITY_FILE,
+        &IdentityFile {
+            schema: IDENTITY_SCHEMA_V2,
+            wrapped_root_b64: B64.encode(wrapped),
+        },
+    )
+}
 
 // ---- transit (symmetric) -------------------------------------------------
 
@@ -449,10 +611,26 @@ pub fn broker_resolve(
 /// metadata listings still show the keys. Idempotent and a no-op for any store
 /// that does not exist yet.
 pub fn rewrap_all_material(root: &Path, old_wrap: &MasterKey, new_wrap: &MasterKey) -> Result<()> {
+    rewrap_identity(root, old_wrap, new_wrap)?;
     rewrap_transit(root, old_wrap, new_wrap)?;
     rewrap_signing(root, old_wrap, new_wrap)?;
     rewrap_brokers(root, old_wrap, new_wrap)?;
     Ok(())
+}
+
+fn rewrap_identity(root: &Path, old_wrap: &MasterKey, new_wrap: &MasterKey) -> Result<()> {
+    let mut identity: IdentityFile = read_json_required(root, IDENTITY_FILE)?;
+    let aad = match identity.schema {
+        IDENTITY_SCHEMA_V1 => IDENTITY_AAD_V1,
+        IDENTITY_SCHEMA_V2 => IDENTITY_AAD_V2,
+        schema => {
+            return Err(CoreError::Misuse(format!(
+                "unsupported identity schema: {schema}"
+            )))
+        }
+    };
+    identity.wrapped_root_b64 = reseal(old_wrap, new_wrap, aad, &identity.wrapped_root_b64)?;
+    write_json(root, IDENTITY_FILE, &identity)
 }
 
 fn reseal(
@@ -464,9 +642,23 @@ fn reseal(
     let sealed = B64
         .decode(wrapped_b64.as_bytes())
         .map_err(|e| CoreError::Base64(e.to_string()))?;
-    let raw = aead_open(old_wrap, &sealed, aad)?;
-    let resealed = aead_seal(new_wrap, &raw, aad)?;
-    Ok(B64.encode(resealed))
+    match aead_open(old_wrap, &sealed, aad) {
+        Ok(raw) => {
+            let resealed = aead_seal(new_wrap, &raw, aad)?;
+            Ok(B64.encode(resealed))
+        }
+        Err(old_error) => {
+            // Rotation recovery can encounter a store already committed by an
+            // earlier attempt. Verify it is under the destination key before
+            // treating the entry as complete; unrelated corruption still
+            // returns the original authentication error.
+            if aead_open(new_wrap, &sealed, aad).is_ok() {
+                Ok(wrapped_b64.to_string())
+            } else {
+                Err(old_error.into())
+            }
+        }
+    }
 }
 
 fn rewrap_transit(root: &Path, old_wrap: &MasterKey, new_wrap: &MasterKey) -> Result<()> {
@@ -536,28 +728,138 @@ fn store_path(root: &Path, file: &str) -> PathBuf {
 }
 
 fn read_json<T: Default + for<'de> Deserialize<'de>>(root: &Path, file: &str) -> Result<T> {
+    ensure_directory(root, "vault root")?;
     let path = store_path(root, file);
-    if !path.exists() {
-        return Ok(T::default());
+    match fs::symlink_metadata(&path) {
+        Ok(_) => ensure_regular_file(&path, file)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(error) => return Err(error.into()),
     }
     let raw = fs::read(&path)?;
     serde_json::from_slice(&raw).map_err(|e| CoreError::Misuse(format!("{file}: {e}")))
+}
+
+fn read_json_required<T: for<'de> Deserialize<'de>>(root: &Path, file: &str) -> Result<T> {
+    ensure_directory(root, "vault root")?;
+    let path = store_path(root, file);
+    ensure_regular_file(&path, file)?;
+    let raw = fs::read(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CoreError::Misuse(format!("required vault material is missing: {file}"))
+        } else {
+            error.into()
+        }
+    })?;
+    serde_json::from_slice(&raw).map_err(|error| CoreError::Misuse(format!("{file}: {error}")))
 }
 
 fn write_json<T: Serialize>(root: &Path, file: &str, value: &T) -> Result<()> {
     if !root.exists() {
         fs::create_dir_all(root)?;
     }
+    ensure_directory(root, "vault root")?;
     let bytes =
         serde_json::to_vec_pretty(value).map_err(|e| CoreError::Misuse(format!("{file}: {e}")))?;
     let path = store_path(root, file);
-    let tmp = path.with_extension("svault.tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
+    ensure_destination_is_regular_or_missing(&path, file)?;
+    let (tmp, mut output) = create_secure_temp(root, file)?;
+    let result = (|| -> Result<()> {
+        output.write_all(&bytes)?;
+        output.sync_all()?;
+        drop(output);
+        ensure_destination_is_regular_or_missing(&path, file)?;
+        atomicwrites::replace_atomic(&tmp, &path)?;
+        sync_parent(root)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, &path)?;
+    result
+}
+
+fn ensure_directory(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CoreError::Misuse(format!("{label} does not exist: {}", path.display()))
+        } else {
+            error.into()
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(CoreError::Misuse(format!(
+            "{label} is not a real directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_regular_file(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CoreError::Misuse(format!("{label} does not exist: {}", path.display()))
+        } else {
+            error.into()
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(CoreError::Misuse(format!(
+            "{label} is not a regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_destination_is_regular_or_missing(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => ensure_regular_file(path, label),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn create_secure_temp(root: &Path, name: &str) -> Result<(PathBuf, fs::File)> {
+    for _ in 0..16 {
+        let suffix = B64_URL.encode(sv_crypto::random_bytes(12)?);
+        let path = root.join(format!(".{name}.{suffix}.tmp"));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(CoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique transit temp file",
+    )))
+}
+
+#[cfg(unix)]
+fn sync_parent(root: &Path) -> Result<()> {
+    fs::File::open(root)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_parent(root: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root)?
+        .sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_parent(_root: &Path) -> Result<()> {
     Ok(())
 }
 

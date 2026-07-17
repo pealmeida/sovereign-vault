@@ -27,12 +27,100 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sv_audit::{AuditAction, AuditDecision, AuditEvent};
 use sv_storage::{ContainerInfo, FileInfo, SecurityMode};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{oneshot, Mutex};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::sync::{oneshot, Mutex, Semaphore};
+use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::{
+    handshake::server::{ErrorResponse, Request as WsRequest, Response as WsResponse},
+    http::{header::HOST, header::ORIGIN, StatusCode},
+    protocol::WebSocketConfig,
+    Message,
+};
+
+const MAX_WS_CONNECTIONS: usize = 32;
+const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_WS_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_WS_FILE_BYTES: usize = 4 * 1024 * 1024;
+const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const WS_PAIRING_TIMEOUT: Duration = Duration::from_secs(10);
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+#[allow(clippy::result_large_err)] // Required by tungstenite's handshake callback contract.
+fn validate_ws_handshake(
+    request: &WsRequest,
+    response: WsResponse,
+) -> std::result::Result<WsResponse, ErrorResponse> {
+    if request.uri().path() != "/" || !ws_request_has_safe_origin(request) {
+        let mut error = ErrorResponse::new(Some("forbidden WebSocket origin".into()));
+        *error.status_mut() = StatusCode::FORBIDDEN;
+        return Err(error);
+    }
+    Ok(response)
+}
+
+fn ws_request_has_safe_origin(request: &WsRequest) -> bool {
+    let mut hosts = request.headers().get_all(HOST).iter();
+    let Some(host) = hosts.next().and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    if hosts.next().is_some() || !authority_is_loopback(host) {
+        return false;
+    }
+
+    let mut origins = request.headers().get_all(ORIGIN).iter();
+    let Some(origin) = origins.next() else {
+        return true;
+    };
+    let valid = origin.to_str().ok().is_some_and(origin_is_loopback);
+    valid && origins.next().is_none()
+}
+
+fn origin_is_loopback(origin: &str) -> bool {
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    !authority.contains(['/', '?', '#']) && authority_is_loopback(authority)
+}
+
+fn authority_is_loopback(authority: &str) -> bool {
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, suffix)) = rest.split_once(']') else {
+            return false;
+        };
+        if !suffix.is_empty() && (!suffix.starts_with(':') || suffix[1..].parse::<u16>().is_err()) {
+            return false;
+        }
+        host
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if port.parse::<u16>().is_err() {
+            return false;
+        }
+        host
+    } else {
+        authority
+    };
+
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .read_buffer_size(16 * 1024)
+        .write_buffer_size(16 * 1024)
+        .max_write_buffer_size(MAX_WS_MESSAGE_BYTES + 16 * 1024)
+        .max_message_size(Some(MAX_WS_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_WS_FRAME_BYTES))
+}
 
 /// MCP layer errors.
 #[derive(Debug, Error)]
@@ -347,6 +435,14 @@ pub struct AccessRequest {
     /// request carrying that code here. Cross-channel: the code is shown in one
     /// place (desktop) and entered in another (agent), binding the session.
     pub otp: Option<String>,
+    /// Cryptographic binding over the exact tool call content, excluding only
+    /// the top-level `otp` field. This lets an access controller re-identify a
+    /// resubmitted request for OTP/approval authorization without exposing
+    /// secret argument values such as `content_b64`, `payload_b64`, `body`, or
+    /// broker headers. Computed as the lowercase SHA-256 hex digest of the
+    /// domain-separated canonical serialization.
+    #[serde(default)]
+    pub authorization_context: String,
 }
 
 /// A scope grant resolved for an authenticated agent. Scopes can only narrow
@@ -553,6 +649,11 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         addr: SocketAddr,
         shutdown: oneshot::Receiver<()>,
     ) -> Result<()> {
+        if !addr.ip().is_loopback() {
+            return Err(McpError::Transport(format!(
+                "refusing non-loopback MCP listener: {addr}"
+            )));
+        }
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| McpError::Transport(format!("bind {addr}: {e}")))?;
@@ -569,7 +670,13 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         let addr = listener
             .local_addr()
             .map_err(|e| McpError::Transport(e.to_string()))?;
+        if !addr.ip().is_loopback() {
+            return Err(McpError::Transport(format!(
+                "refusing non-loopback MCP listener: {addr}"
+            )));
+        }
         tracing::info!(%addr, "MCP WS listening");
+        let connection_limit = Arc::new(Semaphore::new(MAX_WS_CONNECTIONS));
         loop {
             tokio::select! {
                 _ = &mut shutdown => {
@@ -588,8 +695,16 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         tracing::warn!(?peer, "rejecting non-loopback peer");
                         continue;
                     }
+                    let permit = match connection_limit.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            tracing::warn!(?peer, "rejecting MCP connection: limit reached");
+                            continue;
+                        }
+                    };
                     let server = self.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = server.handle_ws_conn(stream).await {
                             tracing::debug!(error=%e, "ws conn closed");
                         }
@@ -600,12 +715,29 @@ impl<H: VaultFacade + 'static> McpServer<H> {
     }
 
     async fn handle_ws_conn(&self, stream: tokio::net::TcpStream) -> Result<()> {
-        let ws = tokio_tungstenite::accept_async(stream)
+        let handshake = tokio_tungstenite::accept_hdr_async_with_config(
+            stream,
+            validate_ws_handshake,
+            Some(websocket_config()),
+        );
+        let ws = timeout(WS_HANDSHAKE_TIMEOUT, handshake)
             .await
+            .map_err(|_| McpError::Transport("WebSocket handshake timed out".into()))?
             .map_err(|e| McpError::Transport(e.to_string()))?;
         let (mut sink, mut source) = ws.split();
         let mut pair_state = PairState::Unpaired;
-        while let Some(msg) = source.next().await {
+        loop {
+            let idle_limit = if matches!(pair_state, PairState::Unpaired) {
+                WS_PAIRING_TIMEOUT
+            } else {
+                WS_IDLE_TIMEOUT
+            };
+            let Some(msg) = timeout(idle_limit, source.next())
+                .await
+                .map_err(|_| McpError::Transport("WebSocket connection timed out".into()))?
+            else {
+                break;
+            };
             let msg = match msg {
                 Ok(m) => m,
                 Err(e) => return Err(McpError::Transport(e.to_string())),
@@ -786,7 +918,8 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         // Scope enforcement: scopes may only narrow, never widen, access.
         if let Some(agent) = agent {
             if let Err(error) = enforce_scopes(agent, &access) {
-                self.record_audit(&access, AuditDecision::Denied, None, Some(error.clone()));
+                let audit =
+                    self.record_audit(&access, AuditDecision::Denied, None, Some(error.clone()));
                 self.emit_timing(
                     &access,
                     false,
@@ -795,44 +928,38 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     Duration::ZERO,
                     Duration::ZERO,
                 );
-                return Err(error);
+                return Err(combine_denial_and_audit(error, audit));
             }
         }
         // Validation + scope enforcement = the validation portion of T_filter.
         let validate = started.elapsed();
 
         let authorize_started = Instant::now();
-        // DIRECT-mode containers and operations without a specific container
-        // (transit key ops, vault.list {}) bypass the GUI approval queue.
-        // APPROVAL / OTP / ZKP route through the controller for human
-        // confirmation. NATIVE must also route through it so the controller
-        // can reject it as unimplemented — leaving it out lets NATIVE
-        // containers silently degrade to DIRECT (no prompt, no rejection).
-        let needs_consent = matches!(
-            access.mode,
-            Some(SecurityMode::Approval)
-                | Some(SecurityMode::Otp)
-                | Some(SecurityMode::Zkp)
-                | Some(SecurityMode::Native)
-        );
-        if needs_consent {
-            if let Some(controller) = &self.access_controller {
-                if let Err(error) = controller.authorize(access.clone()).await {
+        // The controller owns the complete policy, including sensitive actions
+        // without a container mode (transit, signing, and broker operations).
+        // It can return immediately for DIRECT operations that need no prompt.
+        if let Some(controller) = &self.access_controller {
+            if let Err(error) = controller.authorize(access.clone()).await {
+                let audit =
                     self.record_audit(&access, AuditDecision::Denied, None, Some(error.clone()));
-                    self.emit_timing(
-                        &access,
-                        false,
-                        validate,
-                        authorize_started.elapsed(),
-                        Duration::ZERO,
-                        Duration::ZERO,
-                    );
-                    return Err(error);
-                }
+                self.emit_timing(
+                    &access,
+                    false,
+                    validate,
+                    authorize_started.elapsed(),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                );
+                return Err(combine_denial_and_audit(error, audit));
             }
         }
         // The human-in-the-loop consent gate = T_hitl.
         let authorize = authorize_started.elapsed();
+
+        // Persist a durable intent before any vault read, mutation, signing, or
+        // outbound request. A configured audit sink is part of the security
+        // boundary: if it cannot record, the operation must not execute.
+        self.record_audit(&access, AuditDecision::Attempted, None, None)?;
 
         // Brokering performs network I/O and is async; everything else runs
         // synchronously against the locked handle.
@@ -840,12 +967,12 @@ impl<H: VaultFacade + 'static> McpServer<H> {
             let execute_started = Instant::now();
             let (result, detail) = self.execute_broker(&args).await;
             let execute = execute_started.elapsed();
-            match &result {
+            let audit = match &result {
                 Ok(_) => self.record_audit(&access, AuditDecision::Allowed, detail, None),
                 Err(error) => {
                     self.record_audit(&access, AuditDecision::Error, detail, Some(error.clone()))
                 }
-            }
+            };
             self.emit_timing(
                 &access,
                 result.is_ok(),
@@ -854,7 +981,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 execute,
                 Duration::ZERO,
             );
-            return result;
+            return combine_result_and_audit(result, audit);
         }
 
         // The vault operation itself (decrypt + disk for a read) = T_vault.
@@ -864,7 +991,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
             let handle = guard
                 .as_ref()
                 .ok_or_else(|| "vault is locked".to_string())?;
-            self.execute_tool(handle, name, &args)
+            self.execute_tool(handle, name, &args, transport)
         };
         let execute = execute_started.elapsed();
 
@@ -873,20 +1000,33 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         // boundary. This is the sanitisation portion of T_filter.
         let filter_started = Instant::now();
         let (result, filter_detail) = match result {
-            Ok(value) => {
-                let (value, detail) = self.apply_privacy_filter(&access, value);
-                (Ok(value), detail)
-            }
+            Ok(value) => match self.apply_privacy_filter(&access, value) {
+                Ok((value, detail)) => (Ok(value), detail),
+                Err(error) => (Err(error), None),
+            },
             Err(error) => (Err(error), None),
         };
+        let result = result.and_then(|value| {
+            if transport == AccessTransport::McpWs {
+                let response_size = serde_json::to_vec(&value)
+                    .map_err(|error| format!("failed to size response: {error}"))?
+                    .len();
+                if response_size > MAX_WS_MESSAGE_BYTES {
+                    return Err(format!(
+                        "response exceeds WebSocket limit of {MAX_WS_MESSAGE_BYTES} bytes; use the local stdio transport"
+                    ));
+                }
+            }
+            Ok(value)
+        });
         let filter = filter_started.elapsed();
 
-        match &result {
+        let audit = match &result {
             Ok(_) => self.record_audit(&access, AuditDecision::Allowed, filter_detail, None),
             Err(error) => {
                 self.record_audit(&access, AuditDecision::Error, None, Some(error.clone()))
             }
-        }
+        };
         self.emit_timing(
             &access,
             result.is_ok(),
@@ -896,35 +1036,34 @@ impl<H: VaultFacade + 'static> McpServer<H> {
             filter,
         );
 
-        result
+        combine_result_and_audit(result, audit)
     }
 
     /// Apply the PII privacy filter to a successful tool result when the
     /// request was a read against an `ANONYMIZED`-mode container (thesis module
-    /// 3b). Text content is scanned and masked in place; non-UTF-8 (binary)
-    /// content passes through unscanned. Returns the possibly-rewritten value
-    /// and an audit-detail string when masking ran.
+    /// 3b). Text content is scanned and masked in place. Binary or malformed
+    /// content is denied because it cannot be proven safe for anonymized
+    /// egress. Returns the possibly-rewritten value and an audit-detail string
+    /// when masking ran.
     fn apply_privacy_filter(
         &self,
         access: &AccessRequest,
         value: Value,
-    ) -> (Value, Option<String>) {
+    ) -> std::result::Result<(Value, Option<String>), String> {
         if access.action != AccessAction::ReadFile || access.mode != Some(SecurityMode::Anonymized)
         {
-            return (value, None);
+            return Ok((value, None));
         }
         let Some(content_b64) = value.get("content_b64").and_then(|v| v.as_str()) else {
-            return (value, None);
+            return Err("anonymized read response is missing encoded content".into());
         };
-        let Ok(bytes) = B64.decode(content_b64.as_bytes()) else {
-            return (value, None);
-        };
-        let Ok(text) = std::str::from_utf8(&bytes) else {
-            return (
-                value,
-                Some("anonymized: binary content passed through unscanned".into()),
-            );
-        };
+        let bytes = B64
+            .decode(content_b64.as_bytes())
+            .map_err(|_| "anonymized read response contains invalid base64".to_string())?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| {
+            "anonymized egress denied: content is not valid UTF-8 and cannot be safely redacted"
+                .to_string()
+        })?;
         let redaction = sv_privacy::redact(text, &sv_privacy::Policy::all());
         let detail = Some(format!(
             "anonymized: {} pii span(s) masked",
@@ -940,7 +1079,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
             map.insert("anonymized".to_string(), json!(true));
             map.insert("pii_redactions".to_string(), json!(redaction.count()));
         }
-        (value, detail)
+        Ok((value, detail))
     }
 
     /// Emit a [`StageTimings`] to the installed [`TimingSink`], if any.
@@ -1060,6 +1199,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .get("otp")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
+                    authorization_context: build_authorization_context(name, args),
                 })
             }
             "vault.read" => {
@@ -1077,6 +1217,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .get("otp")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
+                    authorization_context: build_authorization_context(name, args),
                 })
             }
             "vault.write" => {
@@ -1098,6 +1239,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .get("otp")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
+                    authorization_context: build_authorization_context(name, args),
                 })
             }
             "vault.delete" => {
@@ -1115,6 +1257,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .get("otp")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
+                    authorization_context: build_authorization_context(name, args),
                 })
             }
             "vault.create_container" => {
@@ -1135,6 +1278,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .get("otp")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
+                    authorization_context: build_authorization_context(name, args),
                 })
             }
             "vault.destroy" => {
@@ -1151,59 +1295,102 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .get("otp")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
+                    authorization_context: build_authorization_context(name, args),
                 })
             }
-            "vault.info" => Ok(simple_request(transport, AccessAction::VaultInfo)),
+            "vault.info" => Ok(simple_request(
+                transport,
+                AccessAction::VaultInfo,
+                build_authorization_context(name, args),
+            )),
             "vault.create_transit_key" => {
                 let _ = required_str(args, "name")?;
-                Ok(simple_request(transport, AccessAction::CreateTransitKey))
+                Ok(simple_request(
+                    transport,
+                    AccessAction::CreateTransitKey,
+                    build_authorization_context(name, args),
+                ))
             }
-            "vault.list_transit_keys" => {
-                Ok(simple_request(transport, AccessAction::ListTransitKeys))
-            }
+            "vault.list_transit_keys" => Ok(simple_request(
+                transport,
+                AccessAction::ListTransitKeys,
+                build_authorization_context(name, args),
+            )),
             "vault.encrypt" => {
                 let _ = required_str(args, "key_ref")?;
                 let _ = required_str(args, "plaintext_b64")?;
-                Ok(simple_request(transport, AccessAction::Encrypt))
+                Ok(simple_request(
+                    transport,
+                    AccessAction::Encrypt,
+                    build_authorization_context(name, args),
+                ))
             }
             "vault.decrypt" => {
                 let _ = required_str(args, "key_ref")?;
                 let _ = required_str(args, "ciphertext_b64")?;
-                Ok(simple_request(transport, AccessAction::Decrypt))
+                Ok(simple_request(
+                    transport,
+                    AccessAction::Decrypt,
+                    build_authorization_context(name, args),
+                ))
             }
             "vault.sign" => {
                 let _ = required_str(args, "key_ref")?;
                 let _ = required_str(args, "payload_b64")?;
-                Ok(simple_request(transport, AccessAction::Sign))
+                Ok(simple_request(
+                    transport,
+                    AccessAction::Sign,
+                    build_authorization_context(name, args),
+                ))
             }
             "vault.create_signing_key" => {
                 let _ = required_str(args, "name")?;
-                Ok(simple_request(transport, AccessAction::CreateSigningKey))
+                Ok(simple_request(
+                    transport,
+                    AccessAction::CreateSigningKey,
+                    build_authorization_context(name, args),
+                ))
             }
-            "vault.list_signing_keys" => {
-                Ok(simple_request(transport, AccessAction::ListSigningKeys))
-            }
+            "vault.list_signing_keys" => Ok(simple_request(
+                transport,
+                AccessAction::ListSigningKeys,
+                build_authorization_context(name, args),
+            )),
             "vault.verify" => {
                 let _ = required_str(args, "public_key_b64")?;
                 let _ = required_str(args, "payload_b64")?;
                 let _ = required_str(args, "signature_b64")?;
-                Ok(simple_request(transport, AccessAction::Verify))
+                Ok(simple_request(
+                    transport,
+                    AccessAction::Verify,
+                    build_authorization_context(name, args),
+                ))
             }
             "vault.create_broker_secret" => {
                 let _ = required_str(args, "name")?;
                 let _ = required_str(args, "secret")?;
                 let _ = required_broker_allow(args)?;
                 let _ = parse_broker_injection(args)?;
-                Ok(simple_request(transport, AccessAction::CreateBrokerSecret))
+                Ok(simple_request(
+                    transport,
+                    AccessAction::CreateBrokerSecret,
+                    build_authorization_context(name, args),
+                ))
             }
-            "vault.list_broker_secrets" => {
-                Ok(simple_request(transport, AccessAction::ListBrokerSecrets))
-            }
+            "vault.list_broker_secrets" => Ok(simple_request(
+                transport,
+                AccessAction::ListBrokerSecrets,
+                build_authorization_context(name, args),
+            )),
             "vault.broker_request" => {
                 let _ = required_str(args, "secret_ref")?;
                 let _ = required_str(args, "method")?;
                 let _ = required_str(args, "url")?;
-                Ok(simple_request(transport, AccessAction::Broker))
+                Ok(simple_request(
+                    transport,
+                    AccessAction::Broker,
+                    build_authorization_context(name, args),
+                ))
             }
             other => Err(format!("unknown tool: {other}")),
         }
@@ -1214,6 +1401,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         handle: &H,
         name: &str,
         args: &Value,
+        transport: AccessTransport,
     ) -> std::result::Result<Value, String> {
         match name {
             "vault.list" => {
@@ -1230,6 +1418,11 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 let container = required_str(args, "container")?;
                 let file_name = required_str(args, "file_name")?;
                 let bytes = handle.read_file(container, file_name)?;
+                if transport == AccessTransport::McpWs && bytes.len() > MAX_WS_FILE_BYTES {
+                    return Err(format!(
+                        "file exceeds WebSocket read limit of {MAX_WS_FILE_BYTES} bytes; use the local stdio transport"
+                    ));
+                }
                 Ok(json!({
                     "container": container,
                     "file_name": file_name,
@@ -1370,10 +1563,10 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         request: &AccessRequest,
         decision: AuditDecision,
         detail: Option<String>,
-        error: Option<String>,
-    ) {
+        _error: Option<String>,
+    ) -> std::result::Result<(), String> {
         let Some(sink) = &self.audit_sink else {
-            return;
+            return Ok(());
         };
 
         let mut event = AuditEvent::new(
@@ -1386,9 +1579,35 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         event.mode = request.mode.map(|mode| mode.as_str().to_string());
         event.byte_size = request.byte_size;
         event.detail = detail;
-        event.error = error;
+        event.error = match decision {
+            AuditDecision::Denied => Some("request denied".to_string()),
+            AuditDecision::Error => Some("operation failed".to_string()),
+            _ => None,
+        };
         event.agent_id = request.agent_id.clone();
-        let _ = sink.record(event);
+        sink.record(event)
+            .map_err(|error| format!("authenticated audit log unavailable: {error}"))
+    }
+}
+
+fn combine_denial_and_audit(denial: String, audit: std::result::Result<(), String>) -> String {
+    match audit {
+        Ok(()) => denial,
+        Err(audit_error) => format!("{denial}; {audit_error}"),
+    }
+}
+
+fn combine_result_and_audit<T>(
+    result: std::result::Result<T, String>,
+    audit: std::result::Result<(), String>,
+) -> std::result::Result<T, String> {
+    match (result, audit) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(audit_error)) => Err(format!(
+            "operation completed, but its authenticated audit outcome could not be recorded: {audit_error}"
+        )),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(audit_error)) => Err(format!("{error}; {audit_error}")),
     }
 }
 
@@ -1519,7 +1738,62 @@ fn glob_inner(p: &[char], v: &[char]) -> bool {
     false
 }
 
-fn simple_request(transport: AccessTransport, action: AccessAction) -> AccessRequest {
+/// Recursively sort JSON object keys so that object key order never affects
+/// the authorization-context digest. Arrays and scalar values are left intact.
+fn canonicalize_json(value: &mut Value) {
+    if let Value::Object(map) = value {
+        let mut sorted: serde_json::Map<String, Value> =
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        for (_, v) in &mut sorted {
+            canonicalize_json(v);
+        }
+        // Use a BTreeMap-like deterministic order by sorting keys.
+        let mut entries: Vec<(String, Value)> = sorted.into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        map.clear();
+        for (k, v) in entries {
+            map.insert(k, v);
+        }
+    } else if let Value::Array(arr) = value {
+        for item in arr {
+            canonicalize_json(item);
+        }
+    }
+}
+
+/// Build the authorization context for a tool call.
+///
+/// The digest binds the fixed domain, the tool name, and the canonical JSON
+/// arguments after removing only the top-level `otp` key. The result is the
+/// lowercase SHA-256 hex digest of:
+///
+/// `sovereign-vault/access-request/v1\0<name>\0<canonical-json>`
+///
+/// where `<canonical-json>` has object keys sorted recursively. This makes the
+/// context stable under key reordering and identical across OTP resubmissions,
+/// while changing any other argument (including write bytes, broker URL,
+/// method, body, or headers) produces a different digest.
+fn build_authorization_context(name: &str, args: &Value) -> String {
+    let mut args = args.clone();
+    if let Value::Object(map) = &mut args {
+        map.remove("otp");
+    }
+    canonicalize_json(&mut args);
+    let canonical = serde_json::to_vec(&args).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(b"sovereign-vault/access-request/v1\0");
+    hasher.update(name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&canonical);
+    let hash = hasher.finalize();
+    hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
+}
+
+fn simple_request(
+    transport: AccessTransport,
+    action: AccessAction,
+    authorization_context: String,
+) -> AccessRequest {
     AccessRequest {
         transport,
         action,
@@ -1529,6 +1803,7 @@ fn simple_request(transport: AccessTransport, action: AccessAction) -> AccessReq
         byte_size: None,
         agent_id: None,
         otp: None,
+        authorization_context,
     }
 }
 
@@ -1886,7 +2161,7 @@ fn base_tool_descriptors() -> Value {
         },
         {
             "name": "vault.list_signing_keys",
-            "description": "List signing-key metadata including exportable public keys.",
+            "description": "Listing signing-key metadata including exportable public keys.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -1945,6 +2220,45 @@ pub fn version() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_handshake_requires_exact_loopback_host_and_origin() {
+        let cli_request = WsRequest::builder()
+            .uri("/")
+            .header(HOST, "127.0.0.1:9944")
+            .body(())
+            .unwrap();
+        assert!(ws_request_has_safe_origin(&cli_request));
+
+        let browser_request = WsRequest::builder()
+            .uri("/")
+            .header(HOST, "localhost:9944")
+            .header(ORIGIN, "http://localhost:3000")
+            .body(())
+            .unwrap();
+        assert!(ws_request_has_safe_origin(&browser_request));
+
+        for (host, origin) in [
+            ("localhost.example.com:9944", None),
+            ("127.0.0.1.example.com:9944", None),
+            ("localhost:9944", Some("https://attacker.example")),
+            ("localhost:9944", Some("null")),
+        ] {
+            let mut request = WsRequest::builder().uri("/").header(HOST, host);
+            if let Some(origin) = origin {
+                request = request.header(ORIGIN, origin);
+            }
+            assert!(!ws_request_has_safe_origin(&request.body(()).unwrap()));
+        }
+    }
+
+    #[test]
+    fn websocket_config_has_hard_memory_limits() {
+        let config = websocket_config();
+        assert_eq!(config.max_message_size, Some(MAX_WS_MESSAGE_BYTES));
+        assert_eq!(config.max_frame_size, Some(MAX_WS_FRAME_BYTES));
+        assert!(config.max_write_buffer_size <= MAX_WS_MESSAGE_BYTES + 16 * 1024);
+    }
 
     struct StubVault {
         containers: Vec<ContainerInfo>,
@@ -2190,6 +2504,14 @@ mod tests {
         fn record(&self, event: AuditEvent) -> std::result::Result<(), String> {
             self.0.lock().unwrap().push(event);
             Ok(())
+        }
+    }
+
+    struct FailingAudit;
+
+    impl AuditSink for FailingAudit {
+        fn record(&self, _event: AuditEvent) -> std::result::Result<(), String> {
+            Err("disk full".into())
         }
     }
 
@@ -2486,6 +2808,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_read_rejects_oversized_existing_file() {
+        let vault = make_vault(false);
+        vault.files.lock().unwrap().insert(
+            ("notes".into(), "large.bin".into()),
+            vec![0u8; MAX_WS_FILE_BYTES + 1],
+        );
+        let server = McpServer::new(Arc::new(Mutex::new(Some(vault))), "test-secret");
+        let mut pair = PairState::AlreadyPaired(None);
+        let response = server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vault.read","arguments":{"container":"notes","file_name":"large.bin"}}}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("WebSocket read limit"));
+    }
+
+    #[tokio::test]
     async fn locked_vault_returns_error() {
         let vault: SharedVault<StubVault> = Arc::new(Mutex::new(None));
         let server = McpServer::new(vault, "x");
@@ -2534,6 +2881,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit_preflight_failure_prevents_vault_mutation() {
+        let vault = Arc::new(Mutex::new(Some(make_vault(false))));
+        let server =
+            McpServer::new(vault.clone(), "test-secret").with_audit_sink(Arc::new(FailingAudit));
+        let mut pair = PairState::AlreadyPaired(None);
+        let payload = B64.encode(b"must-not-be-written");
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.write","arguments":{{"container":"notes","file_name":"blocked.txt","content_b64":"{payload}"}}}}}}"#
+        );
+
+        let response = server
+            .dispatch(&request, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("authenticated audit log unavailable"));
+
+        let guard = vault.lock().await;
+        assert!(guard.as_ref().unwrap().files.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_operation_records_attempt_and_outcome() {
+        let audit = Arc::new(MemoryAudit(Default::default()));
+        let server = server().with_audit_sink(audit.clone());
+        let mut pair = PairState::AlreadyPaired(None);
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vault.list","arguments":{}}}"#;
+
+        let response = server
+            .dispatch(request, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], false);
+
+        let events = audit.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].decision, AuditDecision::Attempted);
+        assert_eq!(events[1].decision, AuditDecision::Allowed);
+    }
+
+    #[tokio::test]
     async fn native_mode_routes_through_access_controller() {
         // NATIVE is reserved/unimplemented: it must reach the controller (which
         // rejects it) rather than silently degrading to promptless DIRECT access.
@@ -2555,6 +2946,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn modeless_sensitive_action_routes_through_access_controller() {
+        let server = server().with_access_controller(Arc::new(DenyController));
+        let mut pair = PairState::AlreadyPaired(None);
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vault.create_transit_key","arguments":{"name":"key-1"}}}"#;
+        let response = server
+            .dispatch(request, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("denied CreateTransitKey"));
     }
 
     struct FakeAuthenticator {
@@ -2865,6 +3273,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anonymized_read_denies_binary_content_that_cannot_be_redacted() {
+        let server = server();
+        let mut pair = PairState::AlreadyPaired(None);
+        let payload = B64.encode([0xff, 0xfe, 0x00, 0x41]);
+        let write = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.write","arguments":{{"container":"anon","file_name":"binary.dat","content_b64":"{payload}"}}}}}}"#
+        );
+        server
+            .dispatch(&write, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+
+        let response = server
+            .dispatch(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"vault.read","arguments":{"container":"anon","file_name":"binary.dat"}}}"#,
+                &mut pair,
+                AccessTransport::McpWs,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response["result"]["isError"], true);
+        let error = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(error.contains("cannot be safely redacted"), "{error}");
+        assert!(!response.to_string().contains(&payload));
+    }
+
+    #[tokio::test]
     async fn non_anonymized_read_is_not_masked() {
         // A normal (APPROVAL/DIRECT) read returns content verbatim.
         let server = server();
@@ -2918,6 +3354,211 @@ mod tests {
         assert_eq!(
             read_timing.total,
             read_timing.validate + read_timing.authorize + read_timing.execute + read_timing.filter
+        );
+    }
+
+    #[tokio::test]
+    async fn prebound_non_loopback_listener_is_rejected() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let error = Arc::new(server())
+            .serve_ws_listener(listener, shutdown_rx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("non-loopback MCP listener"));
+    }
+
+    // ── authorization_context unit tests ──────────────────────────────
+
+    #[test]
+    fn same_tool_args_with_different_otp_produce_identical_context() {
+        let args1 = json!({
+            "container": "notes",
+            "file_name": "a.txt",
+            "otp": "123456",
+        });
+        let args2 = json!({
+            "container": "notes",
+            "file_name": "a.txt",
+            "otp": "999999",
+        });
+        let ctx1 = build_authorization_context("vault.read", &args1);
+        let ctx2 = build_authorization_context("vault.read", &args2);
+        assert_eq!(ctx1, ctx2, "OTP must be stripped before hashing");
+    }
+
+    #[test]
+    fn recursively_reordered_object_keys_produce_identical_context() {
+        let args1 = json!({
+            "file_name": "a.txt",
+            "container": "notes",
+            "content_b64": "SGVsbG8=",
+        });
+        let args2 = json!({
+            "content_b64": "SGVsbG8=",
+            "container": "notes",
+            "file_name": "a.txt",
+        });
+        let ctx1 = build_authorization_context("vault.write", &args1);
+        let ctx2 = build_authorization_context("vault.write", &args2);
+        assert_eq!(ctx1, ctx2, "key reordering must not change the digest");
+    }
+
+    #[test]
+    fn changing_content_b64_changes_context() {
+        let args1 = json!({
+            "container": "notes",
+            "file_name": "a.txt",
+            "content_b64": "SGVsbG8=",
+        });
+        let args2 = json!({
+            "container": "notes",
+            "file_name": "a.txt",
+            "content_b64": "V29ybGQ=",
+        });
+        let ctx1 = build_authorization_context("vault.write", &args1);
+        let ctx2 = build_authorization_context("vault.write", &args2);
+        assert_ne!(
+            ctx1, ctx2,
+            "different content_b64 must produce different digest"
+        );
+    }
+
+    #[test]
+    fn changing_broker_url_changes_context() {
+        let args1 = json!({
+            "secret_ref": "mysecret",
+            "method": "GET",
+            "url": "https://api.example.com/v1/data",
+        });
+        let args2 = json!({
+            "secret_ref": "mysecret",
+            "method": "GET",
+            "url": "https://other.example.com/v2/other",
+        });
+        let ctx1 = build_authorization_context("vault.broker_request", &args1);
+        let ctx2 = build_authorization_context("vault.broker_request", &args2);
+        assert_ne!(
+            ctx1, ctx2,
+            "different broker URL must produce different digest"
+        );
+    }
+
+    #[test]
+    fn changing_broker_body_changes_context() {
+        let args1 = json!({
+            "secret_ref": "mysecret",
+            "method": "POST",
+            "url": "https://api.example.com/v1/data",
+            "body": "{\"key\":\"value1\"}",
+        });
+        let args2 = json!({
+            "secret_ref": "mysecret",
+            "method": "POST",
+            "url": "https://api.example.com/v1/data",
+            "body": "{\"key\":\"value2\"}",
+        });
+        let ctx1 = build_authorization_context("vault.broker_request", &args1);
+        let ctx2 = build_authorization_context("vault.broker_request", &args2);
+        assert_ne!(
+            ctx1, ctx2,
+            "different broker body must produce different digest"
+        );
+    }
+
+    #[test]
+    fn changing_broker_headers_changes_context() {
+        let args1 = json!({
+            "secret_ref": "mysecret",
+            "method": "GET",
+            "url": "https://api.example.com/v1/data",
+            "headers": { "X-Custom": "a" },
+        });
+        let args2 = json!({
+            "secret_ref": "mysecret",
+            "method": "GET",
+            "url": "https://api.example.com/v1/data",
+            "headers": { "X-Custom": "b" },
+        });
+        let ctx1 = build_authorization_context("vault.broker_request", &args1);
+        let ctx2 = build_authorization_context("vault.broker_request", &args2);
+        assert_ne!(
+            ctx1, ctx2,
+            "different broker headers must produce different digest"
+        );
+    }
+
+    #[test]
+    fn record_audit_sanitizes_error_for_denied_and_error_decisions() {
+        let audit = Arc::new(MemoryAudit(Default::default()));
+        let server = server().with_audit_sink(audit.clone());
+
+        // Build a minimal AccessRequest for the test.
+        let request = AccessRequest {
+            transport: AccessTransport::McpWs,
+            action: AccessAction::ReadFile,
+            container: Some("secrets".into()),
+            file_name: Some("passwords.txt".into()),
+            mode: Some(SecurityMode::Approval),
+            byte_size: None,
+            agent_id: Some("ag_1".into()),
+            otp: None,
+            authorization_context: String::new(),
+        };
+
+        // Record an Error decision with a raw error containing a private path and a secret.
+        let raw_error =
+            "I/O error at /private/path/to/secret.key: Permission denied (secret=sk_live_abc123)"
+                .to_string();
+        server
+            .record_audit(
+                &request,
+                AuditDecision::Error,
+                None,
+                Some(raw_error.clone()),
+            )
+            .unwrap();
+
+        // Record a Denied decision with the same raw error.
+        server
+            .record_audit(
+                &request,
+                AuditDecision::Denied,
+                None,
+                Some(raw_error.clone()),
+            )
+            .unwrap();
+
+        let events = audit.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+
+        // First event: Error decision → error field must be "operation failed"
+        assert_eq!(events[0].decision, AuditDecision::Error);
+        assert_eq!(
+            events[0].error.as_deref(),
+            Some("operation failed"),
+            "Error decision must store 'operation failed', not the raw error"
+        );
+        // The raw error must never appear in the stored event.
+        assert!(
+            !serde_json::to_string(&events[0])
+                .unwrap()
+                .contains(&raw_error),
+            "raw error string must not leak into the audit event"
+        );
+
+        // Second event: Denied decision → error field must be "request denied"
+        assert_eq!(events[1].decision, AuditDecision::Denied);
+        assert_eq!(
+            events[1].error.as_deref(),
+            Some("request denied"),
+            "Denied decision must store 'request denied', not the raw error"
+        );
+        assert!(
+            !serde_json::to_string(&events[1])
+                .unwrap()
+                .contains(&raw_error),
+            "raw error string must not leak into the audit event"
         );
     }
 }

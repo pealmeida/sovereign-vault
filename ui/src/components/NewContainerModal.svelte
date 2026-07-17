@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { X } from 'lucide-svelte';
+  import { X } from '@lucide/svelte';
   import type { Mode } from '../lib/types';
   import ModePill from './ModePill.svelte';
   import { containerStore } from '../stores/containers.svelte';

@@ -1,6 +1,6 @@
 # Getting started - using Sovereign Vault with your projects
 
-> **Status: pre-alpha (v0.0.0).** Single-user, single-machine, local-only. Schema and on-disk formats may still change. For genuinely sensitive production secrets, treat this as evaluation software: keep an independent copy of anything you store, and read the **Protect your data** section below before you rely on it.
+> **Status: early release (v0.1.0).** Single-user, single-machine, local-only. The on-disk format and APIs may still change. For genuinely sensitive production secrets, treat this as evaluation software: keep an independent copy of anything you store, and read the **Protect your data** section below before you rely on it.
 
 ## 1. Build and run
 
@@ -85,7 +85,7 @@ Broker features are **disabled by default** and approval-gated. To enable them, 
 - **Back up `keyring.svault` and your recovery phrase, stored separately.** Losing both means permanent data loss.
 - **Changing the passphrase** re-wraps the keyring only. It does not change the recovery phrase.
 - **Rotating the key** re-encrypts every file and issues a new recovery phrase. The old one stops working.
-- **Keep an independent copy** of any secret you cannot afford to lose while this is pre-alpha.
+- **Keep an independent copy** of any secret you cannot afford to lose while this is an early release.
 - The audit log is tamper-evident (hash-chained) and redacts container/file names, but it is not itself encrypted.
 
 ## Verify your build is sound

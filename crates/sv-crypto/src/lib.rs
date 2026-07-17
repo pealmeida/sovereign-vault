@@ -154,7 +154,9 @@ pub fn seal(key: &MasterKey, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::rng().fill_bytes(&mut nonce_bytes);
-    let nonce = XNonce::from_slice(&nonce_bytes);
+    let nonce: &XNonce = nonce_bytes[..]
+        .try_into()
+        .expect("XChaCha20 nonce has the protocol-defined length");
     let ct = cipher
         .encrypt(
             nonce,
@@ -183,7 +185,9 @@ pub fn open(key: &MasterKey, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     }
     let (nonce_bytes, ct) = sealed.split_at(NONCE_LEN);
     let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
-    let nonce = XNonce::from_slice(nonce_bytes);
+    let nonce: &XNonce = nonce_bytes
+        .try_into()
+        .expect("split nonce has the protocol-defined length");
     cipher
         .decrypt(nonce, Payload { msg: ct, aad })
         .map_err(|e| CryptoError::Aead(e.to_string()))
@@ -270,6 +274,15 @@ mod tests {
         let key = MasterKey::generate();
         let sealed = seal(&key, b"data", b"aad-1").unwrap();
         assert!(open(&key, &sealed, b"aad-2").is_err());
+    }
+
+    #[test]
+    fn open_rejects_tampered_ciphertext() {
+        let key = MasterKey::generate();
+        let mut sealed = seal(&key, b"data", b"aad").unwrap();
+        let last = sealed.last_mut().unwrap();
+        *last ^= 0x01;
+        assert!(open(&key, &sealed, b"aad").is_err());
     }
 
     #[test]

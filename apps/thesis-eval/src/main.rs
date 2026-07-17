@@ -105,8 +105,12 @@ fn tmp_root(label: &str) -> PathBuf {
 /// Bootstrap a throwaway vault (passphrase custody) at a temp root.
 fn bootstrap(label: &str) -> (VaultHandle, PathBuf) {
     let root = tmp_root(label);
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("eval-pw"))
-        .expect("bootstrap vault");
+    let boot = VaultHandle::bootstrap(
+        &root,
+        CustodyMode::Passphrase,
+        Some("evaluation-passphrase"),
+    )
+    .expect("bootstrap vault");
     (boot.handle, root)
 }
 
@@ -229,7 +233,7 @@ impl AgentAuthenticator for HarnessAuthenticator {
                 if token != self.shared_secret {
                     return Err("invalid shared secret".into());
                 }
-                sv_core::agents::list_agents(&self.root)
+                sv_core::agents::list_agents(&self.root, &self.token_key)
                     .map_err(|e| e.to_string())?
                     .into_iter()
                     .find(|a| a.name == sv_core::agents::DEFAULT_AGENT_NAME && !a.revoked)

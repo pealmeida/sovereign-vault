@@ -26,7 +26,8 @@ fn tmp_dir(label: &str) -> PathBuf {
 #[tokio::test]
 async fn agent_writes_and_reads_real_vault_over_mcp_stdio() {
     let root = tmp_dir("rw");
-    let boot = VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("pw")).unwrap();
+    let boot =
+        VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some("mcp-e2e-passphrase")).unwrap();
     boot.handle
         .create_container("notes", SecurityMode::Direct, None)
         .unwrap();

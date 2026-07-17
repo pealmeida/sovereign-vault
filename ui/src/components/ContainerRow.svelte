@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ChevronDown, ChevronRight, FolderOpen, Trash2 } from 'lucide-svelte';
+  import { ChevronDown, ChevronRight, FolderOpen, Trash2 } from '@lucide/svelte';
   import type { ContainerInfo } from '../lib/types';
   import ModePill from './ModePill.svelte';
   import ContextMenu from './ContextMenu.svelte';

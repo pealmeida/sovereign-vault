@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -80,14 +81,175 @@ enum ApprovalPromptKind {
 /// How long an issued OTP challenge stays valid for the resend.
 const OTP_TTL_SECS: u64 = 120;
 
+/// Maximum number of wrong OTP attempts before lockout.
+const OTP_MAX_ATTEMPTS: u8 = 5;
+
+/// Lockout duration after exceeding max attempts.
+const OTP_LOCKOUT_SECS: u64 = 300; // 5 minutes
+
+/// Maximum number of concurrent pending OTP challenges. Prevents unbounded
+/// memory growth from a flood of unique request signatures.
+const OTP_MAX_PENDING: usize = 1024;
+
+/// Production OTP challenge state with rate limiting.
+#[derive(Clone)]
+struct OtpChallenge {
+    /// The OTP code (never logged).
+    code: String,
+    /// Modal ID shown on the desktop.
+    modal_id: u64,
+    /// When the challenge was issued.
+    issued_at: Instant,
+    /// Number of failed validation attempts.
+    failed_attempts: u8,
+    /// If locked out, the time until which requests are denied.
+    lockout_until: Option<Instant>,
+}
+
+impl OtpChallenge {
+    fn new(code: String, modal_id: u64) -> Self {
+        Self {
+            code,
+            modal_id,
+            issued_at: Instant::now(),
+            failed_attempts: 0,
+            lockout_until: None,
+        }
+    }
+
+    /// Check if the challenge is expired (TTL exceeded).
+    fn is_expired(&self) -> bool {
+        self.issued_at.elapsed() > Duration::from_secs(OTP_TTL_SECS)
+    }
+
+    /// Check if the challenge is currently locked out.
+    fn is_locked_out(&self) -> bool {
+        self.lockout_until
+            .map(|until| Instant::now() < until)
+            .unwrap_or(false)
+    }
+
+    /// Record a failed attempt. Returns true if this triggers lockout.
+    fn record_failure(&mut self) -> bool {
+        self.failed_attempts = self.failed_attempts.saturating_add(1);
+        if self.failed_attempts >= OTP_MAX_ATTEMPTS {
+            self.lockout_until = Some(Instant::now() + Duration::from_secs(OTP_LOCKOUT_SECS));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Validate an OTP code with constant-time comparison.
+    fn validate(&self, supplied: &str) -> bool {
+        if self.is_expired() || self.is_locked_out() {
+            return false;
+        }
+        supplied.as_bytes().ct_eq(self.code.as_bytes()).into()
+    }
+}
+
+/// Result of processing an OTP request.
+enum OtpProcessResult {
+    /// Challenge accepted; modal should be cancelled.
+    Accepted { modal_id: u64 },
+    /// Challenge required; caller should issue a fresh one via handle_otp_fresh.
+    NeedFresh,
+    /// Request denied due to lockout.
+    LockedOut,
+    /// Invalid code; challenge remains active.
+    Invalid,
+    /// Challenge expired; caller should issue a fresh one via handle_otp_fresh.
+    Expired,
+}
+
+/// Process an OTP request against existing or new challenge state.
+/// This is the pure state transition logic, testable without Tauri dependencies.
+/// Does NOT generate new codes - returns NeedFresh/Expired when no challenge exists.
+fn process_otp_request(
+    challenge: Option<&mut OtpChallenge>,
+    supplied_otp: Option<&str>,
+) -> (OtpProcessResult, Option<OtpChallenge>) {
+    // Case 1: Supplied OTP for validation
+    if let Some(supplied) = supplied_otp {
+        if let Some(chal) = challenge {
+            // Check lockout first - denies even if code would match
+            if chal.is_locked_out() {
+                return (OtpProcessResult::LockedOut, Some(chal.clone()));
+            }
+
+            // Check expiry
+            if chal.is_expired() {
+                return (OtpProcessResult::Expired, None);
+            }
+
+            // Validate
+            if chal.validate(supplied) {
+                let modal_id = chal.modal_id;
+                return (OtpProcessResult::Accepted { modal_id }, None);
+            } else {
+                // Record failure
+                let _triggers_lockout = chal.record_failure();
+                let updated = chal.clone();
+                return (OtpProcessResult::Invalid, Some(updated));
+            }
+        } else {
+            // No challenge exists for this signature - treat as expired/needs fresh
+            return (OtpProcessResult::Expired, None);
+        }
+    }
+
+    // Case 2: No-code request (initial or retry without OTP)
+    if let Some(chal) = challenge {
+        // Check lockout - no-code requests cannot bypass lockout
+        if chal.is_locked_out() {
+            return (OtpProcessResult::LockedOut, Some(chal.clone()));
+        }
+
+        // Check expiry
+        if chal.is_expired() {
+            return (OtpProcessResult::Expired, None);
+        }
+
+        // Reuse existing challenge - do NOT emit new modal
+        return (OtpProcessResult::NeedFresh, Some(chal.clone()));
+    }
+
+    // Case 3: No existing challenge - signal need for fresh challenge
+    (OtpProcessResult::NeedFresh, None)
+}
+
+/// Check whether a new OTP challenge can be admitted given the current store.
+///
+/// Existing signatures are always admissible (still processable) regardless of
+/// store size. A **new** signature is denied when the store has reached
+/// [`OTP_MAX_PENDING`], bounding memory usage against a flood of unique
+/// request signatures.
+///
+/// This is a pure helper with no Tauri dependency, so it can be unit-tested in
+/// isolation.
+fn can_admit_challenge(store: &HashMap<String, OtpChallenge>, key: &str) -> bool {
+    if store.contains_key(key) {
+        return true;
+    }
+    store.len() < OTP_MAX_PENDING
+}
+
+/// Generate a 6-digit OTP code using cryptographically secure random bytes.
+/// Fallible - no zero/predictable fallback.
+fn generate_otp_code() -> Result<String, String> {
+    let bytes = sv_core::sv_crypto::random_bytes(4).map_err(estr)?;
+    let n = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 1_000_000;
+    Ok(format!("{n:06}"))
+}
+
 struct ApprovalState {
     app: AppHandle,
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, PendingApproval>>,
-    /// Outstanding OTP challenges keyed by request signature →
-    /// (code, modal_id, issued_at). The code is shown on the desktop; the agent
-    /// resends the request with it. Single-use, TTL-bounded.
-    otp_pending: Mutex<HashMap<String, (String, u64, Instant)>>,
+    /// Outstanding OTP challenges keyed by request signature.
+    /// Includes rate limiting state (failed attempts, lockout).
+    otp_pending: Mutex<HashMap<String, OtpChallenge>>,
 }
 
 impl ApprovalState {
@@ -100,45 +262,172 @@ impl ApprovalState {
         }
     }
 
-    /// OTP cross-channel flow. First call (no/invalid code): issue a fresh code,
-    /// show it on the desktop (display-only), and return `otp_required` so the
-    /// agent prompts for it. Second call carrying the matching code: consume it
-    /// and allow. The code is never accepted from the same channel that shows
-    /// it — it binds the agent session to a human at the trusted desktop.
+    /// Prune expired challenges and expired lockouts.
+    fn prune_expired(&self, store: &mut HashMap<String, OtpChallenge>) {
+        let now = Instant::now();
+        store.retain(|_, chal| {
+            // Keep if not expired OR if locked out but lockout hasn't expired
+            !chal.is_expired() || chal.lockout_until.map(|until| now < until).unwrap_or(false)
+        });
+    }
+
+    /// OTP cross-channel flow with production rate limiting.
+    ///
+    /// First call (no/invalid code): issue a fresh code, show it on the desktop
+    /// (display-only), and return `otp_required` so the agent prompts for it.
+    /// Subsequent no-code requests for the same signature reuse the current
+    /// challenge without emitting a new modal.
+    ///
+    /// Wrong OTP increments attempt counter; after 5 failures, lock out for 5
+    /// minutes and cancel the modal. Lockout cannot be bypassed by no-code requests.
+    ///
+    /// The pending challenge map is TTL-pruned and size-capped at
+    /// [`OTP_MAX_PENDING`]; a **new** request signature is denied with the
+    /// generic `otp_required` error when the cap is reached, while existing
+    /// signatures remain fully processable.
     async fn handle_otp(&self, request: &sv_mcp::AccessRequest) -> Result<(), String> {
         let key = request_signature(request);
+        let supplied = request.otp.as_deref();
 
-        if let Some(supplied) = request.otp.as_deref() {
-            let mut store = self.otp_pending.lock().await;
-            if let Some((code, modal_id, issued)) = store.get(&key) {
-                let fresh = issued.elapsed() < Duration::from_secs(OTP_TTL_SECS);
-                if fresh && supplied == code.as_str() {
-                    let modal_id = *modal_id;
-                    store.remove(&key);
-                    drop(store);
-                    // Consumed — close the display modal on the desktop.
-                    let _ = self
-                        .app
-                        .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: modal_id });
-                    return Ok(());
-                }
-            }
-            // Wrong or expired code → fall through and issue a fresh challenge.
+        let mut store = self.otp_pending.lock().await;
+
+        // Prune expired entries before processing
+        self.prune_expired(&mut store);
+
+        // Enforce size cap: deny new signatures when the map is full.
+        // Existing signatures remain processable regardless of cap.
+        if !can_admit_challenge(&store, &key) {
+            drop(store);
+            return Err(
+                "otp_required: a one-time code is shown on the Sovereign Vault desktop. \
+                 Resend this exact request with the `otp` argument set to that code."
+                    .into(),
+            );
         }
 
-        // Issue a new challenge.
-        let code = generate_otp_code()?;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut store = self.otp_pending.lock().await;
-            // Supersede any prior challenge for this signature (close its modal).
-            if let Some((_, old_modal, _)) = store.remove(&key) {
+        // Get the existing challenge's modal_id before mutation (for reuse detection)
+        let existing_modal_id = store.get(&key).map(|c| c.modal_id);
+
+        // Process the request through pure state transition logic
+        let existing = store.get_mut(&key);
+        let (result, new_challenge) = process_otp_request(existing, supplied);
+
+        match result {
+            OtpProcessResult::Accepted { modal_id } => {
+                // Valid OTP - remove challenge and cancel modal
+                store.remove(&key);
+                drop(store);
                 let _ = self
                     .app
-                    .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: old_modal });
+                    .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: modal_id });
+                Ok(())
             }
-            store.insert(key, (code.clone(), id, Instant::now()));
+            OtpProcessResult::NeedFresh => {
+                // Handle fresh challenge or reuse
+                if let Some(chal) = new_challenge {
+                    let is_fresh =
+                        existing_modal_id.is_none() || existing_modal_id != Some(chal.modal_id);
+                    let should_emit_modal = if !is_fresh && existing_modal_id == Some(chal.modal_id)
+                    {
+                        // Reuse - just update the store with the same modal
+                        store.insert(key.clone(), chal.clone());
+                        false
+                    } else {
+                        // Fresh challenge - may need to cancel old modal first
+                        if let Some(old_modal) = existing_modal_id {
+                            if old_modal != chal.modal_id {
+                                let _ = self
+                                    .app
+                                    .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: old_modal });
+                            }
+                        }
+                        store.insert(key.clone(), chal.clone());
+                        true
+                    };
+
+                    let modal_id = chal.modal_id;
+                    let code = chal.code.clone();
+                    drop(store);
+
+                    // Only emit modal for fresh challenges (not reuse)
+                    if should_emit_modal {
+                        let payload = ApprovalPrompt {
+                            id: modal_id,
+                            action: format!("{:?}", request.action),
+                            container: request.container.clone(),
+                            file_name: request.file_name.clone(),
+                            mode: request.mode.map(|m| m.as_str().to_string()),
+                            byte_size: request.byte_size,
+                            otp_code: Some(code),
+                        };
+                        self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
+                    }
+
+                    Err(
+                        "otp_required: a one-time code is shown on the Sovereign Vault desktop. \
+                         Resend this exact request with the `otp` argument set to that code."
+                            .into(),
+                    )
+                } else {
+                    // No challenge - need to issue fresh one
+                    drop(store);
+                    self.handle_otp_fresh(request).await
+                }
+            }
+            OtpProcessResult::LockedOut => {
+                drop(store);
+                Err("otp_required: too many failed attempts; retry after 5 minutes".into())
+            }
+            OtpProcessResult::Invalid => {
+                // Update store with incremented failure count
+                if let Some(chal) = new_challenge {
+                    if chal.is_locked_out() {
+                        // Lockout just triggered - cancel the modal
+                        let modal_id = chal.modal_id;
+                        store.insert(key, chal);
+                        drop(store);
+                        let _ = self
+                            .app
+                            .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: modal_id });
+                    } else {
+                        store.insert(key, chal);
+                        drop(store);
+                    }
+                } else {
+                    drop(store);
+                }
+                Err("otp_required: invalid code".into())
+            }
+            OtpProcessResult::Expired => {
+                // Remove expired challenge and issue fresh one
+                store.remove(&key);
+                drop(store);
+                // Call handle_otp_fresh to issue a fresh challenge
+                self.handle_otp_fresh(request).await
+            }
         }
+    }
+
+    /// Issue a fresh OTP challenge (used after expiry or when no challenge exists).
+    async fn handle_otp_fresh(&self, request: &sv_mcp::AccessRequest) -> Result<(), String> {
+        let key = request_signature(request);
+        let code = generate_otp_code()?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+
+        let mut store = self.otp_pending.lock().await;
+
+        // Cancel any prior modal for this signature
+        if let Some(old_chal) = store.remove(&key) {
+            let _ = self.app.emit(
+                APPROVAL_CANCEL_EVENT,
+                ApprovalCancel {
+                    id: old_chal.modal_id,
+                },
+            );
+        }
+
+        store.insert(key, OtpChallenge::new(code.clone(), id));
+        drop(store);
 
         let payload = ApprovalPrompt {
             id,
@@ -320,9 +609,8 @@ impl DesktopAuditSink {
 
 impl sv_mcp::AuditSink for DesktopAuditSink {
     fn record(&self, event: AuditEvent) -> Result<(), String> {
-        AuditLog::with_hmac_key(&self.root, self.hmac_key)
-            .record(&event)
-            .map_err(estr)
+        let log = AuditLog::with_hmac_key(&self.root, self.hmac_key).map_err(estr)?;
+        log.record(&event).map_err(estr)
     }
 }
 
@@ -386,7 +674,7 @@ impl sv_mcp::AgentAuthenticator for DesktopAgentAuthenticator {
                 if token != self.shared_secret {
                     return Err("invalid shared secret".into());
                 }
-                sv_core::agents::list_agents(&self.root)
+                sv_core::agents::list_agents(&self.root, &self.token_key)
                     .map_err(estr)?
                     .into_iter()
                     .find(|a| a.name == sv_core::agents::DEFAULT_AGENT_NAME && !a.revoked)
@@ -458,7 +746,19 @@ fn record_desktop_event(state: &VaultState, event: AuditEvent) {
     let Ok(root) = audit_root(state) else {
         return;
     };
-    let _ = AuditLog::new(&root).record(&event);
+    // Fail-closed best-effort: derive the audit HMAC key from the live handle.
+    // If the vault is locked (no handle or the shared handle is contended),
+    // silently skip recording rather than emitting an unauthenticated event.
+    let Ok(guard) = state.handle.try_lock() else {
+        return;
+    };
+    let Some(handle) = guard.as_ref() else {
+        return;
+    };
+    let audit_hmac_key = handle.audit_hmac_key();
+    if let Ok(log) = AuditLog::with_hmac_key(&root, audit_hmac_key) {
+        let _ = log.record(&event);
+    }
 }
 
 fn approval_requirement(request: &sv_mcp::AccessRequest) -> Result<ApprovalPromptKind, String> {
@@ -503,12 +803,6 @@ fn approval_requirement(request: &sv_mcp::AccessRequest) -> Result<ApprovalPromp
             Err("NATIVE mode is not implemented for live MCP access".into())
         }
     }
-}
-
-fn generate_otp_code() -> Result<String, String> {
-    let bytes = sv_core::sv_crypto::random_bytes(4).map_err(estr)?;
-    let n = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 1_000_000;
-    Ok(format!("{n:06}"))
 }
 
 async fn with_handle<R, F>(state: &State<'_, VaultState>, f: F) -> Result<R, String>
@@ -1408,7 +1702,6 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             app.manage(VaultState::new(app.handle().clone()));
@@ -1446,4 +1739,248 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Sovereign Vault");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a test challenge with known state.
+    fn make_test_challenge(code: &str, modal_id: u64) -> OtpChallenge {
+        let mut chal = OtpChallenge::new(code.to_string(), modal_id);
+        // Override issued_at to be "now" for testing
+        chal.issued_at = Instant::now();
+        chal
+    }
+
+    #[test]
+    fn test_otp_challenge_new() {
+        let chal = make_test_challenge("123456", 1);
+        assert_eq!(chal.code, "123456");
+        assert_eq!(chal.modal_id, 1);
+        assert_eq!(chal.failed_attempts, 0);
+        assert!(chal.lockout_until.is_none());
+        assert!(!chal.is_expired());
+        assert!(!chal.is_locked_out());
+    }
+
+    #[test]
+    fn test_otp_challenge_validate_correct() {
+        let chal = make_test_challenge("123456", 1);
+        assert!(chal.validate("123456"));
+    }
+
+    #[test]
+    fn test_otp_challenge_validate_wrong() {
+        let chal = make_test_challenge("123456", 1);
+        assert!(!chal.validate("654321"));
+    }
+
+    #[test]
+    fn test_otp_challenge_expiry() {
+        let mut chal = make_test_challenge("123456", 1);
+        assert!(!chal.is_expired());
+
+        // Artificially expire by moving issued_at back
+        chal.issued_at = Instant::now() - Duration::from_secs(OTP_TTL_SECS + 1);
+        assert!(chal.is_expired());
+    }
+
+    #[test]
+    fn test_otp_challenge_lockout_after_five_failures() {
+        let mut chal = make_test_challenge("123456", 1);
+
+        // First 4 failures should not lock out
+        for i in 1..=4 {
+            assert!(!chal.record_failure(), "failure {} should not lock out", i);
+            assert!(!chal.is_locked_out());
+            assert_eq!(chal.failed_attempts, i);
+        }
+
+        // 5th failure triggers lockout
+        assert!(chal.record_failure(), "failure 5 should lock out");
+        assert!(chal.is_locked_out());
+        assert_eq!(chal.failed_attempts, 5);
+        assert!(chal.lockout_until.is_some());
+    }
+
+    #[test]
+    fn test_otp_challenge_lockout_expires() {
+        let mut chal = make_test_challenge("123456", 1);
+
+        // Trigger lockout
+        for _ in 0..5 {
+            chal.record_failure();
+        }
+        assert!(chal.is_locked_out());
+
+        // Artificially expire lockout
+        chal.lockout_until = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!chal.is_locked_out());
+    }
+
+    #[test]
+    fn test_process_otp_request_no_challenge_returns_needfresh() {
+        // No challenge exists - should return NeedFresh, not generate a new code
+        let (result, new_chal) = process_otp_request(None::<&mut OtpChallenge>, None);
+
+        assert!(matches!(result, OtpProcessResult::NeedFresh));
+        assert!(new_chal.is_none());
+    }
+
+    #[test]
+    fn test_process_otp_request_reuse_on_duplicate_no_code() {
+        let mut chal = make_test_challenge("123456", 42);
+
+        let (result, returned_chal) = process_otp_request(Some(&mut chal), None);
+
+        match result {
+            OtpProcessResult::NeedFresh => {
+                assert!(returned_chal.is_some());
+            }
+            _ => panic!("Expected NeedFresh result for reuse"),
+        }
+    }
+
+    #[test]
+    fn test_process_otp_request_wrong_code_increments_attempts() {
+        let mut chal = make_test_challenge("123456", 42);
+
+        let (result, returned_chal) = process_otp_request(Some(&mut chal), Some("wrong"));
+
+        assert!(matches!(result, OtpProcessResult::Invalid));
+        assert!(returned_chal.is_some());
+        assert_eq!(returned_chal.unwrap().failed_attempts, 1);
+    }
+
+    #[test]
+    fn test_process_otp_request_five_failures_locks() {
+        let mut chal = make_test_challenge("123456", 42);
+
+        // Record 4 failures first
+        for _ in 0..4 {
+            chal.record_failure();
+        }
+        assert_eq!(chal.failed_attempts, 4);
+
+        // 5th failure via process_otp_request
+        let (result, returned_chal) = process_otp_request(Some(&mut chal), Some("wrong"));
+
+        assert!(matches!(result, OtpProcessResult::Invalid));
+        assert!(returned_chal.is_some());
+        let returned = returned_chal.unwrap();
+        assert_eq!(returned.failed_attempts, 5);
+        assert!(returned.is_locked_out());
+    }
+
+    #[test]
+    fn test_process_otp_request_locked_out_blocks_no_code() {
+        let mut chal = make_test_challenge("123456", 42);
+        // Trigger lockout
+        for _ in 0..5 {
+            chal.record_failure();
+        }
+        assert!(chal.is_locked_out());
+
+        let (result, _) = process_otp_request(Some(&mut chal), None);
+
+        assert!(matches!(result, OtpProcessResult::LockedOut));
+    }
+
+    #[test]
+    fn test_process_otp_request_locked_out_blocks_with_code() {
+        let mut chal = make_test_challenge("123456", 42);
+        // Trigger lockout
+        for _ in 0..5 {
+            chal.record_failure();
+        }
+        assert!(chal.is_locked_out());
+
+        // Even correct code should be blocked during lockout
+        let (result, _) = process_otp_request(Some(&mut chal), Some("123456"));
+
+        assert!(matches!(result, OtpProcessResult::LockedOut));
+    }
+
+    #[test]
+    fn test_process_otp_request_correct_code_accepts() {
+        let mut chal = make_test_challenge("123456", 42);
+
+        let (result, returned_chal) = process_otp_request(Some(&mut chal), Some("123456"));
+
+        match result {
+            OtpProcessResult::Accepted { modal_id } => {
+                assert_eq!(modal_id, 42);
+                assert!(returned_chal.is_none()); // Challenge consumed
+            }
+            _ => panic!("Expected Accepted result"),
+        }
+    }
+
+    #[test]
+    fn test_process_otp_request_expired_returns_expired() {
+        let mut chal = make_test_challenge("123456", 42);
+        // Artificially expire
+        chal.issued_at = Instant::now() - Duration::from_secs(OTP_TTL_SECS + 1);
+
+        let (result, _) = process_otp_request(Some(&mut chal), None);
+
+        assert!(matches!(result, OtpProcessResult::Expired));
+    }
+
+    #[test]
+    fn test_process_otp_request_no_existing_challenge_with_code_expires() {
+        // No challenge exists - treated as expired/needs fresh
+        let (result, _) = process_otp_request(None::<&mut OtpChallenge>, Some("123456"));
+
+        assert!(matches!(result, OtpProcessResult::Expired));
+    }
+
+    // ------------------------------------------------------------------
+    // OTP pending map size cap tests (pure helper, no AppHandle required)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_otp_cap_allows_new_signature_below_cap() {
+        let mut store = HashMap::new();
+        // Fill to one below the cap so a new signature is still admissible.
+        for i in 0..(OTP_MAX_PENDING - 1) {
+            store.insert(format!("sig-{i}"), make_test_challenge("123456", i as u64));
+        }
+        assert_eq!(store.len(), OTP_MAX_PENDING - 1);
+
+        assert!(can_admit_challenge(&store, "sig-new"));
+    }
+
+    #[test]
+    fn test_otp_cap_denies_new_signature_at_cap() {
+        let mut store = HashMap::new();
+        for i in 0..OTP_MAX_PENDING {
+            store.insert(format!("sig-{i}"), make_test_challenge("123456", i as u64));
+        }
+        assert_eq!(store.len(), OTP_MAX_PENDING);
+
+        // New signature is denied when the cap is reached.
+        assert!(!can_admit_challenge(&store, "sig-new"));
+    }
+
+    #[test]
+    fn test_otp_cap_allows_existing_signature_at_cap() {
+        let mut store = HashMap::new();
+        for i in 0..OTP_MAX_PENDING {
+            store.insert(format!("sig-{i}"), make_test_challenge("123456", i as u64));
+        }
+        assert_eq!(store.len(), OTP_MAX_PENDING);
+
+        // Existing signatures remain processable even at the cap.
+        assert!(can_admit_challenge(&store, "sig-0"));
+        assert!(can_admit_challenge(&store, "sig-512"));
+        assert!(can_admit_challenge(&store, "sig-1023"));
+    }
+
+    #[test]
+    fn test_otp_cap_allows_empty_store() {
+        let store: HashMap<String, OtpChallenge> = HashMap::new();
+        assert!(can_admit_challenge(&store, "any-new-signature"));
+    }
 }

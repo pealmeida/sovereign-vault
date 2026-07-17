@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { X } from 'lucide-svelte';
+  import { X } from '@lucide/svelte';
   import type { ApprovalPrompt } from '../lib/types';
 
   let { prompt, onClose }: { prompt: ApprovalPrompt; onClose: () => void } = $props();

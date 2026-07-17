@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import queue
+import stat
 import subprocess
 import sys
 import tempfile
@@ -149,26 +150,55 @@ def _read_cache(container, file, ttl_ms):
     if not ttl_ms or ttl_ms <= 0:
         return None
     p = _cache_path(container, file)
-    if not p.exists():
+    try:
+        metadata = p.lstat()
+    except FileNotFoundError:
+        return None
+    if p.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        return None
+    if os.name != "nt" and metadata.st_mode & 0o077:
         return None
     try:
         data = json.loads(p.read_text("utf-8"))
         if (time.time() * 1000 - data["ts"]) > ttl_ms:
+            p.unlink(missing_ok=True)
             return None
-        return data["vars"]
+        return data["vars"] if isinstance(data.get("vars"), dict) else None
     except Exception:
         return None
 
 
+def _write_private_text(path: Path, text: str) -> None:
+    parent = path.parent if str(path.parent) else Path(".")
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=parent, text=True)
+    temporary_path = Path(temporary)
+    try:
+        os.chmod(temporary_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, path)
+        os.chmod(path, 0o600)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def _write_cache(container, file, vars):
     try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        cache_metadata = CACHE_DIR.lstat()
+        if CACHE_DIR.is_symlink() or not stat.S_ISDIR(cache_metadata.st_mode):
+            raise OSError("cache directory is not a real directory")
+        if os.name != "nt":
+            os.chmod(CACHE_DIR, 0o700)
         p = _cache_path(container, file)
-        p.write_text(json.dumps({"ts": time.time() * 1000, "vars": vars}), "utf-8")
-        try:
-            os.chmod(p, 0o600)
-        except Exception:
-            pass
+        _write_private_text(p, json.dumps({"ts": time.time() * 1000, "vars": vars}))
     except Exception:
         pass  # best-effort
 
@@ -252,11 +282,7 @@ def _main(argv):
         sys.stderr.write(f"[sv-secrets] {len(vars)} keys from {source}\n")
         text = _to_dotenv(vars)
         if out:
-            Path(out).write_text(text, "utf-8")
-            try:
-                os.chmod(out, 0o600)
-            except Exception:
-                pass
+            _write_private_text(Path(out), text)
             sys.stderr.write(f"[sv-secrets] wrote {out}\n")
         else:
             sys.stdout.write(text)

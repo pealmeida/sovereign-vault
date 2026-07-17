@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { X } from 'lucide-svelte';
+  import { X } from '@lucide/svelte';
   import type { ApprovalPrompt } from '../lib/types';
   import { approvalStore } from '../stores/approvals.svelte';
   import { toastStore } from '../stores/toast.svelte';

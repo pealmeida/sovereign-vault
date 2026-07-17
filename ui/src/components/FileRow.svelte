@@ -1,12 +1,11 @@
 <script lang="ts">
-  import { Eye, Download, Trash2 } from 'lucide-svelte';
+  import { Eye, Download, Trash2 } from '@lucide/svelte';
   import type { FileInfo } from '../lib/types';
   import ModePill from './ModePill.svelte';
   import { formatBytes, formatDate } from '../lib/formatters';
   import { fileStore } from '../stores/files.svelte';
   import { toastStore } from '../stores/toast.svelte';
-  import { save, confirm } from '@tauri-apps/plugin-dialog';
-  import { writeFile } from '@tauri-apps/plugin-fs';
+  import { confirm } from '@tauri-apps/plugin-dialog';
 
   let {
     file,
@@ -30,10 +29,8 @@
 
   async function doDownload() {
     try {
-      const bytes = await fileStore.read(container, file.name);
-      const dest = await save({ defaultPath: file.name });
+      const dest = await fileStore.export(container, file.name);
       if (!dest) return;
-      await writeFile(dest, bytes);
       toastStore.setNotice(`Saved to ${dest}`);
     } catch (e) {
       toastStore.setError(e);

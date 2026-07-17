@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/pealmeida/sovereign-vault/actions/workflows/ci.yml/badge.svg)](https://github.com/pealmeida/sovereign-vault/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
-[![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-orange.svg)](#)
+[![Status: early release](https://img.shields.io/badge/status-early--release-yellow.svg)](#)
 [![Rust](https://img.shields.io/badge/Rust-stable-informational.svg)](https://www.rust-lang.org/)
 
 Your API keys, `.env` files, and sensitive data stay encrypted on *your* machine. AI agents (Claude, Cursor, Continue, or any MCP client) request access through the [Model Context Protocol](https://modelcontextprotocol.io), and **you** approve or deny each protected operation from a desktop app. Every access is written to a tamper-evident audit log.
@@ -13,7 +13,7 @@ Your API keys, `.env` files, and sensitive data stay encrypted on *your* machine
 
 No cloud. No plaintext sprawl. No agent ever sees a secret you did not release.
 
-> **Status: pre-alpha (v0.0.0).** Usable today for local, single-user evaluation on one machine. Expect rough edges and schema churn. Keep independent backups.
+> **Status: early release (v0.1.0).** Usable today for local, single-user evaluation on one machine. The on-disk format and APIs may still change; keep independent backups.
 
 > **Academic research project.** Sovereign Vault is the Design Science Research instantiation for a USP/ICMC MBA thesis on data sovereignty for personal AI agents. Start with the [docs index](./docs/README.md), then use the [research track](./docs/research/README.md) and the [thesis materials](./docs/thesis/README.md).
 
@@ -48,7 +48,7 @@ Built for the single-developer and single-agent-fleet case that server-grade too
 
 - **Single root vault** per OS user, with sub-containers and per-container security modes.
 - **Security modes:** `DIRECT`, `APPROVAL`, `OTP`, and `ANONYMIZED`.
-- **15 default MCP tools:** file/container operations (including `vault.destroy` and a read-only `vault.info`) plus transit-key and signing-key management, encryption/decryption, signing, and verification. Operations are gated by their container's security mode — `APPROVAL`/`OTP` raise a desktop prompt; `DIRECT` and key operations run without one; the reserved `ZKP`/`NATIVE` modes are rejected at runtime. Optional broker-secret management and `vault.broker_request` are gated behind `SV_ENABLE_BROKER=1`.
+- **15 default MCP tools:** file/container operations (including `vault.destroy` and a read-only `vault.info`) plus transit-key and signing-key management, encryption/decryption, signing, and verification. File operations are gated by their container's security mode: `APPROVAL`/`OTP` raise a desktop prompt, while per-container `DIRECT` operations do not. Transit, signing, broker, global container-listing, and container-creation operations always reach the desktop approval policy. The reserved `ZKP`/`NATIVE` modes are rejected at runtime. Optional broker-secret management and `vault.broker_request` are gated behind `SV_ENABLE_BROKER=1`.
 - **Key hierarchy:** an OS-keychain key or passphrase wraps a rotatable data key.
 - **Keychain custody hardening:** vault-root-scoped keychain entries, backend availability probing, passphrase-to-keychain migration, and recovery-based repair of broken keychain wrappers.
 - **Per-agent identity and scopes** managed from the desktop.
@@ -65,7 +65,7 @@ Built for the single-developer and single-agent-fleet case that server-grade too
 
 ## Install
 
-Pre-1.0; no signed releases yet. Build from source.
+v0.1.0 is the first managed release; no signed builds yet. Build from source.
 
 **Prerequisites**
 

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Plus } from 'lucide-svelte';
+  import { Plus } from '@lucide/svelte';
   import { onMount } from 'svelte';
   import ContainerRow from '../components/ContainerRow.svelte';
   import NewContainerModal from '../components/NewContainerModal.svelte';

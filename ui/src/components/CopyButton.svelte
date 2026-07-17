@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Copy, Check } from 'lucide-svelte';
+  import { Copy, Check } from '@lucide/svelte';
   let { value, label = 'Copy' }: { value: string; label?: string } = $props();
   let copied = $state(false);
   async function doCopy() {

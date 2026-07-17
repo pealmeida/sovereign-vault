@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -31,15 +31,15 @@ unsafe_code = "forbid"
 
 [workspace.dependencies]
 # Workspace-internal crates
-sv-crypto    = { path = "crates/sv-crypto",    version = "0.0.0" }
-sv-storage   = { path = "crates/sv-storage",   version = "0.0.0" }
-sv-keychain  = { path = "crates/sv-keychain",  version = "0.0.0" }
-sv-recovery  = { path = "crates/sv-recovery",  version = "0.0.0" }
-sv-audit     = { path = "crates/sv-audit",     version = "0.0.0" }
-sv-privacy   = { path = "crates/sv-privacy",   version = "0.0.0" }
-sv-mcp       = { path = "crates/sv-mcp",       version = "0.0.0" }
-sv-http      = { path = "crates/sv-http",      version = "0.0.0" }
-sv-core      = { path = "crates/sv-core",      version = "0.0.0" }
+sv-crypto    = { path = "crates/sv-crypto",    version = "0.1.0" }
+sv-storage   = { path = "crates/sv-storage",   version = "0.1.0" }
+sv-keychain  = { path = "crates/sv-keychain",  version = "0.1.0" }
+sv-recovery  = { path = "crates/sv-recovery",  version = "0.1.0" }
+sv-audit     = { path = "crates/sv-audit",     version = "0.1.0" }
+sv-privacy   = { path = "crates/sv-privacy",   version = "0.1.0" }
+sv-mcp       = { path = "crates/sv-mcp",       version = "0.1.0" }
+sv-http      = { path = "crates/sv-http",      version = "0.1.0" }
+sv-core      = { path = "crates/sv-core",      version = "0.1.0" }
 
 # External — single source of truth for versions
 serde        = { version = "1.0",  features = ["derive"] }
@@ -55,6 +55,7 @@ subtle       = "2.6"
 zeroize      = { version = "1.8",  features = ["derive"] }
 tracing      = "0.1"
 tokio-tungstenite = "0.29"
+tokio-util   = { version = "0.7", features = ["codec"] }
 futures-util = "0.3"
 hyper        = { version = "1.10", features = ["server", "http1"] }
 hyper-util   = { version = "0.1", features = ["tokio", "server", "server-auto"] }
@@ -63,6 +64,9 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 reqwest      = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rand         = "0.10"
 getrandom    = "0.4"
+tempfile     = "3.27"
+fs4          = "1.1"
+atomicwrites = "0.4.4"
 
 [profile.release]
 lto = "thin"
