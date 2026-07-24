@@ -23,7 +23,7 @@
   "dependencies": {
     "@fontsource/fira-mono": "^5.2.7",
     "@fontsource/space-grotesk": "^5.2.10",
-    "dompurify": "^3.4.11",
+    "dompurify": "^3.4.12",
     "highlight.js": "^11.11.1",
     "@lucide/svelte": "^1.25.0",
     "marked": "^18.0.6",
