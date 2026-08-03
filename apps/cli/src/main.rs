@@ -85,9 +85,19 @@ struct ServeCli {
     #[arg(long, default_value = "127.0.0.1:9943")]
     http_bind: SocketAddr,
 
-    /// Rate limit as N/Ms (e.g. 100/60000). 0 disables.
-    #[arg(long, default_value = "0")]
+    /// Rate limit as requests per millisecond window (default: 120/60000 =
+    /// 120 requests per minute per agent). Set explicitly to 0 only to disable.
+    #[arg(long, default_value = "120/60000")]
     rate_limit: String,
+
+    /// ID of the pre-provisioned, scoped agent allowed to use this headless server.
+    #[arg(long, env = "SV_AGENT_ID")]
+    agent_id: Option<String>,
+
+    /// Read the pre-provisioned agent token from this 0600 file. Alternatively,
+    /// set SV_AGENT_TOKEN in the environment. Tokens are never accepted as CLI arguments.
+    #[arg(long, env = "SV_AGENT_TOKEN_FILE")]
+    agent_token_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -115,12 +125,14 @@ enum MigrateCommand {
         #[arg(long, env = "SV_PASSPHRASE")]
         passphrase: Option<String>,
     },
-    /// Verify the audit log hash chain. Exits non-zero on a break.
-    AuditChain,
-    /// Repair the audit checkpoint (rewrites the checkpoint to current head).
-    AuditRepair {
-        #[arg(long, default_value_t = false)]
-        yes: bool,
+    /// Verify the authenticated audit log hash chain after unlocking the vault.
+    AuditChain {
+        /// Passphrase for passphrase custody. May also be supplied as SV_PASSPHRASE.
+        #[arg(long, env = "SV_PASSPHRASE")]
+        passphrase: Option<String>,
+        /// Environment variable containing a space-separated recovery phrase.
+        #[arg(long, env = "SV_RECOVERY_ENV")]
+        recovery_env: Option<String>,
     },
     /// List revoked or expired agents that may need re-issuance.
     Agents,
@@ -189,10 +201,10 @@ fn run_agents(agents: AgentsCli) -> Result<(), String> {
 async fn run_serve(cli: ServeCli) -> Result<(), String> {
     let root = cli
         .root
-        .or_else(|| {
-            dirs::data_dir().map(|d| d.join("sovereign-vault"))
-        })
-        .ok_or_else(|| "cannot determine vault root; set --root or ensure $HOME is set".to_string())?;
+        .or_else(|| dirs::data_dir().map(|d| d.join("sovereign-vault")))
+        .ok_or_else(|| {
+            "cannot determine vault root; set --root or ensure $HOME is set".to_string()
+        })?;
 
     let passphrase = if let Some(ref path) = cli.passphrase_file {
         let content = std::fs::read_to_string(path)
@@ -219,6 +231,10 @@ async fn run_serve(cli: ServeCli) -> Result<(), String> {
     };
 
     let rate_limit = parse_rate_limit(&cli.rate_limit)?;
+    let agent_id = cli.agent_id.filter(|id| !id.is_empty()).ok_or_else(|| {
+        "headless serve requires SV_AGENT_ID for a pre-provisioned scoped agent".to_string()
+    })?;
+    let agent_token = read_headless_agent_token(cli.agent_token_file.as_deref())?;
 
     serve::run(serve::ServeArgs {
         root,
@@ -227,9 +243,51 @@ async fn run_serve(cli: ServeCli) -> Result<(), String> {
         ws_bind: cli.bind,
         http_bind: cli.http_bind,
         rate_limit,
+        agent_id,
+        agent_token,
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+fn read_headless_agent_token(token_file: Option<&std::path::Path>) -> Result<String, String> {
+    let environment_token = std::env::var("SV_AGENT_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty());
+    if environment_token.is_some() && token_file.is_some() {
+        return Err("set either SV_AGENT_TOKEN or SV_AGENT_TOKEN_FILE, not both".into());
+    }
+    if let Some(token) = environment_token {
+        return Ok(token);
+    }
+    let path = token_file.ok_or_else(|| {
+        "headless serve requires SV_AGENT_TOKEN or a 0600 SV_AGENT_TOKEN_FILE".to_string()
+    })?;
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("reading agent token file {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "agent token path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "agent token file must be owner-only (0600): {}",
+                path.display()
+            ));
+        }
+    }
+    let token = std::fs::read_to_string(path)
+        .map_err(|e| format!("reading agent token file {}: {e}", path.display()))?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err(format!("agent token file is empty: {}", path.display()));
+    }
+    Ok(token)
 }
 
 fn parse_rate_limit(raw: &str) -> Result<Option<(usize, std::time::Duration)>, String> {
@@ -276,31 +334,36 @@ fn run_migrate(m: MigrateCli) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
             eprintln!("[migrate] manifest authentication migrated");
         }
-        MigrateCommand::AuditChain => {
-            let log = sv_audit::AuditLog::open(&root, [0u8; 32]).map_err(|e| e.to_string())?;
+        MigrateCommand::AuditChain {
+            passphrase,
+            recovery_env,
+        } => {
+            let handle = if let Some(recovery_env) = recovery_env {
+                let recovery = std::env::var(&recovery_env).map_err(|_| {
+                    format!("recovery environment variable is not set: {recovery_env}")
+                })?;
+                sv_core::VaultHandle::unlock_with_recovery(&root, &recovery)
+                    .map_err(|e| e.to_string())?
+            } else {
+                sv_core::VaultHandle::unlock(
+                    &root,
+                    sv_core::CustodyMode::Passphrase,
+                    passphrase.as_deref(),
+                )
+                .map_err(|e| e.to_string())?
+            };
+            let log = sv_audit::AuditLog::with_hmac_key(&root, handle.audit_hmac_key())
+                .map_err(|e| e.to_string())?;
             let report = log.verify_chain().map_err(|e| e.to_string())?;
             eprintln!(
                 "[migrate] audit chain: {} entries, broken_at={:?}",
                 report.entries, report.first_broken
             );
             if report.first_broken.is_some() {
-                return Err("audit chain is broken; run `audit-repair --yes` to re-anchor".into());
+                return Err(
+                    "audit chain is broken; investigate from a trusted vault backup".into(),
+                );
             }
-        }
-        MigrateCommand::AuditRepair { yes } => {
-            if !yes {
-                return Err("refusing to repair audit checkpoint without --yes".into());
-            }
-            let _log =
-                sv_audit::AuditLog::open(&root, [0u8; 32]).map_err(|e| e.to_string())?;
-            // Re-anchor: just verify the chain and confirm; full repair is
-            // performed by re-rotating the DEK via `unlock` (which rewrites
-            // the lifecycle journal entry).
-            eprintln!(
-                "[migrate] audit anchor check complete; \
-                 to fully re-anchor, rotate the passphrase (locks + unlocks \
-                 the vault) via `sovereign-vault` desktop UI"
-            );
         }
         MigrateCommand::Agents => {
             // Audit log needs HMAC key for token verification; we only read
@@ -322,9 +385,7 @@ fn run_migrate(m: MigrateCli) -> Result<(), String> {
                 }
             }
             eprintln!("[migrate] agents directory entries: {count}, revoked: {revoked}");
-            eprintln!(
-                "[migrate] (use `agents.export_agents` MCP tool for full export)"
-            );
+            eprintln!("[migrate] (use `agents.export_agents` MCP tool for full export)");
         }
     }
     Ok(())
@@ -333,6 +394,17 @@ fn run_migrate(m: MigrateCli) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "sv-cli-main-test-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn parse_rate_limit_zero_disables() {
@@ -347,6 +419,13 @@ mod tests {
     }
 
     #[test]
+    fn default_headless_rate_limit_is_conservative_per_minute() {
+        let (n, window) = parse_rate_limit("120/60000").unwrap().unwrap();
+        assert_eq!(n, 120);
+        assert_eq!(window, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
     fn parse_rate_limit_zero_parts_disables() {
         assert!(parse_rate_limit("0/60000").unwrap().is_none());
         assert!(parse_rate_limit("100/0").unwrap().is_none());
@@ -357,5 +436,37 @@ mod tests {
         assert!(parse_rate_limit("abc/60000").is_err());
         assert!(parse_rate_limit("100/xyz").is_err());
         assert!(parse_rate_limit("100").is_err());
+    }
+
+    #[test]
+    fn audit_chain_uses_the_unlocked_vault_hmac_key() {
+        let root = temp_root("audit-chain");
+        let passphrase = "audit-chain-test-passphrase";
+        let bootstrap = sv_core::VaultHandle::bootstrap(
+            &root,
+            sv_core::CustodyMode::Passphrase,
+            Some(passphrase),
+        )
+        .unwrap();
+        let audit_key = bootstrap.handle.audit_hmac_key();
+        let log = sv_audit::AuditLog::with_hmac_key(&root, audit_key).unwrap();
+        log.record(&sv_audit::AuditEvent::new(
+            sv_audit::AuditAction::VaultInfo,
+            sv_audit::AuditDecision::Allowed,
+            "test",
+        ))
+        .unwrap();
+        drop(log);
+        drop(bootstrap);
+
+        run_migrate(MigrateCli {
+            command: MigrateCommand::AuditChain {
+                passphrase: Some(passphrase.to_string()),
+                recovery_env: None,
+            },
+            root: Some(root.clone()),
+        })
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

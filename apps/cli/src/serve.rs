@@ -4,10 +4,10 @@
 //! but with a fail-closed access policy: requests targeting APPROVAL / OTP /
 //! ZKP / ANONYMIZED containers are rejected, since no UI exists for human
 //! approval. Intended for unattended Linux servers, container hosts, and CI
-//! runners that need read-only access to vault contents.
+//! runners that need scoped access to vault contents.
 //!
-//! The pairing secret is printed once to stderr at startup. Capture and
-//! supply it to local MCP clients; never persist it on disk.
+//! Headless servers never mint a shared Default agent or expose a pairing
+//! secret. They require one pre-provisioned, non-empty scoped agent credential.
 
 #![forbid(unsafe_code)]
 
@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use sv_audit::{AuditDecision, AuditEvent, AuditLog};
-use sv_core::agents::{ensure_default_agent, list_agents, DEFAULT_AGENT_NAME};
+use sv_core::agents::authenticate;
 use sv_core::sv_storage::SecurityMode;
-use sv_core::{fresh_pairing_secret, BootstrapResult, CustodyMode, VaultHandle};
+use sv_core::{BootstrapResult, CustodyMode, VaultHandle};
 use sv_mcp::{
     AccessAction, AccessController, AccessRequest, AgentAuthenticator, AuditSink, RateLimiter,
     ResolvedAgent, ResolvedScope,
@@ -35,6 +35,8 @@ pub struct ServeArgs {
     pub ws_bind: SocketAddr,
     pub http_bind: SocketAddr,
     pub rate_limit: Option<(usize, std::time::Duration)>,
+    pub agent_id: String,
+    pub agent_token: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -57,10 +59,6 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
 
     let (handle, audit_hmac, agent_hmac) = open_or_bootstrap(&args).await?;
 
-    let secret = fresh_pairing_secret().map_err(|e| ServeError::Other(e.to_string()))?;
-    ensure_default_agent(&args.root, &agent_hmac, &secret)
-        .map_err(|e| ServeError::Other(e.to_string()))?;
-
     let ws_listener = TcpListener::bind(args.ws_bind).await?;
     let http_listener = TcpListener::bind(args.http_bind).await?;
 
@@ -68,13 +66,14 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     let authenticator = Arc::new(HeadlessAuthenticator::new(
         args.root.clone(),
         agent_hmac,
-        secret.clone(),
-    ));
+        args.agent_id.clone(),
+        args.agent_token.clone(),
+    )?);
     let controller = Arc::new(HeadlessAccessController);
 
     let mut server = sv_mcp::McpServer::new(
         Arc::new(Mutex::new(Some(handle))) as sv_mcp::SharedVault<VaultHandle>,
-        secret.clone(),
+        "headless-scoped-agent-credentials",
     )
     .with_audit_sink(sink.clone())
     .with_agent_authenticator(authenticator);
@@ -84,8 +83,9 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     }
     let server = Arc::new(server);
 
-    let http_secret = secret.clone();
-    let http_server = sv_http::HttpServer::new(http_secret);
+    // The headless HTTP surface intentionally has no pairing endpoint: loopback
+    // alone is not an authentication boundary between OS users.
+    let http_server = sv_http::HttpServer::without_pairing();
 
     let (ws_tx, ws_rx) = oneshot::channel::<()>();
     let (http_tx, http_rx) = oneshot::channel::<()>();
@@ -105,16 +105,7 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     });
 
     tracing::info!(ws = %args.ws_bind, http = %args.http_bind, "sovereign-vault headless gateway is up");
-    eprintln!("[serve] pairing secret (one-time display, capture immediately):");
-    eprintln!("[serve] {secret}");
-    if let Ok(agents) = list_agents(&args.root, &agent_hmac) {
-        for a in agents
-            .into_iter()
-            .filter(|a| !a.revoked && a.name != DEFAULT_AGENT_NAME)
-        {
-            eprintln!("[serve]   - {} ({})", a.name, a.agent_id);
-        }
-    }
+    tracing::info!(agent_id = %args.agent_id, "headless gateway accepts only the provisioned scoped agent");
 
     let mut term = signal(SignalKind::terminate())?;
     let mut intr = signal(SignalKind::interrupt())?;
@@ -184,17 +175,18 @@ async fn open_or_bootstrap(
     Ok((handle, audit, agent))
 }
 
-/// Fail-closed access controller: DIRECT container requests pass through, but
-/// container modes requiring human mediation and modeless secret-bearing
-/// crypto/broker requests are rejected because no UI is available.
+/// Fail-closed access controller: only explicitly safe modeless operations
+/// pass through. Container modes requiring human mediation and all
+/// secret-bearing/key-creating operations are rejected because no UI exists.
 struct HeadlessAccessController;
 
 #[async_trait::async_trait]
 impl AccessController for HeadlessAccessController {
     async fn authorize(&self, request: AccessRequest) -> Result<(), String> {
-        if is_headless_secret_bearing_action(request.action) {
+        if !is_headless_allowed_action(request.action) {
             return Err(
-                "headless mode cannot mediate crypto/broker operations; use the desktop app".into(),
+                "headless mode only permits explicitly safe scoped operations; use the desktop app"
+                    .into(),
             );
         }
         match request.mode {
@@ -206,15 +198,21 @@ impl AccessController for HeadlessAccessController {
     }
 }
 
-fn is_headless_secret_bearing_action(action: AccessAction) -> bool {
+fn is_headless_allowed_action(action: AccessAction) -> bool {
     matches!(
         action,
-        AccessAction::Encrypt
-            | AccessAction::Decrypt
-            | AccessAction::Sign
-            | AccessAction::CreateBrokerSecret
-            | AccessAction::ListBrokerSecrets
-            | AccessAction::Broker
+        AccessAction::ListContainers
+            | AccessAction::ListFiles
+            | AccessAction::ReadFile
+            | AccessAction::WriteFile
+            | AccessAction::DeleteFile
+            | AccessAction::CreateContainer
+            | AccessAction::ListTransitKeys
+            | AccessAction::ListSigningKeys
+            | AccessAction::Verify
+            | AccessAction::DestroyContainer
+            | AccessAction::VaultInfo
+            | AccessAction::ExportAgents
     )
 }
 
@@ -228,16 +226,35 @@ fn mode_needs_ui(mode: SecurityMode) -> bool {
 struct HeadlessAuthenticator {
     root: PathBuf,
     token_key: [u8; 32],
-    shared_secret: String,
+    agent_id: String,
+    agent_token: String,
 }
 
 impl HeadlessAuthenticator {
-    fn new(root: PathBuf, token_key: [u8; 32], shared_secret: String) -> Self {
-        Self {
+    fn new(
+        root: PathBuf,
+        token_key: [u8; 32],
+        agent_id: String,
+        agent_token: String,
+    ) -> Result<Self, ServeError> {
+        if agent_id.is_empty() || agent_token.is_empty() {
+            return Err(ServeError::Other(
+                "headless serve requires SV_AGENT_ID and SV_AGENT_TOKEN (or a 0600 SV_AGENT_TOKEN_FILE)".into(),
+            ));
+        }
+        let record = authenticate(&root, &token_key, &agent_id, &agent_token)
+            .map_err(|e| ServeError::Other(format!("invalid pre-provisioned agent: {e}")))?;
+        if record.scopes.is_empty() {
+            return Err(ServeError::Other(
+                "headless serve refuses unscoped agents; provision at least one scope".into(),
+            ));
+        }
+        Ok(Self {
             root,
             token_key,
-            shared_secret,
-        }
+            agent_id,
+            agent_token,
+        })
     }
 }
 
@@ -284,22 +301,17 @@ fn resolve_scopes(scopes: &[sv_core::agents::AgentScope]) -> Vec<ResolvedScope> 
 
 impl AgentAuthenticator for HeadlessAuthenticator {
     fn authenticate(&self, agent_id: Option<&str>, token: &str) -> Result<ResolvedAgent, String> {
-        let agent_id = match agent_id {
-            Some(id) => id.to_string(),
-            None => {
-                if token != self.shared_secret {
-                    return Err("invalid shared secret".into());
-                }
-                list_agents(&self.root, &self.token_key)
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .find(|a| a.name == DEFAULT_AGENT_NAME && !a.revoked)
-                    .map(|a| a.agent_id)
-                    .ok_or_else(|| "no default agent".to_string())?
-            }
-        };
-        let record = sv_core::agents::authenticate(&self.root, &self.token_key, &agent_id, token)
+        use subtle::ConstantTimeEq as _;
+
+        let token_matches: bool = token.as_bytes().ct_eq(self.agent_token.as_bytes()).into();
+        if agent_id != Some(self.agent_id.as_str()) || !token_matches {
+            return Err("credential is not the configured scoped agent".into());
+        }
+        let record = authenticate(&self.root, &self.token_key, &self.agent_id, token)
             .map_err(|e| e.to_string())?;
+        if record.scopes.is_empty() {
+            return Err("headless serve refuses unscoped agents".into());
+        }
         Ok(ResolvedAgent {
             agent_id: record.agent_id,
             scopes: resolve_scopes(&record.scopes),
@@ -376,7 +388,9 @@ mod tests {
             }],
         )
         .unwrap();
-        let authenticator = HeadlessAuthenticator::new(root.clone(), token_key, "shared".into());
+        let authenticator =
+            HeadlessAuthenticator::new(root.clone(), token_key, agent_id.clone(), token.clone())
+                .unwrap();
 
         let resolved = authenticator.authenticate(Some(&agent_id), &token).unwrap();
 
@@ -388,16 +402,20 @@ mod tests {
             vec![AccessAction::ReadFile, AccessAction::WriteFile]
         );
         assert_eq!(resolved.scopes[0].mode_ceiling, Some(SecurityMode::Otp));
+        assert!(authenticator.authenticate(None, &token).is_err());
+        assert!(authenticator.authenticate(Some("ag_other"), &token).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
-    async fn headless_controller_denies_modeless_crypto_and_broker_actions() {
+    async fn headless_controller_denies_key_creation_and_secret_bearing_actions() {
         let controller = HeadlessAccessController;
 
         for action in [
+            AccessAction::CreateTransitKey,
             AccessAction::Encrypt,
             AccessAction::Decrypt,
+            AccessAction::CreateSigningKey,
             AccessAction::Sign,
             AccessAction::CreateBrokerSecret,
             AccessAction::ListBrokerSecrets,
@@ -407,15 +425,35 @@ mod tests {
                 .authorize(request(action, None))
                 .await
                 .unwrap_err();
-            assert!(error.contains("cannot mediate crypto/broker operations"));
+            assert!(error.contains("only permits explicitly safe"));
         }
     }
 
     #[tokio::test]
-    async fn headless_controller_allows_direct_reads() {
-        HeadlessAccessController
-            .authorize(request(AccessAction::ReadFile, Some(SecurityMode::Direct)))
-            .await
+    async fn headless_controller_allows_safe_direct_actions() {
+        for action in [
+            AccessAction::ReadFile,
+            AccessAction::WriteFile,
+            AccessAction::ListFiles,
+            AccessAction::Verify,
+        ] {
+            HeadlessAccessController
+                .authorize(request(action, Some(SecurityMode::Direct)))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn headless_authenticator_rejects_unscoped_agent() {
+        let root = temp_root("unscoped");
+        let token_key = [9u8; 32];
+        let (agent_id, token) = create_agent(&root, &token_key, "unscoped", Vec::new()).unwrap();
+
+        let error = HeadlessAuthenticator::new(root.clone(), token_key, agent_id, token)
+            .err()
             .unwrap();
+        assert!(error.to_string().contains("refuses unscoped agents"));
+        fs::remove_dir_all(root).unwrap();
     }
 }

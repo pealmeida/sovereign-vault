@@ -10,13 +10,14 @@
 // Lifecycle:
 //   1. Probe 127.0.0.1:9944 for an unlocked desktop vault. If up, fetch the
 //      per-launch pairing secret from http://127.0.0.1:9943/pairing and pair.
-//   2. If desktop is not running, launch `sovereign-vault serve` headlessly.
+//   2. If desktop is not running, launch `sovereign-vault serve` headlessly
+//      with a pre-provisioned scoped agent credential.
 //      - passphrase from SV_PASSPHRASE_FILE (real vault), or
 //      - well-known SV_BRIDGE_TEST_PASS for SV_BRIDGE_TEST_ROOT (throwaway).
 //   3. Hold the WebSocket open and proxy stdin ↔ WS until opencode closes.
 
 import { spawn, execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { randomBytes, createHash } from "node:crypto";
 import { connect as netConnect } from "node:net";
@@ -170,6 +171,17 @@ class WsClient {
 // node:net without breaking older node versions — require lazily.
 async function bootHeadlessFallback() {
   let root; let passphrase;
+  const agentId = process.env.SV_AGENT_ID;
+  let agentToken = process.env.SV_AGENT_TOKEN;
+  if (!agentToken && process.env.SV_AGENT_TOKEN_FILE) {
+    const tokenFile = process.env.SV_AGENT_TOKEN_FILE;
+    const mode = statSync(tokenFile).mode & 0o777;
+    if ((mode & 0o077) !== 0) throw new Error("SV_AGENT_TOKEN_FILE must be owner-only (0600)");
+    agentToken = readFileSync(tokenFile, "utf8").trim();
+  }
+  if (!agentId || !agentToken) {
+    throw new Error("headless fallback requires SV_AGENT_ID and SV_AGENT_TOKEN (or SV_AGENT_TOKEN_FILE)");
+  }
   if (process.env.SV_PASSPHRASE_FILE) {
     passphrase = readFileSync(process.env.SV_PASSPHRASE_FILE, "utf8").trim();
     root = process.env.SV_ROOT || defaultRoot();
@@ -189,24 +201,42 @@ async function bootHeadlessFallback() {
   ], { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, SV_BRIDGE_PASS: passphrase }, detached: false });
   return new Promise((resolve, reject) => {
     let buf = "";
+    let stderrLineBuffer = "";
     let portBusy = false;
     const timer = setTimeout(() => reject(new Error("boot timeout")), BOOT_TIMEOUT_S * 1000);
     sub.stderr.on("data", (c) => {
       const text = c.toString("utf8");
       buf += text;
-      process.stderr.write(text);
+      stderrLineBuffer += text;
+      const lastNewline = stderrLineBuffer.lastIndexOf("\n");
+      if (lastNewline !== -1) {
+        const completeLines = stderrLineBuffer.slice(0, lastNewline + 1);
+        stderrLineBuffer = stderrLineBuffer.slice(lastNewline + 1);
+        process.stderr.write(redactPairingSecretLines(completeLines));
+      }
       // Detect "Address already in use" → headless can't run, but the desktop
       // (or another headless) is occupying the port. Signal the race caller.
       if (/Address already in use/i.test(text)) portBusy = true;
-      const m = buf.match(/\[serve\] ([A-Za-z0-9_\-]{20,})/);
-      if (m) { clearTimeout(timer); resolve({ child: sub, secret: m[1] }); }
+      if (/headless gateway is up/.test(buf)) {
+        clearTimeout(timer);
+        resolve({ child: sub, credential: { agentId, token: agentToken } });
+      }
     });
     sub.on("exit", (code) => {
       clearTimeout(timer);
+      if (stderrLineBuffer) process.stderr.write(redactPairingSecretLines(stderrLineBuffer));
       if (portBusy) reject(Object.assign(new Error("port busy"), { code: "PORT_BUSY" }));
       else reject(new Error(`serve exited (${code})`));
     });
   });
+}
+
+// Defense in depth: a future child must never cause a bearer pairing secret
+// to be copied into this bridge's stderr, even if it accidentally logs one.
+function redactPairingSecretLines(text) {
+  return text
+    .replace(/^.*pairing secret.*$/gim, "[sv-mcp-bridge] [REDACTED pairing secret]")
+    .replace(/^\[serve\]\s+[A-Za-z0-9_-]{20,}\s*$/gm, "[serve] [REDACTED]");
 }
 
 function defaultRoot() {
@@ -223,14 +253,17 @@ function desktopProcessRunning() {
 
 let headlessChild = null;
 
-async function openWebSocket(secret) {
-  const ws = await WsClient.connect(PAIR_ENDPOINT_HOST, PAIR_ENDPOINT_PORT, "/", secret);
+async function openWebSocket(credential) {
+  // The WS subprotocol is not an authentication channel; pairing below is.
+  const ws = await WsClient.connect(PAIR_ENDPOINT_HOST, PAIR_ENDPOINT_PORT, "/", "scoped-agent");
   // Send pair frame so the server considers us authenticated.
   const pairReq = {
     jsonrpc: "2.0",
     id: 1,
     method: "vault.pair",
-    params: { token: secret },
+    params: credential.agentId
+      ? { agent_id: credential.agentId, token: credential.token }
+      : { token: credential.token },
   };
   ws.send(JSON.stringify(pairReq));
   // Read the pair response from the WS (server replies before any other frames).
@@ -284,7 +317,7 @@ async function main() {
     process.stdout.on("drain", flushStdout);
   }
 
-  let secret;
+  let credential;
   const desktopRunning = desktopProcessRunning();
   if (desktopRunning) log("desktop process detected; waiting for unlock");
 
@@ -297,7 +330,7 @@ async function main() {
   let desktopWins = await waitForGateway(desktopRunning ? BOOT_TIMEOUT_S : 1);
   if (desktopWins) {
     try {
-      secret = await fetchPairingSecret();
+      credential = { token: await fetchPairingSecret() };
       log("using live desktop pairing secret");
       const hb = await headlessRace;
       if (hb && hb.child) try { hb.child.kill("SIGTERM"); } catch {}
@@ -314,17 +347,17 @@ async function main() {
     const tryHeadless = async () => {
       const hb = await headlessRace;
       if (resolved) return;
-      if (hb && hb.child && hb.secret) {
+      if (hb && hb.child && hb.credential) {
         resolved = true;
         headlessChild = hb.child;
-        secret = hb.secret;
-        log(`headless fallback paired (length=${secret.length})`);
+        credential = hb.credential;
+        log("headless fallback is ready with its scoped agent credential");
       } else if (hb && hb.code === "PORT_BUSY") {
         // The port is in use — assume the desktop is coming up. Poll for it.
         if (!resolved && (await waitForGateway(BOOT_TIMEOUT_S))) {
           resolved = true;
           try {
-            secret = await fetchPairingSecret();
+            credential = { token: await fetchPairingSecret() };
             log("desktop gateway came up after waiting; using live pairing");
           } catch (e) {
             log(`desktop pairing after wait failed: ${e.message}`);
@@ -340,7 +373,7 @@ async function main() {
         if (!resolved && (await waitForGateway(BOOT_TIMEOUT_S))) {
           resolved = true;
           try {
-            secret = await fetchPairingSecret();
+            credential = { token: await fetchPairingSecret() };
             log("desktop gateway came up; using live pairing");
           } catch (e) {
             log(`desktop pairing failed: ${e.message}`);
@@ -355,7 +388,7 @@ async function main() {
         if (!resolved && (await waitForGateway(BOOT_TIMEOUT_S))) {
           resolved = true;
           try {
-            secret = await fetchPairingSecret();
+            credential = { token: await fetchPairingSecret() };
             log("desktop unlocked; using live pairing");
           } catch (e) {
             log(`desktop pairing after unlock failed: ${e.message}`);
@@ -370,7 +403,7 @@ async function main() {
     await tryHeadless();
   }
 
-  const ws = await openWebSocket(secret);
+  const ws = await openWebSocket(credential);
   log("ws connected and paired");
 
   // Hand the WS callbacks to the producers + drain any pre-queued frames.
