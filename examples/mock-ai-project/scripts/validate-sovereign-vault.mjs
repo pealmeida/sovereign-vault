@@ -708,7 +708,8 @@ function renderMarkdown(summary) {
 
 function escapeCell(value) {
   return String(value ?? "")
-    .replace(/\r?\n/g, " ")
+    .replace(/\\/g, "\\\\")
+    .replace(/\r\n|[\r\n]/g, " ")
     .replace(/\|/g, "\\|");
 }
 
