@@ -1,0 +1,52 @@
+# systemd --user unit for headless Sovereign Vault gateway.
+#
+# Install:
+#   cp apps/cli/systemd/sovereign-vault.serve.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now sovereign-vault.serve.service
+#
+# Store the passphrase in a 0600 file the service reads on boot:
+#   install -m 0600 /dev/null ~/.config/sovereign-vault.passphrase
+#   $EDITOR ~/.config/sovereign-vault.passphrase
+#   chmod 0600 ~/.config/sovereign-vault.passphrase
+#
+# Provision a scoped agent in the desktop app first. Then create the owner-only
+# credentials below (see docs/USER-GUIDE.md) before starting this service.
+
+[Unit]
+Description=Sovereign Vault headless gateway (MCP + HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Required values: SV_AGENT_ID=ag_... and
+# SV_AGENT_TOKEN_FILE=%h/.config/sovereign-vault/agent.token. The passphrase
+# and agent-token files must be owner-only (0600).
+EnvironmentFile=-%h/.config/sovereign-vault/serve.env
+ExecStart=/usr/local/bin/sovereign-vault serve \
+    --root %h/.local/share/sovereign-vault \
+    --passphrase-file %h/.config/sovereign-vault.passphrase \
+    --bind 127.0.0.1:9944 \
+    --http-bind 127.0.0.1:9943 \
+    --rate-limit 100/60000
+Restart=on-failure
+RestartSec=5
+# Hardening: keep the unit confined to the user's namespace.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=%h/.local/share/sovereign-vault
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=default.target

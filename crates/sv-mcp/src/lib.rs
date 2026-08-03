@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -198,6 +199,266 @@ pub struct SigningKeyInfo {
     pub public_key_b64: String,
 }
 
+/// One scope grant attached to an agent. Mirrors `sv_core::agents::AgentScope`
+/// as an MCP-layer DTO so that sv-mcp does not need to depend on sv-core (which
+/// would create a cycle).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentScope {
+    /// Glob matched against the container name (e.g. `notes/**`).
+    pub container_glob: String,
+    /// Actions the agent may perform on matching containers.
+    pub actions: Vec<String>,
+    /// Maximum security mode the agent may exercise; cannot widen the
+    /// container's own mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_ceiling: Option<String>,
+}
+
+impl AgentScope {
+    /// Validate and resolve a persisted/imported scope without silently
+    /// discarding any part of its authority restriction.
+    pub fn resolve(&self) -> std::result::Result<ResolvedScope, String> {
+        validate_agent_scope(self)?;
+        Ok(ResolvedScope {
+            container_glob: self.container_glob.clone(),
+            actions: self
+                .actions
+                .iter()
+                .map(|action| AccessAction::parse_scope_action(action))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            mode_ceiling: self
+                .mode_ceiling
+                .as_deref()
+                .map(|mode| {
+                    SecurityMode::parse(mode).map_err(|error| {
+                        format!("invalid agent scope mode_ceiling {mode:?}: {error}")
+                    })
+                })
+                .transpose()?,
+        })
+    }
+}
+
+/// Validate one agent scope before it is persisted or resolved.
+///
+/// Scope parsing must fail closed: dropping an unknown action or an invalid
+/// mode ceiling would turn a malformed restriction into broader authority.
+pub fn validate_agent_scope(scope: &AgentScope) -> std::result::Result<(), String> {
+    validate_scope_glob(&scope.container_glob)?;
+    if scope.actions.is_empty() {
+        return Err("agent scope.actions must contain at least one action".into());
+    }
+    for action in &scope.actions {
+        AccessAction::parse_scope_action(action)?;
+    }
+    if let Some(mode) = scope.mode_ceiling.as_deref() {
+        SecurityMode::parse(mode)
+            .map_err(|error| format!("invalid agent scope mode_ceiling {mode:?}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn validate_scope_glob(glob: &str) -> std::result::Result<(), String> {
+    if glob.is_empty() {
+        return Err("agent scope.container_glob must not be empty".into());
+    }
+    if glob.len() > 128
+        || glob.starts_with('/')
+        || glob.ends_with('/')
+        || glob.split('/').any(str::is_empty)
+        || !glob
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '*' | '/'))
+    {
+        return Err(format!("invalid agent scope.container_glob: {glob:?}"));
+    }
+    Ok(())
+}
+
+/// Parse the import envelope once into authority that is safe to show during
+/// approval and entries that are safe to execute. Keeping this validation in
+/// front of the approval gate ensures the operator sees the same scopes the
+/// vault will later persist.
+fn validate_agent_import(args: &Value) -> std::result::Result<ValidatedAgentImport, String> {
+    let envelope = args
+        .get("envelope")
+        .ok_or_else(|| "envelope is required".to_string())?;
+    let envelope: AgentImportEnvelope = serde_json::from_value(envelope.clone())
+        .map_err(|e| format!("invalid agent import envelope: {e}"))?;
+    if envelope.version != 1 {
+        return Err(format!(
+            "unsupported envelope version: {}",
+            envelope.version
+        ));
+    }
+    let _exported_at_unix = envelope.exported_at_unix;
+    if envelope.agent_count != envelope.agents.len() {
+        return Err("envelope.agent_count does not match agents length".into());
+    }
+    let (mode, replace_existing) = match args
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("create_only")
+    {
+        "create_only" => ("create_only", false),
+        "create_or_replace" => ("create_or_replace", true),
+        other => return Err(format!("unsupported import mode: {other}")),
+    };
+
+    let mut names = std::collections::HashSet::with_capacity(envelope.agents.len());
+    let mut agents = Vec::with_capacity(envelope.agents.len());
+    let mut entries = Vec::with_capacity(envelope.agents.len());
+    for entry in envelope.agents {
+        if entry.name.is_empty() {
+            return Err("agent.name must not be empty".into());
+        }
+        if !names.insert(entry.name.clone()) {
+            return Err(format!(
+                "agent import contains duplicate name: {}",
+                entry.name
+            ));
+        }
+        if entry.revoked {
+            return Err(format!(
+                "cannot import revoked agent {}; revoke it in the destination instead",
+                entry.name
+            ));
+        }
+        if entry.expires_at.is_some() {
+            return Err(format!(
+                "cannot import expiring agent {}; expiry preservation is unsupported",
+                entry.name
+            ));
+        }
+        if entry.scopes.is_empty() {
+            return Err(format!(
+                "cannot import unscoped agent {}; at least one concrete scope is required",
+                entry.name
+            ));
+        }
+        for scope in &entry.scopes {
+            validate_agent_scope(scope)?;
+        }
+        agents.push(ImportApprovalAgent {
+            name: entry.name.clone(),
+            scopes: entry.scopes.clone(),
+        });
+        entries.push(AgentImportEntry {
+            name: entry.name,
+            scopes: entry.scopes,
+        });
+    }
+
+    Ok(ValidatedAgentImport {
+        summary: ImportApprovalSummary {
+            mode: mode.to_string(),
+            agent_count: agents.len(),
+            agents,
+        },
+        entries,
+        replace_existing,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentImportEnvelope {
+    version: u32,
+    exported_at_unix: u64,
+    agent_count: usize,
+    agents: Vec<AgentImportEnvelopeEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentImportEnvelopeEntry {
+    name: String,
+    scopes: Vec<AgentScope>,
+    expires_at: Option<String>,
+    revoked: bool,
+}
+
+/// Non-secret authority shown to a human before importing agents.
+///
+/// This deliberately contains only the import mode, agent names, and scope
+/// grants. Import tokens are never part of an import envelope and are minted
+/// only after approval, so they can never reach an approval surface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportApprovalSummary {
+    /// Requested behavior when an imported name already exists.
+    pub mode: String,
+    /// Number of imported agent identities in this request.
+    pub agent_count: usize,
+    /// Every imported agent and the scope grants it would receive.
+    pub agents: Vec<ImportApprovalAgent>,
+}
+
+/// The non-secret scope authority for one imported agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportApprovalAgent {
+    /// Human-readable imported identity name.
+    pub name: String,
+    /// Validated scope grants that define this identity's authority.
+    pub scopes: Vec<AgentScope>,
+}
+
+/// Fully validated import data, shared by authorization and execution.
+struct ValidatedAgentImport {
+    summary: ImportApprovalSummary,
+    entries: Vec<AgentImportEntry>,
+    replace_existing: bool,
+}
+
+/// Agent-safe metadata for one agent identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentInfo {
+    /// Stable identifier (`ag_<random>`). Excluded from bulk export.
+    pub agent_id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Scope grants; an empty list means unscoped.
+    pub scopes: Vec<AgentScope>,
+    /// Issue timestamp (RFC 3339).
+    pub created_at: String,
+    /// Optional expiry; `None` means the token never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// Whether the agent has been revoked.
+    pub revoked: bool,
+}
+
+/// One fully validated agent identity to import in an atomic batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentImportEntry {
+    /// Human-readable agent name.
+    pub name: String,
+    /// Scope grants for the fresh token.
+    pub scopes: Vec<AgentScope>,
+}
+
+/// A fresh credential created by an atomic import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedAgent {
+    /// Imported agent name.
+    pub name: String,
+    /// Fresh stable agent identifier.
+    pub agent_id: String,
+    /// Fresh one-time token, shown once.
+    pub one_time_token: String,
+}
+
+/// Result of an atomic agent import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentImportResult {
+    /// Agents that received fresh credentials.
+    pub imported: Vec<ImportedAgent>,
+    /// Existing names skipped in create-only mode.
+    pub skipped: Vec<String>,
+    /// Existing names revoked by replacement mode.
+    pub revoked: Vec<String>,
+}
+
 /// One destination allowlist entry for a brokered secret.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrokerAllow {
@@ -268,6 +529,24 @@ pub trait VaultFacade: Send + Sync {
     fn container_mode(&self, container: &str) -> std::result::Result<SecurityMode, String>;
     /// Destroy (delete) a container and all its contents.
     fn destroy_container(&self, name: &str) -> std::result::Result<(), String>;
+    /// List registered agent identities (including revoked ones).
+    fn list_agents(&self) -> std::result::Result<Vec<AgentInfo>, String>;
+    /// Mint a new agent. Returns `(agent_id, one_time_token)`. Token is shown
+    /// to the caller once and never persisted in plaintext.
+    fn create_agent(
+        &self,
+        name: &str,
+        scopes: Vec<AgentScope>,
+    ) -> std::result::Result<(String, String), String>;
+    /// Revoke an agent by id.
+    fn revoke_agent(&self, agent_id: &str) -> std::result::Result<(), String>;
+    /// Import a complete agent batch with one atomic registry replacement.
+    /// Implementations must leave the prior registry unchanged on failure.
+    fn import_agents_atomically(
+        &self,
+        entries: Vec<AgentImportEntry>,
+        replace_existing: bool,
+    ) -> std::result::Result<AgentImportResult, String>;
     /// Create a new symmetric transit key.
     fn transit_create_key(&self, name: &str) -> std::result::Result<TransitKeyInfo, String>;
     /// List symmetric transit keys.
@@ -385,9 +664,41 @@ pub enum AccessAction {
     DestroyContainer,
     /// Return vault metadata (version, custody mode, container count).
     VaultInfo,
+    /// Bulk export agent identities. Identity-free envelope; no token material.
+    ExportAgents,
+    /// Bulk import agent identities. Mint fresh tokens for each imported entry.
+    ImportAgents,
 }
 
 impl AccessAction {
+    /// Parse the stable action names accepted in agent scopes.
+    pub fn parse_scope_action(action: &str) -> std::result::Result<Self, String> {
+        match action {
+            "list" | "list_containers" => Ok(Self::ListContainers),
+            "list_files" => Ok(Self::ListFiles),
+            "read" | "read_file" => Ok(Self::ReadFile),
+            "write" | "write_file" => Ok(Self::WriteFile),
+            "delete" | "delete_file" => Ok(Self::DeleteFile),
+            "create_container" => Ok(Self::CreateContainer),
+            "destroy" | "destroy_container" => Ok(Self::DestroyContainer),
+            "create_transit_key" => Ok(Self::CreateTransitKey),
+            "list_transit_keys" => Ok(Self::ListTransitKeys),
+            "encrypt" => Ok(Self::Encrypt),
+            "decrypt" => Ok(Self::Decrypt),
+            "create_signing_key" => Ok(Self::CreateSigningKey),
+            "list_signing_keys" => Ok(Self::ListSigningKeys),
+            "sign" => Ok(Self::Sign),
+            "verify" => Ok(Self::Verify),
+            "create_broker_secret" => Ok(Self::CreateBrokerSecret),
+            "list_broker_secrets" => Ok(Self::ListBrokerSecrets),
+            "broker" | "broker_request" => Ok(Self::Broker),
+            "vault_info" | "info" => Ok(Self::VaultInfo),
+            "export_agents" => Ok(Self::ExportAgents),
+            "import_agents" => Ok(Self::ImportAgents),
+            _ => Err(format!("unknown agent scope action: {action}")),
+        }
+    }
+
     fn audit_action(self) -> AuditAction {
         match self {
             Self::ListContainers => AuditAction::ListContainers,
@@ -409,6 +720,8 @@ impl AccessAction {
             Self::Broker => AuditAction::Broker,
             Self::DestroyContainer => AuditAction::DeleteContainer,
             Self::VaultInfo => AuditAction::VaultInfo,
+            Self::ExportAgents => AuditAction::AgentExport,
+            Self::ImportAgents => AuditAction::AgentImport,
         }
     }
 }
@@ -443,6 +756,10 @@ pub struct AccessRequest {
     /// domain-separated canonical serialization.
     #[serde(default)]
     pub authorization_context: String,
+    /// Validated, non-secret import authority for desktop approval surfaces.
+    /// Present only for `ImportAgents` requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_summary: Option<ImportApprovalSummary>,
 }
 
 /// A scope grant resolved for an authenticated agent. Scopes can only narrow
@@ -543,6 +860,50 @@ pub trait TimingSink: Send + Sync {
     fn record_timing(&self, timings: StageTimings);
 }
 
+/// Per-agent rate limiter using a sliding window. Counts requests per
+/// `agent_id` (or the shared pairing secret key when unscoped) and rejects
+/// when the count exceeds `max_requests` within `window`. Defends against
+/// buggy or hostile local processes flooding the gateway.
+pub struct RateLimiter {
+    max_requests: usize,
+    window: Duration,
+    state: std::sync::Mutex<HashMap<String, Vec<Instant>>>,
+}
+
+impl RateLimiter {
+    /// Create a new rate limiter. `max_requests` per `window` per agent.
+    pub fn new(max_requests: usize, window: Duration) -> Self {
+        Self {
+            max_requests,
+            window,
+            state: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Check whether a request from `key` is allowed. Returns `Ok(())` if
+    /// allowed, or `Err` with a message if the rate limit is exceeded.
+    /// Records the request on success (so the next call sees it).
+    pub fn check(&self, key: &str) -> Result<()> {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| McpError::Protocol(format!("rate limiter poisoned: {e}")))?;
+        let entry = state.entry(key.to_string()).or_default();
+        // Drop entries outside the window.
+        entry.retain(|t| now.duration_since(*t) < self.window);
+        if entry.len() >= self.max_requests {
+            return Err(McpError::Protocol(format!(
+                "rate limit exceeded: {} requests in {:?}",
+                entry.len(),
+                self.window
+            )));
+        }
+        entry.push(now);
+        Ok(())
+    }
+}
+
 /// MCP server. Holds a shared vault handle + the per-launch pairing secret.
 pub struct McpServer<H: VaultFacade + 'static> {
     handle: SharedVault<H>,
@@ -551,6 +912,7 @@ pub struct McpServer<H: VaultFacade + 'static> {
     audit_sink: Option<Arc<dyn AuditSink>>,
     agent_authenticator: Option<Arc<dyn AgentAuthenticator>>,
     timing_sink: Option<Arc<dyn TimingSink>>,
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl<H: VaultFacade + 'static> McpServer<H> {
@@ -563,6 +925,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
             audit_sink: None,
             agent_authenticator: None,
             timing_sink: None,
+            rate_limiter: None,
         }
     }
 
@@ -591,6 +954,15 @@ impl<H: VaultFacade + 'static> McpServer<H> {
     /// sink installed the gateway performs no timing instrumentation.
     pub fn with_timing_sink(mut self, sink: Arc<dyn TimingSink>) -> Self {
         self.timing_sink = Some(sink);
+        self
+    }
+
+    /// Install a per-agent rate limiter. Requests exceeding `max_requests`
+    /// within `window` are rejected with a rate-limit error. Off by default
+    /// (unlimited). Use this to protect against buggy or hostile local
+    /// processes flooding the gateway.
+    pub fn with_rate_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.rate_limiter = Some(limiter);
         self
     }
 
@@ -906,6 +1278,17 @@ impl<H: VaultFacade + 'static> McpServer<H> {
         agent: Option<&ResolvedAgent>,
     ) -> std::result::Result<Value, String> {
         let started = Instant::now();
+
+        // Rate limiting: per-agent (or shared secret key) sliding window.
+        if let Some(limiter) = &self.rate_limiter {
+            let key = agent
+                .map(|a| a.agent_id.clone())
+                .unwrap_or_else(|| format!("__shared__:{}", transport.as_str()));
+            if let Err(error) = limiter.check(&key) {
+                return Err(error.to_string());
+            }
+        }
+
         let mut access = {
             let guard = self.handle.lock().await;
             let handle = guard
@@ -1200,6 +1583,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     authorization_context: build_authorization_context(name, args),
+                    import_summary: None,
                 })
             }
             "vault.read" => {
@@ -1218,6 +1602,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     authorization_context: build_authorization_context(name, args),
+                    import_summary: None,
                 })
             }
             "vault.write" => {
@@ -1240,6 +1625,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     authorization_context: build_authorization_context(name, args),
+                    import_summary: None,
                 })
             }
             "vault.delete" => {
@@ -1258,6 +1644,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     authorization_context: build_authorization_context(name, args),
+                    import_summary: None,
                 })
             }
             "vault.create_container" => {
@@ -1279,6 +1666,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     authorization_context: build_authorization_context(name, args),
+                    import_summary: None,
                 })
             }
             "vault.destroy" => {
@@ -1296,6 +1684,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     authorization_context: build_authorization_context(name, args),
+                    import_summary: None,
                 })
             }
             "vault.info" => Ok(simple_request(
@@ -1303,6 +1692,21 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 AccessAction::VaultInfo,
                 build_authorization_context(name, args),
             )),
+            "vault.export_agents" => Ok(simple_request(
+                transport,
+                AccessAction::ExportAgents,
+                build_authorization_context(name, args),
+            )),
+            "vault.import_agents" => {
+                let import = validate_agent_import(args)?;
+                let mut request = simple_request(
+                    transport,
+                    AccessAction::ImportAgents,
+                    build_authorization_context(name, args),
+                );
+                request.import_summary = Some(import.summary);
+                Ok(request)
+            }
             "vault.create_transit_key" => {
                 let _ = required_str(args, "name")?;
                 Ok(simple_request(
@@ -1408,10 +1812,34 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 let container = args.get("container").and_then(|v| v.as_str());
                 if let Some(container) = container {
                     let files = handle.list_files(container)?;
-                    Ok(serde_json::to_value(files).map_err(|e| e.to_string())?)
+                    let redacted: Vec<Value> = files
+                        .into_iter()
+                        .map(|f| {
+                            // Partial redaction: trim byte_size and modified_at,
+                            // which are integrity/audit metadata that don't
+                            // need to leave the vault for legitimate reads.
+                            // Keep `name` and `mode` so the caller can issue
+                            // an explicit read.
+                            json!({
+                                "name": f.name,
+                                "mode": f.mode,
+                            })
+                        })
+                        .collect();
+                    Ok(Value::Array(redacted))
                 } else {
                     let containers = handle.list_containers()?;
-                    Ok(serde_json::to_value(containers).map_err(|e| e.to_string())?)
+                    let redacted: Vec<Value> = containers
+                        .into_iter()
+                        .map(|c| {
+                            json!({
+                                "name": c.name,
+                                "mode": c.mode,
+                                "description": c.description,
+                            })
+                        })
+                        .collect();
+                    Ok(Value::Array(redacted))
                 }
             }
             "vault.read" => {
@@ -1468,6 +1896,42 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                     "version": crate::version(),
                     "custody_mode": handle.custody_mode_label(),
                     "containers": containers.len(),
+                }))
+            }
+            "vault.export_agents" => {
+                let agents = handle.list_agents()?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let envelope = json!({
+                    "version": 1u32,
+                    "exported_at_unix": now,
+                    "agent_count": agents.len(),
+                    "agents": agents.into_iter().map(|a| json!({
+                        "name": a.name,
+                        "scopes": a.scopes,
+                        "expires_at": a.expires_at,
+                        "revoked": a.revoked,
+                    })).collect::<Vec<_>>(),
+                });
+                Ok(envelope)
+            }
+            "vault.import_agents" => {
+                let import = validate_agent_import(args)?;
+                let result =
+                    handle.import_agents_atomically(import.entries, import.replace_existing)?;
+                Ok(json!({
+                    "imported_count": result.imported.len(),
+                    "skipped_count": result.skipped.len(),
+                    "revoked_count": result.revoked.len(),
+                    "imported": result.imported.into_iter().map(|agent| json!({
+                        "name": agent.name,
+                        "agent_id": agent.agent_id,
+                        "one_time_token": agent.one_time_token,
+                    })).collect::<Vec<_>>(),
+                    "skipped": result.skipped,
+                    "revoked": result.revoked,
                 }))
             }
             "vault.create_transit_key" => {
@@ -1630,8 +2094,8 @@ fn enforce_scopes(
                     agent.agent_id
                 ));
             }
-            AccessAction::Verify => return Ok(()),
-            AccessAction::CreateTransitKey
+            AccessAction::Verify
+            | AccessAction::CreateTransitKey
             | AccessAction::ListTransitKeys
             | AccessAction::Encrypt
             | AccessAction::Decrypt
@@ -1804,6 +2268,7 @@ fn simple_request(
         agent_id: None,
         otp: None,
         authorization_context,
+        import_summary: None,
     }
 }
 
@@ -2197,6 +2662,38 @@ fn base_tool_descriptors() -> Value {
                 },
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "vault.export_agents",
+            "description":
+                "Export every registered agent identity as a JSON envelope. \
+                 Names, scopes, expiry, and revoked flag are included; \
+                 agent_id and token_hash are intentionally EXCLUDED \
+                 (tokens are regenerated on import). \
+                 Output is suitable for backup or migration to another vault.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "vault.import_agents",
+            "description":
+                "Import agent identities from a JSON envelope produced by \
+                 vault.export_agents (or any compatible tool). Fresh tokens are \
+                 minted for each imported entry and returned ONCE in the response. \
+                 Use mode=create_only to skip names that already exist, or \
+                 mode=create_or_replace to revoke existing names first.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["envelope"],
+                "properties": {
+                    "envelope": { "type": "object", "description": "JSON envelope with version, exported_at, agents[]. Required." },
+                    "mode":     { "type": "string", "enum": ["create_only", "create_or_replace"], "default": "create_only" }
+                },
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -2266,6 +2763,7 @@ mod tests {
         transit_keys: std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>,
         signing_keys: std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>,
         broker_secrets: std::sync::Mutex<std::collections::HashMap<String, BrokerSecretInfo>>,
+        agents: std::sync::Mutex<Vec<AgentInfo>>,
         broker_enabled: bool,
     }
 
@@ -2463,6 +2961,112 @@ mod tests {
             Ok(())
         }
 
+        fn list_agents(&self) -> std::result::Result<Vec<AgentInfo>, String> {
+            Ok(self.agents.lock().unwrap().clone())
+        }
+        fn create_agent(
+            &self,
+            name: &str,
+            scopes: Vec<AgentScope>,
+        ) -> std::result::Result<(String, String), String> {
+            let mut counter = self.agents.lock().unwrap();
+            let seq = counter.len() as u32 + 1;
+            let mut id_hasher = Sha256::new();
+            id_hasher.update(name.as_bytes());
+            id_hasher.update(seq.to_le_bytes());
+            let id_digest = id_hasher.finalize();
+            let id_hex: String = id_digest
+                .iter()
+                .take(8)
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let id = format!("ag_{id_hex}");
+            let mut token_hasher = Sha256::new();
+            token_hasher.update(name.as_bytes());
+            token_hasher.update(seq.to_le_bytes());
+            token_hasher.update(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+                    .to_le_bytes(),
+            );
+            let token_digest = token_hasher.finalize();
+            let token_hex: String = token_digest
+                .iter()
+                .take(8)
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let token = format!("tok_{token_hex}");
+            counter.push(AgentInfo {
+                agent_id: id.clone(),
+                name: name.to_string(),
+                scopes,
+                created_at: "1970-01-01T00:00:00Z".to_string(),
+                expires_at: None,
+                revoked: false,
+            });
+            Ok((id, token))
+        }
+        fn revoke_agent(&self, agent_id: &str) -> std::result::Result<(), String> {
+            let mut agents = self.agents.lock().unwrap();
+            let a = agents
+                .iter_mut()
+                .find(|a| a.agent_id == agent_id)
+                .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+            a.revoked = true;
+            Ok(())
+        }
+
+        fn import_agents_atomically(
+            &self,
+            entries: Vec<AgentImportEntry>,
+            replace_existing: bool,
+        ) -> std::result::Result<AgentImportResult, String> {
+            let mut registry = self.agents.lock().unwrap();
+            let mut planned = registry.clone();
+            let mut imported = Vec::with_capacity(entries.len());
+            let mut skipped = Vec::new();
+            let mut revoked = Vec::new();
+
+            for entry in entries {
+                let has_existing = planned.iter().any(|agent| agent.name == entry.name);
+                if has_existing && !replace_existing {
+                    skipped.push(entry.name);
+                    continue;
+                }
+                if has_existing {
+                    for agent in planned.iter_mut().filter(|agent| agent.name == entry.name) {
+                        agent.revoked = true;
+                    }
+                    revoked.push(entry.name.clone());
+                }
+                let sequence = planned.len() as u32 + 1;
+                let agent_id = format!("ag_import_{sequence}");
+                let one_time_token = format!("tok_import_{sequence}");
+                planned.push(AgentInfo {
+                    agent_id: agent_id.clone(),
+                    name: entry.name.clone(),
+                    scopes: entry.scopes,
+                    created_at: "1970-01-01T00:00:00Z".into(),
+                    expires_at: None,
+                    revoked: false,
+                });
+                imported.push(ImportedAgent {
+                    name: entry.name,
+                    agent_id,
+                    one_time_token,
+                });
+            }
+
+            *registry = planned;
+            Ok(AgentImportResult {
+                imported,
+                skipped,
+                revoked,
+            })
+        }
+
         fn create_container(
             &self,
             _name: &str,
@@ -2535,6 +3139,7 @@ mod tests {
             transit_keys: Default::default(),
             signing_keys: Default::default(),
             broker_secrets: Default::default(),
+            agents: Default::default(),
             broker_enabled,
         }
     }
@@ -2573,8 +3178,8 @@ mod tests {
             .unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
         // 5 file tools + vault.destroy + vault.info + transit create/list/encrypt/decrypt
-        // + signing create/list/sign/verify.
-        assert_eq!(tools.len(), 15);
+        // + signing create/list/sign/verify + export/import agents.
+        assert_eq!(tools.len(), 17);
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"vault.encrypt"));
         assert!(names.contains(&"vault.sign"));
@@ -2596,7 +3201,7 @@ mod tests {
             .await
             .unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 20);
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"vault.broker_request"));
         assert!(names.contains(&"vault.create_broker_secret"));
@@ -2630,6 +3235,231 @@ mod tests {
         let inner: Value =
             serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(inner["plaintext_b64"], pt);
+    }
+
+    #[tokio::test]
+    async fn export_then_import_agents_roundtrip() {
+        let server = server();
+        let mut pair = PairState::AlreadyPaired(None);
+
+        // Seed two agents directly through the facade so the test does not
+        // rely on a public create route.
+        {
+            let arc = server.handle.clone();
+            let mut guard = arc.lock().await;
+            let v = guard.as_mut().unwrap();
+            v.create_agent(
+                "alpha",
+                vec![AgentScope {
+                    container_glob: "alpha/**".into(),
+                    actions: vec!["read".into()],
+                    mode_ceiling: None,
+                }],
+            )
+            .unwrap();
+            v.create_agent(
+                "beta",
+                vec![AgentScope {
+                    container_glob: "notes/**".into(),
+                    actions: vec!["read".into()],
+                    mode_ceiling: None,
+                }],
+            )
+            .unwrap();
+        }
+
+        // Export the registry.
+        let export_req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vault.export_agents","arguments":{}}}"#;
+        let export_resp = server
+            .dispatch(export_req, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let export_text = export_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let envelope: Value = serde_json::from_str(export_text).unwrap();
+        assert_eq!(envelope["version"], 1);
+        let exported_agents = envelope["agents"].as_array().unwrap();
+        assert_eq!(exported_agents.len(), 2);
+        for a in exported_agents {
+            assert!(a.get("agent_id").is_none(), "agent_id must be excluded");
+            assert!(a.get("token_hash").is_none(), "token_hash must be excluded");
+        }
+
+        // Import with create_or_replace: 2 revoked, 2 fresh tokens minted.
+        let import_args = json!({ "envelope": envelope, "mode": "create_or_replace" });
+        let import_req = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"vault.import_agents","arguments":{}}}}}"#,
+            serde_json::to_string(&import_args).unwrap()
+        );
+        let import_resp = server
+            .dispatch(&import_req, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        let import_text = import_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let import_out: Value = serde_json::from_str(import_text).unwrap();
+        assert_eq!(import_out["imported_count"], 2);
+        assert_eq!(import_out["revoked_count"], 2);
+        assert_eq!(import_out["skipped_count"], 0);
+        let tokens: Vec<&str> = import_out["imported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["one_time_token"].as_str().unwrap())
+            .collect();
+        assert_eq!(tokens.len(), 2);
+
+        // Tokens must not appear in the export envelope (no leakage).
+        assert!(!export_text.contains("tok_"));
+    }
+
+    #[tokio::test]
+    async fn malformed_agent_import_leaves_registry_unchanged() {
+        let server = server();
+        let mut pair = PairState::AlreadyPaired(None);
+        {
+            let mut handle = server.handle.lock().await;
+            handle
+                .as_mut()
+                .unwrap()
+                .create_agent("alpha", Vec::new())
+                .unwrap();
+        }
+        let before = {
+            let handle = server.handle.lock().await;
+            handle.as_ref().unwrap().list_agents().unwrap()
+        };
+        let envelope = json!({
+            "version": 1,
+            "exported_at_unix": 0,
+            "agent_count": 2,
+            "agents": [
+                {"name": "alpha", "scopes": [], "expires_at": null, "revoked": false},
+                {"name": "later-invalid", "scopes": "not-an-array", "expires_at": null, "revoked": false}
+            ]
+        });
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.import_agents","arguments":{{"envelope":{},"mode":"create_or_replace"}}}}}}"#,
+            serde_json::to_string(&envelope).unwrap()
+        );
+        let response = server
+            .dispatch(&request, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+
+        let after = {
+            let handle = server.handle.lock().await;
+            handle.as_ref().unwrap().list_agents().unwrap()
+        };
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_invalid_mode_ceiling_without_changing_registry() {
+        let server = server();
+        let mut pair = PairState::AlreadyPaired(None);
+        {
+            let mut handle = server.handle.lock().await;
+            handle
+                .as_mut()
+                .unwrap()
+                .create_agent("existing", Vec::new())
+                .unwrap();
+        }
+        let before = {
+            let handle = server.handle.lock().await;
+            handle.as_ref().unwrap().list_agents().unwrap()
+        };
+        let envelope = json!({
+            "version": 1,
+            "exported_at_unix": 0,
+            "agent_count": 1,
+            "agents": [{
+                "name": "invalid-ceiling",
+                "scopes": [{
+                    "container_glob": "notes/**",
+                    "actions": ["read"],
+                    "mode_ceiling": "DIRECTT"
+                }],
+                "expires_at": null,
+                "revoked": false
+            }]
+        });
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.import_agents","arguments":{{"envelope":{}}}}}}}"#,
+            serde_json::to_string(&envelope).unwrap()
+        );
+        let response = server
+            .dispatch(&request, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("mode_ceiling"));
+
+        let after = {
+            let handle = server.handle.lock().await;
+            handle.as_ref().unwrap().list_agents().unwrap()
+        };
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_unscoped_agent() {
+        let server = server();
+        let mut pair = PairState::AlreadyPaired(None);
+        let envelope = json!({
+            "version": 1,
+            "exported_at_unix": 0,
+            "agent_count": 1,
+            "agents": [{
+                "name": "unscoped",
+                "scopes": [],
+                "expires_at": null,
+                "revoked": false
+            }]
+        });
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.import_agents","arguments":{{"envelope":{}}}}}}}"#,
+            serde_json::to_string(&envelope).unwrap()
+        );
+        let response = server
+            .dispatch(&request, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cannot import unscoped agent"));
+    }
+
+    #[test]
+    fn scope_validation_rejects_unknown_actions_and_invalid_globs() {
+        let unknown_action = AgentScope {
+            container_glob: "notes/**".into(),
+            actions: vec!["read_everything".into()],
+            mode_ceiling: None,
+        };
+        assert!(validate_agent_scope(&unknown_action)
+            .unwrap_err()
+            .contains("unknown agent scope action"));
+
+        for container_glob in ["", "/notes", "notes/", "notes?", "notes//private"] {
+            let invalid_glob = AgentScope {
+                container_glob: container_glob.into(),
+                actions: vec!["read".into()],
+                mode_ceiling: None,
+            };
+            assert!(validate_agent_scope(&invalid_glob)
+                .unwrap_err()
+                .contains("container_glob"));
+        }
     }
 
     #[tokio::test]
@@ -3173,6 +4003,31 @@ mod tests {
         assert_eq!(resp["result"]["isError"], true);
     }
 
+    #[test]
+    fn scoped_agent_cannot_verify_without_an_explicit_verify_grant() {
+        let agent = ResolvedAgent {
+            agent_id: "ag_1".into(),
+            scopes: vec![ResolvedScope {
+                container_glob: "notes".into(),
+                actions: vec![AccessAction::ReadFile],
+                mode_ceiling: None,
+            }],
+        };
+        let request = simple_request(AccessTransport::McpWs, AccessAction::Verify, String::new());
+
+        assert!(enforce_scopes(&agent, &request).is_err());
+
+        let granted = ResolvedAgent {
+            scopes: vec![ResolvedScope {
+                container_glob: "notes".into(),
+                actions: vec![AccessAction::Verify],
+                mode_ceiling: None,
+            }],
+            ..agent
+        };
+        assert!(enforce_scopes(&granted, &request).is_ok());
+    }
+
     #[tokio::test]
     async fn scoped_agent_can_use_transit_with_grant() {
         let server = authed_server(vec![ResolvedScope {
@@ -3359,7 +4214,13 @@ mod tests {
 
     #[tokio::test]
     async fn prebound_non_loopback_listener_is_rejected() {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let listener = match tokio::net::TcpListener::bind("0.0.0.0:0").await {
+            Ok(listener) => listener,
+            // Restricted CI sandboxes can prohibit non-loopback binds before
+            // the server gets a chance to reject the listener itself.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("binding non-loopback test listener: {error}"),
+        };
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
         let error = Arc::new(server())
             .serve_ws_listener(listener, shutdown_rx)
@@ -3489,6 +4350,61 @@ mod tests {
     }
 
     #[test]
+    fn changing_import_authority_changes_context_and_summary() {
+        let limited = json!({
+            "envelope": {
+                "version": 1,
+                "exported_at_unix": 0,
+                "agent_count": 1,
+                "agents": [{
+                    "name": "limited-agent",
+                    "scopes": [{
+                        "container_glob": "notes/*",
+                        "actions": ["read"],
+                        "mode_ceiling": "APPROVAL"
+                    }],
+                    "expires_at": null,
+                    "revoked": false
+                }]
+            },
+            "mode": "create_only"
+        });
+        let broader = json!({
+            "envelope": {
+                "version": 1,
+                "exported_at_unix": 0,
+                "agent_count": 1,
+                "agents": [{
+                    "name": "replacement-agent",
+                    "scopes": [{
+                        "container_glob": "**",
+                        "actions": ["read", "write"],
+                        "mode_ceiling": "OTP"
+                    }],
+                    "expires_at": null,
+                    "revoked": false
+                }]
+            },
+            "mode": "create_or_replace"
+        });
+
+        assert_ne!(
+            build_authorization_context("vault.import_agents", &limited),
+            build_authorization_context("vault.import_agents", &broader)
+        );
+        let summary = validate_agent_import(&broader).unwrap().summary;
+        assert_eq!(summary.mode, "create_or_replace");
+        assert_eq!(summary.agent_count, 1);
+        assert_eq!(summary.agents[0].name, "replacement-agent");
+        assert_eq!(summary.agents[0].scopes[0].container_glob, "**");
+        assert_eq!(summary.agents[0].scopes[0].actions, ["read", "write"]);
+        assert_eq!(
+            summary.agents[0].scopes[0].mode_ceiling.as_deref(),
+            Some("OTP")
+        );
+    }
+
+    #[test]
     fn record_audit_sanitizes_error_for_denied_and_error_decisions() {
         let audit = Arc::new(MemoryAudit(Default::default()));
         let server = server().with_audit_sink(audit.clone());
@@ -3504,6 +4420,7 @@ mod tests {
             agent_id: Some("ag_1".into()),
             otp: None,
             authorization_context: String::new(),
+            import_summary: None,
         };
 
         // Record an Error decision with a raw error containing a private path and a secret.

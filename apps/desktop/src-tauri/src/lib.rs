@@ -52,17 +52,29 @@ struct ServersShutdown {
 struct PendingApproval {
     tx: oneshot::Sender<bool>,
     otp_code: Option<String>,
-    /// Identity of the request (action + target + agent). Used to dedupe a
-    /// retry storm: an identical request supersedes the older pending one.
+    /// Identity of the request (action + target + agent + content digest).
+    /// Used to dedupe a retry storm: only an identical request supersedes the
+    /// older pending one.
     signature: String,
 }
 
 /// Stable identity for an access request so retries collapse onto one modal.
 fn request_signature(request: &sv_mcp::AccessRequest) -> String {
     format!(
-        "{:?}|{:?}|{:?}|{:?}",
-        request.action, request.container, request.file_name, request.agent_id
+        "{:?}|{:?}|{:?}|{:?}|{}",
+        request.action,
+        request.container,
+        request.file_name,
+        request.agent_id,
+        request.authorization_context
     )
+}
+
+/// Compare a pending approval identity with a request. The authorization
+/// context is part of both values, so a changed MCP argument envelope cannot
+/// collapse onto (and inherit approval from) an earlier pending request.
+fn matches_pending_approval(signature: &str, request: &sv_mcp::AccessRequest) -> bool {
+    signature == request_signature(request)
 }
 
 #[derive(Clone, Serialize)]
@@ -359,6 +371,7 @@ impl ApprovalState {
                             mode: request.mode.map(|m| m.as_str().to_string()),
                             byte_size: request.byte_size,
                             otp_code: Some(code),
+                            import_summary: request.import_summary.clone(),
                         };
                         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
                     }
@@ -415,6 +428,17 @@ impl ApprovalState {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         let mut store = self.otp_pending.lock().await;
+        self.prune_expired(&mut store);
+        // The caller may have released the lock between the initial admission
+        // check and this insertion. Re-check while holding it so concurrent
+        // new requests cannot exceed the bounded pending-challenge store.
+        if !can_admit_challenge(&store, &key) {
+            return Err(
+                "otp_required: a one-time code is shown on the Sovereign Vault desktop. \
+                 Resend this exact request with the `otp` argument set to that code."
+                    .into(),
+            );
+        }
 
         // Cancel any prior modal for this signature
         if let Some(old_chal) = store.remove(&key) {
@@ -437,6 +461,7 @@ impl ApprovalState {
             mode: request.mode.map(|m| m.as_str().to_string()),
             byte_size: request.byte_size,
             otp_code: Some(code),
+            import_summary: request.import_summary.clone(),
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
         Err(
@@ -464,7 +489,7 @@ impl ApprovalState {
             // call) instead of stacking a second modal.
             let stale: Vec<u64> = pending
                 .iter()
-                .filter(|(_, p)| p.signature == signature)
+                .filter(|(_, p)| matches_pending_approval(&p.signature, &request))
                 .map(|(k, _)| *k)
                 .collect();
             for old in &stale {
@@ -496,6 +521,7 @@ impl ApprovalState {
             mode: request.mode.map(|m| m.as_str().to_string()),
             byte_size: request.byte_size,
             otp_code: None,
+            import_summary: request.import_summary.clone(),
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
 
@@ -574,6 +600,10 @@ struct VaultStatus {
 #[derive(Debug, Serialize, Deserialize)]
 struct VaultInitResponse {
     recovery_phrase: String,
+    /// Non-sensitive warning when the vault is initialized but the local
+    /// gateway could not be started. The recovery phrase is still returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway_warning: Option<String>,
 }
 
 /// MCP integration status returned by [`mcp_status`].
@@ -594,6 +624,8 @@ struct ApprovalPrompt {
     mode: Option<String>,
     byte_size: Option<usize>,
     otp_code: Option<String>,
+    /// Validated non-secret authority shown for agent imports.
+    import_summary: Option<sv_mcp::ImportApprovalSummary>,
 }
 
 struct DesktopAuditSink {
@@ -620,43 +652,18 @@ struct DesktopAgentAuthenticator {
     shared_secret: String,
 }
 
-fn parse_access_action(s: &str) -> Option<sv_mcp::AccessAction> {
-    match s {
-        "list" | "list_containers" => Some(sv_mcp::AccessAction::ListContainers),
-        "list_files" => Some(sv_mcp::AccessAction::ListFiles),
-        "read" | "read_file" => Some(sv_mcp::AccessAction::ReadFile),
-        "write" | "write_file" => Some(sv_mcp::AccessAction::WriteFile),
-        "delete" | "delete_file" => Some(sv_mcp::AccessAction::DeleteFile),
-        "create_container" => Some(sv_mcp::AccessAction::CreateContainer),
-        "create_transit_key" => Some(sv_mcp::AccessAction::CreateTransitKey),
-        "list_transit_keys" => Some(sv_mcp::AccessAction::ListTransitKeys),
-        "encrypt" => Some(sv_mcp::AccessAction::Encrypt),
-        "decrypt" => Some(sv_mcp::AccessAction::Decrypt),
-        "create_signing_key" => Some(sv_mcp::AccessAction::CreateSigningKey),
-        "list_signing_keys" => Some(sv_mcp::AccessAction::ListSigningKeys),
-        "sign" => Some(sv_mcp::AccessAction::Sign),
-        "verify" => Some(sv_mcp::AccessAction::Verify),
-        "create_broker_secret" => Some(sv_mcp::AccessAction::CreateBrokerSecret),
-        "list_broker_secrets" => Some(sv_mcp::AccessAction::ListBrokerSecrets),
-        "broker" | "broker_request" => Some(sv_mcp::AccessAction::Broker),
-        _ => None,
-    }
-}
-
-fn resolve_scopes(scopes: &[sv_core::agents::AgentScope]) -> Vec<sv_mcp::ResolvedScope> {
+fn resolve_scopes(
+    scopes: &[sv_core::agents::AgentScope],
+) -> Result<Vec<sv_mcp::ResolvedScope>, String> {
     scopes
         .iter()
-        .map(|s| sv_mcp::ResolvedScope {
-            container_glob: s.container_glob.clone(),
-            actions: s
-                .actions
-                .iter()
-                .filter_map(|a| parse_access_action(a))
-                .collect(),
-            mode_ceiling: s
-                .mode_ceiling
-                .as_deref()
-                .and_then(|m| SecurityMode::parse(m).ok()),
+        .map(|s| {
+            sv_mcp::AgentScope {
+                container_glob: s.container_glob.clone(),
+                actions: s.actions.clone(),
+                mode_ceiling: s.mode_ceiling.clone(),
+            }
+            .resolve()
         })
         .collect()
 }
@@ -671,7 +678,8 @@ impl sv_mcp::AgentAuthenticator for DesktopAgentAuthenticator {
         let agent_id = match agent_id {
             Some(id) => id.to_string(),
             None => {
-                if token != self.shared_secret {
+                let matches: bool = token.as_bytes().ct_eq(self.shared_secret.as_bytes()).into();
+                if !matches {
                     return Err("invalid shared secret".into());
                 }
                 sv_core::agents::list_agents(&self.root, &self.token_key)
@@ -686,7 +694,7 @@ impl sv_mcp::AgentAuthenticator for DesktopAgentAuthenticator {
             .map_err(estr)?;
         Ok(sv_mcp::ResolvedAgent {
             agent_id: record.agent_id,
-            scopes: resolve_scopes(&record.scopes),
+            scopes: resolve_scopes(&record.scopes)?,
         })
     }
 }
@@ -762,9 +770,14 @@ fn record_desktop_event(state: &VaultState, event: AuditEvent) {
 }
 
 fn approval_requirement(request: &sv_mcp::AccessRequest) -> Result<ApprovalPromptKind, String> {
-    // Broker is the highest-risk action and ALWAYS requires approval, never
-    // DIRECT, regardless of any (absent) container mode.
-    if matches!(request.action, sv_mcp::AccessAction::Broker) {
+    // Broker and agent-management actions are high risk and ALWAYS require
+    // explicit approval, regardless of any (absent) container mode.
+    if matches!(
+        request.action,
+        sv_mcp::AccessAction::Broker
+            | sv_mcp::AccessAction::ImportAgents
+            | sv_mcp::AccessAction::ExportAgents
+    ) {
         return Ok(ApprovalPromptKind::Click);
     }
     // Transit + signing carry no container mode; gate them on a click, except
@@ -894,23 +907,14 @@ async fn vault_init(
         *guard = Some(handle);
     }
 
-    if let Err(error) = start_servers(&state).await {
-        let mut guard = state.handle.lock().await;
-        *guard = None;
-        record_desktop_event(
-            &state,
-            desktop_event(
-                AuditAction::VaultInit,
-                AuditDecision::Error,
-                None,
-                None,
-                None,
-                None,
-                Some(error.clone()),
-            ),
-        );
-        return Err(error);
-    }
+    // Initialization is already durably committed at this point, and the
+    // recovery phrase exists only in this response. A gateway bind failure
+    // must never turn that successful bootstrap into an error that discards
+    // the phrase and strands the vault. Keep the handle available for the
+    // desktop UI and return a non-secret warning instead.
+    let gateway_warning = start_servers(&state).await.err().map(|_| {
+        "vault initialized, but the local MCP/HTTP gateway could not start; the recovery phrase below is valid and the gateway can be retried after resolving the local error".to_string()
+    });
 
     record_desktop_event(
         &state,
@@ -936,7 +940,10 @@ async fn vault_init(
             None,
         ),
     );
-    Ok(VaultInitResponse { recovery_phrase })
+    Ok(VaultInitResponse {
+        recovery_phrase,
+        gateway_warning,
+    })
 }
 
 #[tauri::command]
@@ -1072,6 +1079,18 @@ async fn vault_unlock_recovery(
             None,
         ),
     );
+
+    // Post-recovery re-bootstrap: recovery restores the DEK but bypasses the
+    // KEK, so the manifest integrity check + agents registry may have been
+    // written against older code paths. Trigger a list path so the audit log
+    // records a recovery re-bootstrap marker; this also catches any drift
+    // in agent/token state and logs an `AgentList` event for observability.
+    {
+        let guard = state.handle.lock().await;
+        if let Some(handle) = guard.as_ref() {
+            let _ = handle.list_agents();
+        }
+    }
     Ok(())
 }
 
@@ -1160,7 +1179,10 @@ async fn vault_rotate_key(
             result.as_ref().err().cloned(),
         ),
     );
-    result.map(|recovery_phrase| VaultInitResponse { recovery_phrase })
+    result.map(|recovery_phrase| VaultInitResponse {
+        recovery_phrase,
+        gateway_warning: None,
+    })
 }
 
 #[tauri::command]
@@ -1744,6 +1766,125 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn modeless_request(action: sv_mcp::AccessAction) -> sv_mcp::AccessRequest {
+        sv_mcp::AccessRequest {
+            transport: sv_mcp::AccessTransport::McpWs,
+            action,
+            container: None,
+            file_name: None,
+            mode: None,
+            byte_size: None,
+            agent_id: Some("ag_test".into()),
+            otp: None,
+            authorization_context: String::new(),
+            import_summary: None,
+        }
+    }
+
+    fn container_request(mode: SecurityMode, authorization_context: &str) -> sv_mcp::AccessRequest {
+        sv_mcp::AccessRequest {
+            transport: sv_mcp::AccessTransport::McpWs,
+            action: sv_mcp::AccessAction::ReadFile,
+            container: Some("notes".into()),
+            file_name: Some("entry.txt".into()),
+            mode: Some(mode),
+            byte_size: None,
+            agent_id: Some("ag_test".into()),
+            otp: None,
+            authorization_context: authorization_context.into(),
+            import_summary: None,
+        }
+    }
+
+    fn import_request(context: &str) -> sv_mcp::AccessRequest {
+        let mut request = modeless_request(sv_mcp::AccessAction::ImportAgents);
+        request.authorization_context = context.into();
+        request.import_summary = Some(sv_mcp::ImportApprovalSummary {
+            mode: "create_only".into(),
+            agent_count: 1,
+            agents: vec![sv_mcp::ImportApprovalAgent {
+                name: "limited-agent".into(),
+                scopes: vec![sv_mcp::AgentScope {
+                    container_glob: "notes/*".into(),
+                    actions: vec!["read".into()],
+                    mode_ceiling: Some("APPROVAL".into()),
+                }],
+            }],
+        });
+        request
+    }
+
+    #[test]
+    fn agent_management_actions_require_desktop_approval() {
+        for action in [
+            sv_mcp::AccessAction::ImportAgents,
+            sv_mcp::AccessAction::ExportAgents,
+        ] {
+            assert!(matches!(
+                approval_requirement(&modeless_request(action)),
+                Ok(ApprovalPromptKind::Click)
+            ));
+        }
+    }
+
+    #[test]
+    fn import_approval_rejects_a_different_authorization_context() {
+        let approved = import_request("context-for-limited-import");
+        let changed = import_request("context-for-broader-import");
+        let approved_signature = request_signature(&approved);
+
+        assert!(matches_pending_approval(&approved_signature, &approved));
+        assert!(
+            !matches_pending_approval(&approved_signature, &changed),
+            "an approval for one import envelope must not match another"
+        );
+    }
+
+    #[test]
+    fn create_or_replace_broader_scope_requires_fresh_content_bound_approval() {
+        let create_only = import_request("digest:create_only:limited-agent:notes/*:read:APPROVAL");
+        let mut replacement =
+            import_request("digest:create_or_replace:limited-agent:**:read,write:OTP");
+        replacement.import_summary.as_mut().unwrap().mode = "create_or_replace".into();
+        replacement.import_summary.as_mut().unwrap().agents[0].scopes[0].container_glob =
+            "**".into();
+        replacement.import_summary.as_mut().unwrap().agents[0].scopes[0].actions =
+            vec!["read".into(), "write".into()];
+        replacement.import_summary.as_mut().unwrap().agents[0].scopes[0].mode_ceiling =
+            Some("OTP".into());
+
+        assert_ne!(
+            request_signature(&create_only),
+            request_signature(&replacement)
+        );
+        assert!(!matches_pending_approval(
+            &request_signature(&create_only),
+            &replacement
+        ));
+    }
+
+    #[test]
+    fn direct_approval_and_otp_container_requests_keep_their_normal_paths() {
+        let direct = container_request(SecurityMode::Direct, "direct-context");
+        let approval = container_request(SecurityMode::Approval, "approval-context");
+        let otp = container_request(SecurityMode::Otp, "otp-context");
+
+        assert!(matches!(
+            approval_requirement(&direct),
+            Ok(ApprovalPromptKind::NotRequired)
+        ));
+        assert!(matches!(
+            approval_requirement(&approval),
+            Ok(ApprovalPromptKind::Click)
+        ));
+        assert!(matches!(
+            approval_requirement(&otp),
+            Ok(ApprovalPromptKind::Otp)
+        ));
+        assert_eq!(request_signature(&approval), request_signature(&approval));
+        assert_eq!(request_signature(&otp), request_signature(&otp));
+    }
 
     /// Helper to create a test challenge with known state.
     fn make_test_challenge(code: &str, modal_id: u64) -> OtpChallenge {

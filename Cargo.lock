@@ -4346,13 +4346,20 @@ dependencies = [
 name = "sovereign-vault"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
+ "dirs",
  "futures-util",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_yaml",
+ "subtle",
+ "sv-audit",
  "sv-core",
+ "sv-http",
+ "sv-mcp",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
@@ -5203,6 +5210,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
