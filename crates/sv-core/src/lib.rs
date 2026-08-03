@@ -191,9 +191,11 @@ impl VaultLock {
             // the symlink_metadata check and open(2), O_NOFOLLOW causes open to
             // fail with ELOOP on Unix. Map that to the same Misuse shape as the
             // pre-check so we never leak a symlink follow.
-            if error.kind() == std::io::ErrorKind::Other
-                || error.raw_os_error() == Some(libc::ELOOP)
-            {
+            let is_symlink_open_error = error.kind() == std::io::ErrorKind::Other;
+            #[cfg(unix)]
+            let is_symlink_open_error =
+                is_symlink_open_error || error.raw_os_error() == Some(libc::ELOOP);
+            if is_symlink_open_error {
                 CoreError::Misuse(format!(
                     "vault lock is not a regular file: {}",
                     path.display()
@@ -534,6 +536,23 @@ impl VaultHandle {
     /// calling [`Self::migrate_manifest_authentication`].
     pub fn manifest_migration_digest(root: &Path) -> Result<String> {
         Ok(sv_storage::manifest_migration_digest(root)?)
+    }
+
+    /// Detect the normal custody mode recorded by an existing vault.
+    ///
+    /// Passphrase custody is recorded by the private `master.salt` file.
+    /// OS-keychain custody deliberately has no salt file, including legacy
+    /// vaults that predate the keyring. This is the same discriminator used
+    /// by the keychain unlock path, so callers can select custody before
+    /// asking for a passphrase or accessing the OS keychain.
+    pub fn detect_custody(root: &Path) -> Result<CustodyMode> {
+        let salt = root.join(SALT_FILENAME);
+        if path_entry_exists(&salt) {
+            ensure_regular_file(&salt, "passphrase salt")?;
+            Ok(CustodyMode::Passphrase)
+        } else {
+            Ok(CustodyMode::OsKeychain)
+        }
     }
 
     /// Authenticate one exact legacy manifest and permanently require
@@ -2140,6 +2159,107 @@ impl sv_mcp::VaultFacade for VaultHandle {
             host,
             method: method.to_ascii_uppercase(),
         })
+    }
+
+    fn list_agents(&self) -> std::result::Result<Vec<sv_mcp::AgentInfo>, String> {
+        VaultHandle::list_agents(self)
+            .map(|v| {
+                v.into_iter()
+                    .map(|a| sv_mcp::AgentInfo {
+                        agent_id: a.agent_id,
+                        name: a.name,
+                        scopes: a
+                            .scopes
+                            .into_iter()
+                            .map(|s| sv_mcp::AgentScope {
+                                container_glob: s.container_glob,
+                                actions: s.actions,
+                                mode_ceiling: s.mode_ceiling,
+                            })
+                            .collect(),
+                        created_at: a.created_at.to_rfc3339(),
+                        expires_at: a.expires_at.map(|t| t.to_rfc3339()),
+                        revoked: a.revoked,
+                    })
+                    .collect()
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    fn create_agent(
+        &self,
+        name: &str,
+        scopes: Vec<sv_mcp::AgentScope>,
+    ) -> std::result::Result<(String, String), String> {
+        for scope in &scopes {
+            sv_mcp::validate_agent_scope(scope)?;
+        }
+        let scopes: Vec<crate::agents::AgentScope> = scopes
+            .into_iter()
+            .map(|s| crate::agents::AgentScope {
+                container_glob: s.container_glob,
+                actions: s.actions,
+                mode_ceiling: s.mode_ceiling,
+            })
+            .collect();
+        VaultHandle::create_agent(self, name, scopes).map_err(|e| e.to_string())
+    }
+
+    fn revoke_agent(&self, agent_id: &str) -> std::result::Result<(), String> {
+        VaultHandle::revoke_agent(self, agent_id).map_err(|e| e.to_string())
+    }
+
+    fn import_agents_atomically(
+        &self,
+        entries: Vec<sv_mcp::AgentImportEntry>,
+        replace_existing: bool,
+    ) -> std::result::Result<sv_mcp::AgentImportResult, String> {
+        for entry in &entries {
+            if entry.scopes.is_empty() {
+                return Err(format!(
+                    "cannot import unscoped agent {}; at least one concrete scope is required",
+                    entry.name
+                ));
+            }
+            for scope in &entry.scopes {
+                sv_mcp::validate_agent_scope(scope)?;
+            }
+        }
+        let entries = entries
+            .into_iter()
+            .map(|entry| crate::agents::AgentImportEntry {
+                name: entry.name,
+                scopes: entry
+                    .scopes
+                    .into_iter()
+                    .map(|scope| crate::agents::AgentScope {
+                        container_glob: scope.container_glob,
+                        actions: scope.actions,
+                        mode_ceiling: scope.mode_ceiling,
+                    })
+                    .collect(),
+            })
+            .collect();
+        crate::agents::import_agents_atomically(
+            self.root(),
+            &self.agent_token_key(),
+            entries,
+            replace_existing,
+        )
+        .map(|result| sv_mcp::AgentImportResult {
+            imported: result
+                .imported
+                .into_iter()
+                .map(|agent| sv_mcp::ImportedAgent {
+                    name: agent.name,
+                    agent_id: agent.agent_id,
+                    one_time_token: agent.one_time_token,
+                })
+                .collect(),
+            skipped: result.skipped,
+            revoked: result.revoked,
+        })
+        .map_err(|e| e.to_string())
     }
 }
 

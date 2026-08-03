@@ -70,13 +70,15 @@ async fn main() {
 
     match cmd {
         "latency" => run_latency(&out, iterations).await,
+        "micro" => run_micro(&out, iterations).await,
         "adversarial" => run_adversarial(&out).await,
         "all" => {
             run_latency(&out, iterations).await;
+            run_micro(&out, iterations).await;
             run_adversarial(&out).await;
         }
         other => {
-            eprintln!("unknown subcommand {other:?}; use: latency | adversarial | all");
+            eprintln!("unknown subcommand {other:?}; use: latency | micro | adversarial | all");
             std::process::exit(2);
         }
     }
@@ -287,6 +289,118 @@ fn summarize(mut micros: Vec<f64>) -> Stats {
 
 fn us(d: Duration) -> f64 {
     d.as_nanos() as f64 / 1000.0
+}
+
+// ---------------------------------------------------------------------------
+// Component micro-measurements (§3.9.1, Equation 1 completeness)
+// ---------------------------------------------------------------------------
+//
+// The `latency` subcommand decomposes end-to-end reads by *gateway stage*
+// (TimingSink). This subcommand measures the two content-sensitive components
+// in isolation — calling the raw functions in a tight loop with no gateway
+// dispatch — so the pure component floor can be compared against the
+// gateway-stage figure to isolate per-component dispatch overhead.
+
+struct MicroRow {
+    bytes: usize,
+    decrypt_mean_us: f64,
+    decrypt_p95_us: f64,
+    filter_mean_us: f64,
+    filter_p95_us: f64,
+}
+
+/// PII-bearing ASCII text of approximately `size` bytes, for filter timing.
+/// Uses the same PII unit as `payload_for(Anonymized, _)` so the isolated
+/// filter cost is directly comparable to the gateway `T_filter (PII)` stage.
+fn pii_payload(size: usize) -> String {
+    let unit = "user jane.doe@example.com cpf 529.982.247-25 ip 192.168.0.1; ";
+    let mut s = String::new();
+    while s.len() < size {
+        s.push_str(unit);
+    }
+    s.truncate(size);
+    s
+}
+
+async fn run_micro(out: &Path, iterations: usize) {
+    println!("== Component micro-measurements, isolated (thesis §3.9.1) ==");
+    let (handle, root) = bootstrap("micro");
+
+    let sizes = [128usize, 1024, 16384];
+    handle
+        .create_container("bench", SecurityMode::Direct, None)
+        .expect("container");
+    for size in sizes {
+        let content = payload_for(SecurityMode::Direct, size);
+        handle
+            .write_file("bench", &format!("f{size}"), &content)
+            .expect("seed file");
+    }
+
+    let policy = sv_privacy::Policy::all();
+    let mut rows: Vec<MicroRow> = Vec::new();
+    for size in sizes {
+        let name = format!("f{size}");
+
+        // Warm once, then time isolated decrypt+read (no gateway).
+        let _ = handle.read_file("bench", &name).expect("warm read");
+        let mut decrypt_us: Vec<f64> = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let t0 = std::time::Instant::now();
+            let _ = handle.read_file("bench", &name).expect("read");
+            decrypt_us.push(us(t0.elapsed()));
+        }
+
+        // Isolated PII filter (no vault): redact on PII-bearing text.
+        let text = pii_payload(size);
+        let _ = sv_privacy::redact(&text, &policy);
+        let mut filter_us: Vec<f64> = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let t0 = std::time::Instant::now();
+            let _ = sv_privacy::redact(&text, &policy);
+            filter_us.push(us(t0.elapsed()));
+        }
+
+        let d = summarize(decrypt_us);
+        let f = summarize(filter_us);
+        println!(
+            "  {size:>5} B  decrypt mean={:>7.2} us (p95 {:>7.2})   filter mean={:>7.2} us (p95 {:>7.2})",
+            d.mean_us, d.p95_us, f.mean_us, f.p95_us
+        );
+        rows.push(MicroRow {
+            bytes: size,
+            decrypt_mean_us: d.mean_us,
+            decrypt_p95_us: d.p95_us,
+            filter_mean_us: f.mean_us,
+            filter_p95_us: f.p95_us,
+        });
+    }
+
+    let mut md = String::new();
+    md.push_str(
+        "# Component micro-measurements — isolated (thesis §3.9.1, Eq. 1 completeness)\n\n",
+    );
+    md.push_str("Pure cost of the two content-sensitive gateway components measured *outside* the gateway: `sv_storage` decrypt+read (`T_vault` floor) and `sv_privacy::redact` (`T_filter` floor), each in a tight loop with no dispatch overhead. Compare to the gateway-stage figures in `latency.md` to isolate per-component dispatch overhead.\n\n");
+    md.push_str("| Bytes | decrypt mean (us) | decrypt p95 | filter mean (us) | filter p95 |\n");
+    md.push_str("|---|---|---|---|---|\n");
+    let mut csv =
+        String::from("bytes,decrypt_mean_us,decrypt_p95_us,filter_mean_us,filter_p95_us\n");
+    for r in &rows {
+        md.push_str(&format!(
+            "| {} | {:.2} | {:.2} | {:.2} | {:.2} |\n",
+            r.bytes, r.decrypt_mean_us, r.decrypt_p95_us, r.filter_mean_us, r.filter_p95_us
+        ));
+        csv.push_str(&format!(
+            "{},{},{},{},{}\n",
+            r.bytes, r.decrypt_mean_us, r.decrypt_p95_us, r.filter_mean_us, r.filter_p95_us
+        ));
+    }
+    fs::write(out.join("micro.md"), md).expect("write micro.md");
+    fs::write(out.join("micro.csv"), csv).expect("write micro.csv");
+    println!("   wrote {}/micro.csv and micro.md", out.display());
+
+    drop(handle);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ---------------------------------------------------------------------------

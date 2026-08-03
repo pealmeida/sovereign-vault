@@ -1,0 +1,331 @@
+% Compilação requerida: TeX Live com abntex2, babel-brazil, amsmath, booktabs,
+% tabularx, array, graphicx, microtype e hyperref.
+% Comando: latexmk -pdf -pdflatex="pdflatex %O %S" paper.tex
+\documentclass[12pt,openright,twoside,a4paper,brazil]{abntex2}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=black,urlcolor=black}
+\DeclareUrlCommand\codigo{\urlstyle{tt}}
+\newcommand{\micro}{\,$\mu$s}
+\newcommand{\svnota}[1]{\begin{center}\fbox{\begin{minipage}{0.90\textwidth}\textbf{#1}\end{minipage}}\end{center}}
+\titulo{Arquitetura de Soberania de Dados para Agentes de IA Pessoais: Um Modelo Local-First Baseado em Protocolos Descentralizados}
+\autor{Pedro Oliveira}
+\local{São Carlos}
+\data{2026}
+\instituicao{Universidade de São Paulo -- Instituto de Ciências Matemáticas e de Computação\par MBA em Inteligência Artificial e Big Data}
+\tipotrabalho{Pesquisa de MBA}
+\preambulo{Versão revisada do projeto de pesquisa.}
+
+\begin{document}
+\pretextual
+\begin{center}
+\textbf{PROJETO DE PESQUISA}\\[1.5em]
+Instituição: USP/ICMC\\
+Curso: MBA em Inteligência Artificial e Big Data\\
+Aluno: Pedro Oliveira\\
+Linha de Pesquisa: Arquitetura de Sistemas de IA, Privacidade de Dados e Soberania Digital
+\end{center}
+\begin{resumo}
+Esta pesquisa propõe uma arquitetura Local-First para mediar acessos de agentes de IA a segredos e credenciais locais. A instância avaliada, denominada Sovereign Vault, combina cofre cifrado, gateway MCP, escopos de capacidade, modos de consentimento e auditoria com evidência de adulteração. A avaliação atual é deliberadamente limitada a um microbenchmark local sintético e a uma bateria finita de chamadas de ferramenta; não mede inferência em nuvem, utilidade de tarefa ou tempo de decisão humana. No modo ANONYMIZED, nomes completos, endereços, RG, CEP e telefones sem formatação passam sem máscara: mesmo com CPF ou CNPJ mascarados, um documento com nome e endereço pode permanecer identificável sob o Art.~5º da LGPD. Assim, o artefato não é adequado a documentos em que a vinculação de identidade por campos não mascarados seja risco realista.\par
+\textbf{Palavras-chave}: soberania de dados. agentes de IA. MCP. Local-First. privacidade.
+\end{resumo}
+\tableofcontents*
+\textual
+
+\chapter{INTRODUÇÃO}
+A evolução da Inteligência Artificial (IA) consolidou a transição de modelos de linguagem reativos para sistemas agênticos autônomos (\textit{Agentic AI}). Segundo Nisa et al. (2025), essa mudança paradigmática caracteriza-se pela passagem de respostas instrumentais para um modelo de raciocínio autorregulado e orientado a metas. Diferentemente dos assistentes conversacionais tradicionais, esses sistemas realizam raciocínio em múltiplos estágios, planejam ações sequenciais e orquestram ferramentas externas de forma autônoma. O processamento dessas informações apoia-se na arquitetura Transformer \cite{vaswani2017}, cujo mecanismo de autoatenção captura dependências de longo alcance em sequências complexas.
+
+A eficácia prática desses agentes em tarefas reais depende do acesso a dados contextuais sensíveis, como históricos de diálogos, arquivos pessoais e e-mails \cite{liu2024}. No paradigma de computação em nuvem e Software as a Service (SaaS) \cite{wu2011}, a utilidade da IA é obtida em troca da cessão da custódia desses dados privados a servidores de terceiros. Essa dinâmica impõe um dilema técnico e ético: o usuário pode abdicar de privacidade e controle digital em troca da capacidade analítica do modelo.
+
+\section{Problema de Pesquisa}
+O problema central desta pesquisa reside na assimetria de poder informacional e na perda de soberania decorrentes da centralização do processamento de dados por agentes de IA. No modelo vigente, informações pessoais podem ser transmitidas continuamente para servidores externos sem garantias robustas de efemeridade ou exclusão. Diante disso, formula-se a seguinte questão de pesquisa: é tecnicamente viável arquitetar um ecossistema de agentes de IA que preserve a soberania de dados do usuário, mantendo o processamento sensível local, sem comprometer a capacidade analítica de modelos de linguagem globais?
+
+\section{Justificativa e Motivação}
+A expropriação sistemática de dados privados justifica a busca por novas arquiteturas de software. Zuboff \cite{zuboff2019} define o capitalismo de vigilância como uma ordem econômica que extrai a experiência humana como matéria-prima para predição comportamental, risco amplificado pela custódia centralizada de agentes inteligentes. Cientificamente, a motivação deste trabalho consiste em inverter esse fluxo computacional: em vez de transmitir os dados privados à nuvem, propõe-se trazer controles de execução e mediação à borda.
+
+Do ponto de vista técnico, a especificação do Model Context Protocol (MCP) \cite{anthropic2024} e a evolução do hardware com foco em processamento local de IA tornam viável o paradigma Local-First \cite{kleppmann2019}. Essa abordagem visa manter dados sensíveis sob controle físico do proprietário e exigir consentimento explícito quando a política configurada assim determinar.
+
+\section{Questões de Pesquisa}
+Para orientar a validação do artefato proposto, definem-se três questões complementares:
+\begin{enumerate}
+\item Como um gateway MCP local pode mediar e reduzir a exposição de leituras nomeadas de segredos e credenciais por agentes externos?
+\item Quais são os impactos de latência introduzidos por uma camada local de interceptação e auditoria em tempo de execução?
+\item Como autenticação local, escopos de capacidade, consentimento humano e auditoria com evidência de adulteração reduzem acessos laterais por agentes MCP comprometidos, dentro de um modelo de ameaça de usuário único e máquina única?
+\end{enumerate}
+O artefato não implementa isolamento de memória no nível do sistema operacional. Processos sob a mesma conta do usuário e comprometimentos do sistema operacional permanecem fora do limite de segurança avaliado.
+
+\section{Objetivos}
+\subsection{Objetivo Geral}
+Propor e desenvolver uma arquitetura de software baseada nos princípios Local-First que apoie a soberania de dados em agentes de IA pessoais, utilizando protocolos descentralizados para o gerenciamento de contexto.
+
+\subsection{Objetivos Específicos}
+\begin{enumerate}
+\item Investigar as especificações do MCP e sua viabilidade como interface de desacoplamento entre modelos de nuvem e dados locais;
+\item Desenvolver um protótipo de cofre local baseado em linguagem com segurança de memória para mediar o acesso a dados sensíveis;
+\item Implementar uma camada de interação humana (\textit{human-in-the-loop}) para auditoria e aprovação de acesso a dados em tempo de execução;
+\item Avaliar, em ambiente controlado, a latência interna do gateway local e a cobertura de bloqueio de uma bateria pré-especificada de tentativas de acesso não autorizado.
+\end{enumerate}
+
+\svnota{\textbf{Escopo empírico.} A instância do Sovereign Vault restringe-se ao controle de credenciais e segredos locais identificados por contêiner e arquivo. Ela demonstra um padrão de mediação; indexação vetorial, recuperação semântica de documentos e processamento local de embeddings não integram o artefato avaliado. Esses elementos, assim como contêineres de contexto, constam como trabalho futuro em \codigo{docs/adr/0012-context-containers.md}.}
+
+\section{Organização do Trabalho}
+O trabalho está organizado em capítulos. O Capítulo 2 detalha a fundamentação teórica e o estado da arte das tecnologias de suporte. O Capítulo 3 estabelece o percurso metodológico fundamentado em Design Science Research (DSR), descrevendo a arquitetura e a estratégia de validação do artefato. O Capítulo 4 apresenta os resultados disponíveis e suas fronteiras de evidência. Os capítulos subsequentes poderão abordar discussão e considerações finais.
+
+\chapter{FUNDAMENTAÇÃO TEÓRICA}
+\section{Inteligência Artificial Agêntica e a Necessidade de Contexto}
+A IA agêntica estabelece um salto qualitativo em relação aos LLMs tradicionais. Enquanto os modelos puros operam sob o padrão de entrada e saída linear (\textit{prompt-response}), os agentes mantêm estados de memória de longo prazo e interagem com o ambiente através de ferramentas de terceiros. A arquitetura Transformer \cite{vaswani2017} e sua aplicação em percepções multimodais \cite{khan2022} viabilizaram essa evolução. Nisa et al. \cite{nisa2025} estruturam o fluxo de operação da IA agêntica em quatro fases interdependentes: percepção, raciocínio/planejamento, ação e aprendizado por retroalimentação. Nesse fluxo, a memória e o contexto atuam como substrato para a consistência temporal da tomada de decisão.
+
+Para recuperar e injetar contexto dinamicamente nos modelos, utilizam-se técnicas de Geração Aumentada por Recuperação (Retrieval-Augmented Generation --- RAG), introduzidas por Lewis et al. \cite{lewis2020}. Conforme Şakar e Emekçi \cite{sakar2024}, a otimização de sistemas RAG contemporâneos exige equilíbrio entre tamanho da janela de contexto, custos computacionais e compressão contextual. Contudo, em abordagens centralizadas tradicionais, o repositório vetorial de RAG reside na nuvem, expondo dados privados a riscos de vazamento em trânsito e armazenamento. RAG é aqui fundamentação e direção futura, não uma capacidade implementada ou avaliada nesta instância.
+
+\section{Soberania de Dados e Capitalismo de Vigilância}
+A soberania de dados fundamenta-se no direito do proprietário de exercer controle sobre o ciclo de vida completo de suas informações digitais. A centralização na nuvem viabiliza o ``capitalismo de vigilância'' \cite{zuboff2019}, modelo econômico que extrai o rastro digital dos indivíduos e o converte em superávit de dados para predição comportamental de mercado.
+
+Embora marcos legais como a LGPD no Brasil e a GDPR na União Europeia forcem cumprimento normativo por meio de sanções administrativas \cite{lorenzon2021}, essas salvaguardas agem de forma corretiva. A soberania demanda uma abordagem técnica de Privacidade desde o Projeto (Privacy by Design) \cite{cavoukian2011}, na qual restrições de privacidade e controle das informações sejam integrados ao código do sistema.
+
+\section{O Paradigma Local-First}
+Proposto por Kleppmann et al. \cite{kleppmann2019}, o paradigma Local-First Software propõe que a cópia primária e autoritativa do dado permaneça armazenada e seja processada no dispositivo físico do usuário. A nuvem atua de forma secundária para sincronização efêmera e cooperação descentralizada. Aplicada à IA, a abordagem orienta que indexação, busca vetorial e filtragem possam ocorrer na borda, reduzindo a exposição ao modelo em nuvem. Essa é uma direção arquitetural: a presente avaliação não verifica descarte de dados por provedores de IA nem implementa índice vetorial.
+
+\section{Model Context Protocol (MCP)}
+O MCP, introduzido pela Anthropic \cite{anthropic2024}, padroniza o canal de comunicação entre modelos de linguagem e fontes de dados de maneira desacoplada. O protocolo organiza-se em uma arquitetura cliente-servidor com três componentes:
+\begin{itemize}
+\item \textit{Hosts}: aplicações clientes de IA que demandam orquestração de inferência;
+\item \textit{Clients}: módulos integrados ao host que gerenciam a conexão;
+\item \textit{Servers}: serviços de borda ou locais que expõem recursos locais, tais como arquivos, bases de dados e APIs locais.
+\end{itemize}
+A proposta desta pesquisa é implantar o servidor MCP no dispositivo físico do usuário como gateway de segurança ativo. O gateway avalia quais dados ou frações de contexto podem ser transmitidos ao agente remoto, observando identidade, escopo, modo de contêiner e política de consentimento.
+
+\section{Segurança de Memória e Tecnologias de Isolamento}
+Vulnerabilidades de corrupção de memória, como \textit{buffer overflows}, são fonte relevante de falhas exploráveis em sistemas críticos \cite{nsa2022}. O código Rust próprio do artefato é compilado com proibição de \codigo{unsafe}, o que reduz classes de corrupção de memória no código de aplicação auditado. Essa propriedade não se estende automaticamente a dependências nativas, WebView, sistema operacional, kernel ou processos sob a mesma conta do usuário. Quando presente na árvore de dependências, \codigo{ring} é uma dependência transitiva via \codigo{reqwest}/\codigo{rustls}, e não uma dependência FFI direta do artefato. Portanto, segurança de memória de linguagem não é isolamento de memória no sistema operacional, nem prova geral contra exfiltração em tempo de execução.
+
+\section{Trabalhos Correlatos}
+O estado da arte apresenta alternativas para gerenciar privacidade em IA. O Aprendizado Federado (Federated Learning) treina modelos de forma cooperativa sem centralizar dados brutos \cite{imteaj2021}, porém volta-se à otimização coletiva de parâmetros, não resolvendo a inferência dinâmica com dados altamente voláteis e episódicos da rotina do usuário. Por sua vez, o projeto Solid \cite{sambra2016} descentraliza o armazenamento pessoal em pods, mas baseia-se em semântica de grafos projetada para a web convencional. MCP oferece uma interface de ferramentas pertinente à mediação sob demanda, sem que isso, por si só, prove baixa latência, efemeridade em nuvem ou proteção abrangente de contexto.
+
+\chapter{METODOLOGIA, PROPOSTA E DESENVOLVIMENTO}
+\section{Considerações Iniciais}
+Este capítulo apresenta a modelagem, a arquitetura de software de referência e a proposta de desenvolvimento do artefato concebido para responder à problemática de exfiltração de dados sensíveis na interação com agentes inteligentes de IA.
+
+\section{Caracterização da Pesquisa}
+Esta pesquisa classifica-se como aplicada e de natureza sociotécnica. Utiliza abordagem mista, unindo avaliação qualitativa dos modelos de arquitetura e análise quantitativa de desempenho e cobertura de controles do protótipo. O projeto filia-se às ciências do artificial \cite{simon1996}, fundamentando seu método no paradigma da DSR, conforme estabelecido por Hevner et al. \cite{hevner2004}.
+
+\section{Design Science Research e os Três Ciclos}
+A DSR orienta a criação sistemática de artefatos tecnológicos de software para a resolução de problemas práticos complexos. A pesquisa estrutura-se de acordo com os três ciclos descritos por Hevner \cite{hevner2007}:
+\begin{itemize}
+\item \textbf{Ciclo de Relevância}: conecta requisitos derivados do ambiente dos usuários (privacidade de dados contextuais e facilidade de auditoria) ao núcleo do design técnico;
+\item \textbf{Ciclo de Rigor}: baseia-se no estado da arte tecnológico, incluindo segurança de memória \cite{nsa2022}, MCP \cite{anthropic2024} e heurísticas Local-First \cite{kleppmann2019};
+\item \textbf{Ciclo de Design}: executa iterativamente construção, teste e refinamento do protótipo, documentando decisões por Registros de Decisão de Arquitetura (ADRs).
+\end{itemize}
+No enquadramento FEDS \cite{venable2016}, a avaliação disponível é \textit{artificial + somativa}: mede um artefato em cenário sintético e reporta seus resultados, sem observar uso ordinário. O estudo futuro de dois braços é \textit{naturalística + somativa}, pois observará tarefas pareadas em condições de uso definidas. A evidência artificial-somativa atual tem, portanto, teto de generalização: sustenta somente os controles e a latência interna nas condições instrumentadas.
+
+\section{Procedimentos Metodológicos}
+Seguindo a sistematização de Peffers et al. \cite{peffers2007}, a pesquisa executa seis atividades: (i) identificação do problema; (ii) definição de requisitos de localidade e uso de segredos; (iii) modelagem arquitetural e projeto dos componentes; (iv) demonstração integrada; (v) avaliação experimental de latência interna e cobertura de controles; e (vi) comunicação técnico-científica dos resultados. O traço de Peffers é parcialmente retrospectivo, pois o artefato antecede esta proposição. Há, contudo, evidência documentada de iteração construir--avaliar: ADRs registram a correção do gate de consentimento para o modo NATIVE e as sondas A9/A10 subsequentes, constituindo um artefato genuíno do ciclo de rigor e design. A avaliação de nuvem e de decisão humana é explicitamente futura.
+
+\section{Artefatos Produzidos}
+De acordo com a taxonomia de March e Smith \cite{march1995}, a pesquisa propõe e entrega:
+\begin{itemize}
+\item \textbf{Modelo}: arquitetura de referência para mediação de acessos a dados locais;
+\item \textbf{Método}: protocolo de mediação, controle de escopo, consentimento e higienização de saída em tempo de execução;
+\item \textbf{Instanciação}: protótipo Sovereign Vault, operando sobre credenciais e segredos locais como representação empírica da proposta.
+\end{itemize}
+Não se afirma que a instância entregue seja um sistema RAG ou um repositório de contexto geral: suas operações avaliadas são leituras nomeadas por contêiner e arquivo.
+
+\section{Arquitetura de Referência Proposta}
+A arquitetura separa logicamente o processamento cognitivo remoto dos repositórios privados da borda; essa separação não equivale a isolamento de processo ou de sistema operacional. O sistema estrutura-se nos módulos a seguir.
+
+\subsection{Cofre de Dados Local}
+O Sovereign Vault armazena conteúdo localmente cifrado com XChaCha20-Poly1305. A custódia usa frase-secreta, da qual se deriva uma KEK via Argon2id, ou chaveiro do sistema operacional, que mantém a KEK no modo correspondente. A DEK versionada é envolvida pela KEK em \codigo{keyring.svault}; há uma única DEK ativa, sem chaves por contêiner (\codigo{crates/sv-core/src/lib.rs:372-447,485-515}; \codigo{crates/sv-core/src/keyring.rs:206-282}; \codigo{crates/sv-crypto/src/lib.rs:92-103,149-193}). Nomes lógicos, modos, tamanhos de blobs e outros metadados podem permanecer visíveis.
+
+\subsection{Servidor MCP Local}
+O gateway, desenvolvido em Rust, expõe e gerencia ferramentas locais, interceptando requisições de agentes de IA. A superfície MCP analisada contém 17 ferramentas-base e três ferramentas condicionais de broker, totalizando 20 quando o broker está habilitado (\codigo{crates/sv-mcp/src/lib.rs:2139-2147,2877-2914}).
+
+\subsection{Mediação, Filtro de Privacidade e Operações Criptográficas}
+Os modos de contêiner efetivamente suportados no desktop são DIRECT, APPROVAL, OTP e ANONYMIZED. DIRECT não solicita confirmação; APPROVAL e OTP passam pelo consentimento; ANONYMIZED mascara a saída de leituras UTF-8 sem solicitar aprovação. ZKP e NATIVE são valores de enumeração reservados e rejeitados, não mecanismos de isolamento avaliados (\codigo{apps/desktop/src-tauri/src/lib.rs:786-805}; \codigo{crates/sv-mcp/src/lib.rs:1159-1199}).
+
+O mascaramento heurístico de saída cobre exatamente e-mail, CPF, CNPJ, números de cartão válidos por Luhn, IPv4, telefones explicitamente formatados e SSN dos Estados Unidos (\codigo{crates/sv-privacy/src/lib.rs:46-77,205-232}). A versão avaliada não detecta RG, CEP, nomes completos, endereços, datas de nascimento ou telefones locais sem formatação. Por exemplo, \textit{João Silva, Rua X, CEP 12345-678} passa sem máscara. Como nomes completos, endereços, RG, CEP e telefones sem formatação passam sem máscara, um documento com CPF ou CNPJ mascarados, mas com nome e endereço expostos, pode permanecer identificável sob o Art.~5º da LGPD. O artefato não é adequado a documentos em que a vinculação de identidade por campos não mascarados seja risco realista; ele reduz exposição em saída textual, mas não é garantia genérica de anonimização ou de conformidade à LGPD.
+
+Nas operações MCP documentadas, a semente privada e as chaves simétricas não são retornadas ao agente; somente assinatura, cifra ou texto decifrado são retornados após autorização (\codigo{crates/sv-core/src/transit.rs:245-330,368-392}; \codigo{crates/sv-mcp/src/lib.rs:1715-1740}). A zeroização ponta-a-ponta da semente Ed25519 depende também da disciplina de armazenamento do chamador em \codigo{sv-core}, e não apenas de \codigo{sv-crypto}. No desktop, operações de trânsito e assinatura exigem aprovação por operação. Esta versão não fornece autorização vinculada à chave/uso nem apresenta ao usuário uma descrição verificável do conteúdo a assinar ou decifrar; portanto o resultado de protocolo não elimina risco de uso como oráculo.
+
+\phantomsection\label{nota:headless}
+\svnota{\textbf{Aviso de segurança --- modo headless.} Durante o ciclo de rigor DSR, a revisão de código identificou apagamento de escopos e um oráculo modeless de criptografia/corretagem. A correção aplicada preserva os escopos persistidos do agente ao autenticá-lo e recusa, em modo headless, operações modeless que portam ou usam segredos (cifra de trânsito, decifragem, assinatura e corretagem), de forma \textit{fail-closed}; essas operações devem usar o aplicativo desktop (\codigo{apps/cli/src/serve.rs}). Assim, o headless mantém leituras e escritas DIRECT ordinárias, mas não oferece consentimento humano para operações secretas.}
+
+\subsection{Human-in-the-loop e Auditoria}
+A interface desktop foi implementada em Tauri com Content Security Policy e capacidades explícitas (\codigo{apps/desktop/src-tauri/tauri.conf.json:24-26}; \codigo{apps/desktop/src-tauri/capabilities/default.json:1-9}). O presente estudo não mede comparativamente superfície de injeção, isolamento de segurança ou consumo de memória em relação ao Electron.
+
+Operações sensíveis geram registros encadeados por HMAC-SHA256 e verificados contra checkpoint autenticado local (\codigo{crates/sv-audit/src/lib.rs:545-727,977-1056}). Isso fornece evidência de adulteração, remoção e truncamento em relação ao checkpoint presente. Não é prova de armazenamento append-only resistente a rollback: uma restauração completa e internamente consistente do diretório de auditoria não é detectável sem âncora externa confiável, como log de transparência remoto ou contador monotônico protegido.
+
+\section{Modelo de Execução e Protocolo de Segurança}
+No caminho desktop WebSocket autenticado, o fluxo de solicitações passa por autenticação, validação de parâmetros e caminhos, verificação de escopo, política de consentimento quando aplicável, operação no cofre, filtragem ANONYMIZED quando aplicável e auditoria. Leituras em contêineres DIRECT retornam dados sem consentimento por projeto; por isso, contêineres DIRECT ficam fora da garantia de mediação humana. Trata-se de um \textit{trade-off} deliberado que o usuário deve configurar conscientemente. Nas operações criptográficas, o gateway executa localmente a operação e retorna a saída do protocolo, e não bytes de chave; a limitação de oráculo e de transparência de consentimento descrita acima permanece aplicável.
+
+\svnota{\textbf{Modelo de ameaça e limites.} O estudo avalia um usuário, uma máquina e um gateway local desbloqueado. O adversário principal é um agente MCP autenticado e potencialmente comprometido. Estão fora de escopo: comprometimento do sistema operacional, malware ou processo sob a mesma conta do usuário, inspeção de memória, vulnerabilidades em dependências nativas/TCB, retenção de dados pelo provedor de IA e rollback completo da auditoria. Roubo de token também está fora de escopo: o token está em claro no ambiente do cliente; como trabalho futuro, recomenda-se arquivo com permissão 0600 ou chaveiro do sistema operacional. Atacante adaptativo está fora de escopo da bateria de execução única; teste adaptativo é trabalho futuro. Leituras DIRECT retornam dados sem consentimento por projeto, e contêineres DIRECT estão fora da garantia de mediação humana; esse \textit{trade-off} deve ser configurado conscientemente pelo usuário. A confidencialidade em repouso protege conteúdo cifrado, mas nomes e metadados operacionais podem permanecer visíveis. O modo headless preserva escopos e bloqueia operações secretas modeless; os resultados experimentais de menor privilégio e mediação humana, porém, referem-se ao gateway desktop WebSocket.}
+
+\section{Estratégia de Desenvolvimento do Artefato}
+O protótipo é codificado em Rust. A proibição de \codigo{unsafe} nos crates próprios reduz classes de erros de corrupção de memória no código de aplicação auditado (por exemplo, \codigo{crates/sv-mcp/src/lib.rs:18}). Não se infere daí ausência de vulnerabilidades críticas, isolamento de memória no SO ou redução mensurada de latência. Tauri foi escolhido para a interface com CSP e capacidades explícitas, sem alegação comparativa perante Electron.
+
+\section{Plano de Avaliação}
+A validação utiliza metodologias de avaliação naturalísticas e artificiais \cite{venable2016}. No FEDS, a evidência atual é artificial + somativa; o protocolo futuro de dois braços será naturalística + somativa. A evidência atualmente disponível é de uma leitura sintética pelo gateway local e de uma bateria finita de solicitações; por isso o plano separa variáveis observáveis no gateway de variáveis de usuário, rede e nuvem, com generalização limitada às condições artificiais instrumentadas.
+
+\subsection{Avaliação de Latência}
+Para uma leitura local mediada, define-se:
+\begin{equation}
+\resizebox{\textwidth}{!}{$\displaystyle T_{gateway}=T_{parse+validacao+escopo}+T_{cofre}+I_{anon}(T_{mascaramento})+I_{consentimento}(T_{espera\ humana}+T_{despacho})$}
+\label{eq:gateway}
+\end{equation}
+O indicador $I$ vale 1 somente quando o modo correspondente é aplicado. No microbenchmark stdio atual, o termo $T_{parse+validacao+escopo}$ observa somente validação de parâmetros e caminho: o transporte usa \codigo{PairState::AlreadyPaired(None)}, portanto não há resolução de agente nem aplicação de escopo nesse caminho. O custo de \codigo{enforce_scopes} não é medido neste microbenchmark; ele é exercido separadamente na bateria adversarial, no transporte WebSocket. Para uma única chamada MCP instrumentada, define-se separadamente:
+\begin{equation}
+T_{e2e}^{(1)}=T_{cliente,\,serializacao}+T_{transporte,\,ida}+T_{gateway}+T_{transporte,\,volta}+T_{cliente,\,recebimento}.
+\label{eq:e2e}
+\end{equation}
+O estimando $T_{e2e}^{(1)}$ começa imediatamente antes da serialização JSON-RPC no cliente e termina quando o cliente recebe a resposta completa; ida e volta do transporte são termos disjuntos. Ele exclui planejamento/inferência do modelo, filas externas, interação do usuário e múltiplas voltas ferramenta--modelo. Ainda não foi medido e não sustenta inferência sobre experiência do usuário até haver instrumentação desses timestamps. Para APPROVAL e OTP, $T_{espera\ humana}$ deve ser relatado como distribuição (mediana, p95 e taxa de timeout/negação), e não como parcela em microssegundos.
+
+\begin{table}[htbp]
+\centering
+\caption{Metodologia do microbenchmark atual.}
+\label{tab:metodologia-microbenchmark}
+\begin{tabularx}{\textwidth}{>{\bfseries}p{0.29\textwidth}X}
+\toprule Campo & Estado na evidência atual \\ \midrule
+Unidade de análise & uma leitura sintética \codigo{vault.read} pelo gateway local em stdio \\
+Condições & DIRECT, APPROVAL--AutoAllow, OTP--AutoAllow e ANONYMIZED \\
+Cargas & 128 B, 1 KiB e 16 KiB \\
+N & 1.000 requisições por célula no CSV versionado \\
+Medido & validação de parâmetros/caminho (sem resolução de agente nem escopo no caminho stdio), despacho do controlador, leitura local do cofre e filtro de PII \\
+Não medido & custo de \codigo{enforce_scopes}, decisão humana, WAN, inferência em nuvem, carga de produção e utilidade de tarefa \\
+\bottomrule
+\end{tabularx}
+\fonte{Elaboração própria a partir de \codigo{apps/thesis-eval/src/main.rs} e \codigo{target/thesis-eval/latency.csv}.}
+\end{table}
+
+\subsection{Avaliação da Preservação de Privacidade}
+A avaliação de segurança utiliza uma bateria pré-especificada de chamadas JSON-RPC e controles legítimos, em uma execução de caixa-preta. Ela valida somente transporte WebSocket, escopo, validação de caminho e aplicação de política HITL simulada (\codigo{HitlPolicy}); não exercita o controlador real de consentimento desktop \codigo{ApprovalState}. Não estima taxa populacional de bloqueio de \textit{prompt injection}: as ``injeções'' são simuladas pelo efeito final --- chamadas de ferramenta --- e não por um LLM real submetido a conteúdo adversarial. A validade externa, portanto, restringe-se ao protocolo e às negativas enumeradas.
+
+\subsection{Protocolo Futuro de Comparação em Nuvem}
+Uma comparação com nuvem não foi executada. Como avaliação futura, o protocolo de dois braços em \codigo{docs/thesis/EVAL-PROTOCOL.md} compara Arm A (mesmo modelo acessando dados somente pelo gateway local) e Arm B (mesmo modelo/versão recebendo o material sintético diretamente por um caminho de contexto em nuvem). A evidência corrente fornece apenas parte do Arm A; adaptador de nuvem, telemetria, política de baseline, governança e análise estatística ainda são necessários.
+
+\section{Considerações Finais}
+Este capítulo definiu o método DSR e a arquitetura Local-First integrada ao MCP. O artefato permite estudar mediação de segredos e credenciais, mas não responde empiricamente por RAG, isolamento de processo/SO, consentimento humano mensurado ou comparação com nuvem. O capítulo seguinte apresenta somente os dados efetivamente produzidos pelo harness.
+
+\chapter{RESULTADOS}
+\section{Fronteira de Evidência}
+\begin{table}[htbp]
+\centering
+\small
+\caption{O que os dados e o código sustentam, e suas qualificações.}
+\label{tab:fronteira-evidencia}
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{0.23\textwidth}>{\raggedright\arraybackslash}p{0.36\textwidth}X}
+\toprule Alegação & Evidência reportável & Qualificação obrigatória \\ \midrule
+Armazenamento local cifrado & XChaCha20-Poly1305, KEK Argon2id e DEK & sem chaves por contêiner; metadados visíveis \\
+Mediação MCP desktop & implementação desktop WS de escopos, APPROVAL/OTP e auditoria & o resultado 10/10 usa \codigo{HitlPolicy} simulada e não exercita o controlador real de consentimento desktop; headless excluído \\
+Sem retorno de bytes de chave & implementação de trânsito/assinatura & não elimina abuso como oráculo \\
+Redução de PII & sete categorias heurísticas em saída ANONYMIZED & não é anonimização genérica/LGPD; somente texto; NÃO detecta RG, CEP, nomes, endereços, datas de nascimento e telefones sem formatação \\
+Sobrecarga local & microbenchmark N=1.000 & execução preliminar de desenvolvimento, uma sessão sem IC; sem humano, WAN, inferência, baseline de nuvem ou utilidade \\
+Resultado adversarial & 10/10 sondas e 2/2 controles & execução preliminar de uma sessão; valida transporte WS, escopo, caminho e política simulada, sem controlador desktop real, atacante adaptativo ou inferência de taxa populacional \\
+\bottomrule
+\end{tabularx}
+\fonte{Elaboração própria com base nos crates citados e nos artefatos em \codigo{target/thesis-eval}.}
+\end{table}
+
+\section{Microbenchmark Sintético de Leitura Local Mediada}
+O microbenchmark cria cofre temporário, semeia cargas sintéticas e executa leituras reais pelo gateway local. A Tabela~\ref{tab:microbenchmark-latencia} resume as médias e p95 de total presentes em \codigo{target/thesis-eval/latency.csv}; N é 1.000 por célula e APPROVAL/OTP usam AutoAllow. Os dados são uma execução preliminar de desenvolvimento (uma sessão, sem intervalo de confiança), não figuras representativas da execução definitiva. Evidência final exige $k\geq3$ sessões independentes, IC de 95\% por bootstrap e regra explícita de \textit{warmup}/descarte.
+
+\begin{table}[htbp]
+\centering
+\caption{Execução preliminar de desenvolvimento: microbenchmark sintético de leitura local mediada (uma sessão, N=1.000 por célula; AutoAllow; resultados dependentes de host). Os valores não representam latência fim a fim nem tempo de decisão humana.}
+\label{tab:microbenchmark-latencia}
+\begin{tabular}{lrrr}
+\toprule Modo & Carga & Média total (\micro) & p95 total (\micro) \\ \midrule
+DIRECT & 128 B & 14,70 & 23,12 \\
+DIRECT & 1 KiB & 17,77 & 32,39 \\
+DIRECT & 16 KiB & 36,64 & 41,29 \\
+APPROVAL--AutoAllow & 128 B & 13,93 & 17,24 \\
+APPROVAL--AutoAllow & 1 KiB & 15,36 & 16,19 \\
+APPROVAL--AutoAllow & 16 KiB & 34,41 & 36,85 \\
+OTP--AutoAllow & 128 B & 13,57 & 17,92 \\
+OTP--AutoAllow & 1 KiB & 15,62 & 19,24 \\
+OTP--AutoAllow & 16 KiB & 35,23 & 40,15 \\
+ANONYMIZED & 128 B & 15,74 & 19,08 \\
+ANONYMIZED & 1 KiB & 26,07 & 29,79 \\
+ANONYMIZED & 16 KiB & 189,79 & 262,19 \\
+\bottomrule
+\end{tabular}
+\fonte{\codigo{target/thesis-eval/latency.csv}.}
+\end{table}
+
+DIRECT apresentou médias de 14,70\micro{} (128 B), 17,77\micro{} (1 KiB) e 36,64\micro{} (16 KiB). Para ANONYMIZED, as médias foram 15,74\micro{}, 26,07\micro{} e 189,79\micro{}, respectivamente, compatíveis com custo crescente do mascaramento heurístico sobre o conteúdo sintético. APPROVAL e OTP ficaram aproximadamente entre 14 e 35\micro{} sob AutoAllow: esses valores são o piso mecânico de despacho do gateway. Em produção, $T_{espera\ humana}$ é dominado pelo tempo de reação humana, tipicamente em segundos, parâmetro externo não medido pelo gateway.
+
+Medições isoladas dos componentes também estão disponíveis em \codigo{target/thesis-eval/micro.csv}: para 128 B, 1 KiB e 16 KiB, a leitura/decifra teve médias de 4,14\micro{}, 4,97\micro{} e 16,82\micro{}, e o filtro teve 1,17\micro{}, 7,86\micro{} e 125,08\micro{}, respectivamente. São medições fora do gateway e não devem ser somadas à Tabela~\ref{tab:microbenchmark-latencia} como se fossem uma nova latência fim a fim.
+
+\section{Bateria Adversarial Pré-especificada}
+Na execução preliminar única da bateria pré-especificada, o gateway bloqueou 10/10 chamadas maliciosas e aceitou 2/2 controles legítimos, conforme \codigo{target/thesis-eval/adversarial.csv} e Tabela~\ref{tab:sondas-adversariais}. O resultado valida somente transporte WebSocket, escopo, validação de caminho e aplicação de política HITL simulada; ele não exercita o controlador real de consentimento desktop, nem atribui cada bloqueio individual à sua causa. Não estima robustez geral contra adversário adaptativo, fluxo de exfiltração por operações permitidas ou população de ataques.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Sondas de caixa-preta da bateria adversarial (uma execução).}
+\label{tab:sondas-adversariais}
+\begin{tabularx}{\textwidth}{>{\bfseries}p{0.08\textwidth}p{0.15\textwidth}Xc}
+\toprule ID & Classe & Descrição & Veredito \\ \midrule
+A1 & ataque & leitura de \codigo{secrets/api.key} fora do escopo & bloqueada \\
+A2 & ataque & leitura de \codigo{personal-id} fora do escopo & bloqueada \\
+A3 & ataque & escrita em \codigo{public} com escopo somente leitura & bloqueada \\
+A4 & ataque & travessia de caminho em \codigo{file_name} & bloqueada \\
+A5 & ataque & travessia de caminho em contêiner & bloqueada \\
+A6 & ataque & enumeração de todos os contêineres & bloqueada \\
+A7 & ataque & exclusão de segredo fora do escopo & bloqueada \\
+A8 & ataque & agente Default sem escopo lê segredo sem consentimento & bloqueada \\
+A9 & ataque & leitura em contêiner NATIVE reservado & bloqueada \\
+A10 & ataque & criação em contêiner NATIVE reservado & bloqueada \\
+C1 & controle & leitura de arquivo público próprio e no escopo & aceita \\
+C2 & controle & listagem de arquivos públicos no escopo & aceita \\
+\bottomrule
+\end{tabularx}
+\fonte{\codigo{target/thesis-eval/adversarial.csv}.}
+\end{table}
+
+\section{Limitações e Trabalho Futuro}
+As próximas iterações devem: (i) vincular autorização criptográfica a referência de chave, hash de payload, semântica da operação, destinatário/domínio e identidade do agente; (ii) introduzir hierarquia de chaves por contêiner ou documentar segmentação apenas lógica e avaliar controles de SO em múltiplas plataformas; (iii) ampliar e medir precisão/recall dos detectores de PII em dados brasileiros, incluindo RG, CEP, nomes e endereços; (iv) adicionar âncora externa ao cabeçalho de auditoria; e (v) executar o protocolo de dois braços e estudo de consentimento humano antes de responder a comparação com nuvem ou latência humana. A correção \textit{fail-closed} do \hyperref[nota:headless]{modo headless} foi aplicada durante o ciclo de rigor DSR.
+
+\appendix
+\chapter{REPRODUTIBILIDADE DA EVIDÊNCIA ATUAL}
+Os artefatos analisados são \codigo{target/thesis-eval/latency.csv}, \codigo{adversarial.csv} e \codigo{micro.csv}. O comando registrado para produzir a execução preliminar de desenvolvimento é:
+{\footnotesize\begin{verbatim}
+cargo run --release -p thesis-eval -- all --out target/thesis-eval --iterations 1000
+\end{verbatim}}
+O commit do repositório é \codigo{dfb0a49f7360aedf37ee89152b99e2d970b6cfd6}; o perfil é \codigo{release}; a plataforma registrada na documentação de avaliação é Linux 7.0, CPU 11th Gen Intel Core i7-11600H (12 threads) a 2,90 GHz, 30 GiB RAM e \codigo{rustc 1.96.1}, capturada em 31 jul. 2026. Os campos de armazenamento e modo de energia estão a finalizar na execução definitiva. Para ligar essa descrição definitivamente aos arquivos, registrar também SO/kernel, CPU, RAM, armazenamento, \codigo{rustc}, perfil, comando, modo de energia e data em cada execução final.
+
+{\footnotesize\begin{verbatim}
+latency.csv:     2e914c1bbd7b290c9aa4c5e143227f08b6f581884d436ccbbd965df7d2649adc
+adversarial.csv: 845a1d042ba68d52123d726c415dc2b21e50f39e3f708ccfc3a18788d2e81d5f
+micro.csv:       d526ed70ebf659e72247a53ddd4de27dbf2a3ffc789c421b1d4e95fc056bf4c6
+\end{verbatim}}
+
+\postextual
+\begin{thebibliography}{99}
+\bibitem{anthropic2024} ANTHROPIC PBC. \textit{Model Context Protocol Specification}. v. 1.0. 2024. Disponível em: \url{https://modelcontextprotocol.io}. Acesso em: 10 abr. 2026.
+\bibitem{cavoukian2011} CAVOUKIAN, Ann. \textit{Privacy by Design: the 7 foundational principles}. Toronto: Information and Privacy Commissioner of Ontario, 2011.
+\bibitem{hevner2007} HEVNER, Alan R. A three cycle view of design science research. \textit{Scandinavian Journal of Information Systems}, v. 19, n. 2, p. 87-92, 2007.
+\bibitem{hevner2004} HEVNER, Alan R.; MARCH, Salvatore T.; PARK, Jinsoo; RAM, Sudha. Design science in information systems research. \textit{MIS Quarterly}, v. 28, n. 1, p. 75-105, 2004.
+\bibitem{imteaj2021} IMTEAJ, Alamin et al. Federated learning: opportunities and challenges. \textit{arXiv preprint arXiv:2101.05428}, 2021.
+\bibitem{khan2022} KHAN, Salman et al. Transformers in vision: a survey. \textit{ACM Computing Surveys}, v. 54, n. 10s, p. 1-41, 2022.
+\bibitem{kleppmann2019} KLEPPMANN, Martin et al. Local-first software: you own your data, in spite of the cloud. In: \textit{ACM SIGPLAN SYMPOSIUM (ONWARD!)}, 2019, Athens. Proceedings [...]. New York: ACM, 2019. p. 154-171.
+\bibitem{lewis2020} LEWIS, Patrick et al. Retrieval-augmented generation for knowledge-intensive NLP tasks. In: \textit{ADVANCES IN NEURAL INFORMATION PROCESSING SYSTEMS (NEURIPS)}, 33., 2020. Proceedings [...]. p. 9459-9474.
+\bibitem{liu2024} LIU, Xiao et al. AgentBench: evaluating LLMs as agents. In: \textit{INTERNATIONAL CONFERENCE ON LEARNING REPRESENTATIONS (ICLR)}, 2024, Vienna. Proceedings [...]. 2024. arXiv:2308.03688.
+\bibitem{lorenzon2021} LORENZON, Laila Neves. Análise comparada entre regulamentações de dados pessoais no Brasil e na União Europeia (LGPD e GDPR). \textit{Revista de Direito Público e Economia}, v. 19, n. 73, p. 129-160, 2021.
+\bibitem{march1995} MARCH, Salvatore T.; SMITH, Gerald F. Design and natural science research on information technology. \textit{Decision Support Systems}, v. 15, n. 4, p. 251-266, 1995.
+\bibitem{nsa2022} NATIONAL SECURITY AGENCY. \textit{Software Memory Safety: Cybersecurity Information Sheet}. 2022. Disponível em: \url{https://media.defense.gov/2022/Nov/10/2003112742/-1/-1/0/CSI_SOFTWARE_MEMORY_SAFETY.PDF}. Acesso em: 1 jun. 2026.
+\bibitem{nisa2025} NISA, Ume et al. Agentic AI: the age of reasoning -- a review. \textit{Journal of Automation and Intelligence}, v. 5, n. 1, p. 69-89, 2025. DOI: 10.1016/j.jai.2025.08.003.
+\bibitem{peffers2007} PEFFERS, Ken et al. A design science research methodology for information systems research. \textit{Journal of Management Information Systems}, v. 24, n. 3, p. 45-77, 2007.
+\bibitem{sakar2024} ŞAKAR, Tolga; EMEKÇI, Hakan. Maximizing RAG efficiency: a comparative analysis of RAG methods. \textit{Natural Language Processing}, v. 31, n. 1, p. 1-25, 2024. DOI: 10.1017/nlp.2024.53.
+\bibitem{sambra2016} SAMBRA, Andrei Vlad et al. \textit{Solid: a platform for decentralized social applications based on linked data}. Cambridge: MIT CSAIL, 2016. (Technical Report).
+\bibitem{simon1996} SIMON, Herbert A. \textit{The sciences of the artificial}. 3. ed. Cambridge, MA: MIT Press, 1996.
+\bibitem{vaswani2017} VASWANI, Ashish et al. Attention is all you need. In: \textit{ADVANCES IN NEURAL INFORMATION PROCESSING SYSTEMS (NEURIPS)}, 2017, Long Beach. Proceedings [...]. p. 5998-6008.
+\bibitem{venable2016} VENABLE, John; PRIES-HEJE, Jan; BASKERVILLE, Richard. FEDS: a framework for evaluation in design science research. \textit{European Journal of Information Systems}, v. 25, n. 1, p. 77-89, 2016.
+\bibitem{wu2011} WU, Wei-Wen. Developing an explorative model for SaaS adoption. \textit{Expert Systems with Applications}, v. 38, n. 12, p. 15057-15064, 2011. DOI: 10.1016/j.eswa.2011.05.039.
+\bibitem{zuboff2019} ZUBOFF, Shoshana. \textit{The age of surveillance capitalism: the fight for a human future at the new frontier of power}. New York: PublicAffairs, 2019.
+\end{thebibliography}
+\end{document}
