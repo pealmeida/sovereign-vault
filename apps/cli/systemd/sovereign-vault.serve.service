@@ -21,7 +21,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 # Required values: SV_AGENT_ID=ag_... and
-# SV_AGENT_TOKEN_FILE=%h/.config/sovereign-vault/agent.token. Both files must be 0600.
+# SV_AGENT_TOKEN_FILE=%h/.config/sovereign-vault/agent.token. The passphrase
+# and agent-token files must be owner-only (0600).
 EnvironmentFile=-%h/.config/sovereign-vault/serve.env
 ExecStart=/usr/local/bin/sovereign-vault serve \
     --root %h/.local/share/sovereign-vault \

@@ -428,6 +428,17 @@ impl ApprovalState {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         let mut store = self.otp_pending.lock().await;
+        self.prune_expired(&mut store);
+        // The caller may have released the lock between the initial admission
+        // check and this insertion. Re-check while holding it so concurrent
+        // new requests cannot exceed the bounded pending-challenge store.
+        if !can_admit_challenge(&store, &key) {
+            return Err(
+                "otp_required: a one-time code is shown on the Sovereign Vault desktop. \
+                 Resend this exact request with the `otp` argument set to that code."
+                    .into(),
+            );
+        }
 
         // Cancel any prior modal for this signature
         if let Some(old_chal) = store.remove(&key) {
@@ -589,6 +600,10 @@ struct VaultStatus {
 #[derive(Debug, Serialize, Deserialize)]
 struct VaultInitResponse {
     recovery_phrase: String,
+    /// Non-sensitive warning when the vault is initialized but the local
+    /// gateway could not be started. The recovery phrase is still returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway_warning: Option<String>,
 }
 
 /// MCP integration status returned by [`mcp_status`].
@@ -663,7 +678,8 @@ impl sv_mcp::AgentAuthenticator for DesktopAgentAuthenticator {
         let agent_id = match agent_id {
             Some(id) => id.to_string(),
             None => {
-                if token != self.shared_secret {
+                let matches: bool = token.as_bytes().ct_eq(self.shared_secret.as_bytes()).into();
+                if !matches {
                     return Err("invalid shared secret".into());
                 }
                 sv_core::agents::list_agents(&self.root, &self.token_key)
@@ -891,23 +907,14 @@ async fn vault_init(
         *guard = Some(handle);
     }
 
-    if let Err(error) = start_servers(&state).await {
-        let mut guard = state.handle.lock().await;
-        *guard = None;
-        record_desktop_event(
-            &state,
-            desktop_event(
-                AuditAction::VaultInit,
-                AuditDecision::Error,
-                None,
-                None,
-                None,
-                None,
-                Some(error.clone()),
-            ),
-        );
-        return Err(error);
-    }
+    // Initialization is already durably committed at this point, and the
+    // recovery phrase exists only in this response. A gateway bind failure
+    // must never turn that successful bootstrap into an error that discards
+    // the phrase and strands the vault. Keep the handle available for the
+    // desktop UI and return a non-secret warning instead.
+    let gateway_warning = start_servers(&state).await.err().map(|_| {
+        "vault initialized, but the local MCP/HTTP gateway could not start; the recovery phrase below is valid and the gateway can be retried after resolving the local error".to_string()
+    });
 
     record_desktop_event(
         &state,
@@ -933,7 +940,10 @@ async fn vault_init(
             None,
         ),
     );
-    Ok(VaultInitResponse { recovery_phrase })
+    Ok(VaultInitResponse {
+        recovery_phrase,
+        gateway_warning,
+    })
 }
 
 #[tauri::command]
@@ -1169,7 +1179,10 @@ async fn vault_rotate_key(
             result.as_ref().err().cloned(),
         ),
     );
-    result.map(|recovery_phrase| VaultInitResponse { recovery_phrase })
+    result.map(|recovery_phrase| VaultInitResponse {
+        recovery_phrase,
+        gateway_warning: None,
+    })
 }
 
 #[tauri::command]

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use sv_audit::{AuditDecision, AuditEvent, AuditLog};
 use sv_core::agents::authenticate;
 use sv_core::sv_storage::SecurityMode;
-use sv_core::{BootstrapResult, CustodyMode, VaultHandle};
+use sv_core::{CustodyMode, VaultHandle};
 use sv_mcp::{
     AccessAction, AccessController, AccessRequest, AgentAuthenticator, AuditSink, RateLimiter,
     ResolvedAgent, ResolvedScope,
@@ -149,19 +149,6 @@ async fn open_or_bootstrap(
             VaultHandle::unlock_with_recovery(root, &phrase)
                 .map_err(|e| ServeError::Other(e.to_string()))?
         }
-        StartupAction::Bootstrap => {
-            fs::create_dir_all(root)?;
-            let pp = args.passphrase.as_deref().ok_or_else(|| {
-                ServeError::Other("vault is uninitialized; supply --passphrase to bootstrap".into())
-            })?;
-            let BootstrapResult {
-                handle,
-                recovery_phrase: _,
-            } = VaultHandle::bootstrap(root, CustodyMode::Passphrase, Some(pp))
-                .map_err(|e| ServeError::Other(e.to_string()))?;
-            tracing::info!(root = %root.display(), "bootstrapped new vault");
-            handle
-        }
         StartupAction::Unlock(custody) => {
             VaultHandle::unlock(root, custody, args.passphrase.as_deref())
                 .map_err(|e| ServeError::Other(e.to_string()))?
@@ -176,7 +163,6 @@ async fn open_or_bootstrap(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupAction {
     Recovery,
-    Bootstrap,
     Unlock(CustodyMode),
 }
 
@@ -186,17 +172,19 @@ enum StartupAction {
 /// distinguish a new vault from an initialized one. The manifest and keyring
 /// are the durable initialization artefacts checked by `VaultHandle::bootstrap`.
 fn startup_action(root: &std::path::Path, has_recovery: bool) -> Result<StartupAction, ServeError> {
+    if !vault_is_initialized(root)? {
+        return Err(ServeError::Other(
+            "vault is uninitialized; initialize it and provision a scoped agent with the desktop app or the dedicated init/bootstrap command before running serve".into(),
+        ));
+    }
+
     if has_recovery {
         return Ok(StartupAction::Recovery);
     }
 
-    if vault_is_initialized(root)? {
-        let custody =
-            VaultHandle::detect_custody(root).map_err(|e| ServeError::Other(e.to_string()))?;
-        Ok(StartupAction::Unlock(custody))
-    } else {
-        Ok(StartupAction::Bootstrap)
-    }
+    let custody =
+        VaultHandle::detect_custody(root).map_err(|e| ServeError::Other(e.to_string()))?;
+    Ok(StartupAction::Unlock(custody))
 }
 
 fn vault_is_initialized(root: &std::path::Path) -> Result<bool, ServeError> {
@@ -437,8 +425,9 @@ mod tests {
     }
 
     #[test]
-    fn recovery_startup_is_prioritized_before_fresh_bootstrap() {
+    fn recovery_startup_is_prioritized_for_an_initialized_vault() {
         let root = temp_root("recovery-priority");
+        fs::write(root.join("manifest.json"), b"existing vault").unwrap();
 
         assert_eq!(
             startup_action(&root, true).unwrap(),
@@ -449,16 +438,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_vault_bootstraps_with_passphrase() {
-        let root = temp_root("fresh-bootstrap");
+    async fn uninitialized_vault_is_rejected_without_creating_any_vault_files() {
+        let root = temp_root("uninitialized-rejected");
         let mut args = serve_args(root.clone());
-        args.passphrase = Some("fresh-bootstrap-passphrase".into());
+        args.passphrase = Some("must-not-bootstrap".into());
 
-        let (handle, _, _) = open_or_bootstrap(&args).await.unwrap();
-        assert_eq!(handle.custody(), CustodyMode::Passphrase);
-        assert!(root.join("manifest.json").exists());
-        assert!(root.join("keyring.svault").exists());
-        drop(handle);
+        let error = match open_or_bootstrap(&args).await {
+            Ok(_) => panic!("uninitialized vault must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("vault is uninitialized"));
+        assert!(error.to_string().contains("provision a scoped agent"));
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
 
         fs::remove_dir_all(root).unwrap();
     }
