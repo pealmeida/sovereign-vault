@@ -60,7 +60,7 @@ futures-util = "0.3"
 hyper        = { version = "1.10", features = ["server", "http1"] }
 hyper-util   = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 http-body-util = "0.1"
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+ed25519-dalek = { version = "3.0", features = ["rand_core"] }
 reqwest      = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rand         = "0.10"
 getrandom    = "0.4"
