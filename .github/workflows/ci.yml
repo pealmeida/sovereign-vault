@@ -57,7 +57,7 @@ jobs:
       # custom-protocol feature, whose generate_context! embeds ui/dist at
       # compile time — so the UI must be built before any all-features step.
       - name: Install Node 20
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -130,7 +130,7 @@ jobs:
       # advisories (e.g. the GTK3 bindings Tauri pulls in on Linux) are reported
       # but non-fatal — unlike the rustsec/audit-check action, which fails on them.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
+        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
         with:
           tool: cargo-audit
       - name: cargo audit (fail only on vulnerabilities)
@@ -147,7 +147,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Install Node 20
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '20'
           cache: 'npm'

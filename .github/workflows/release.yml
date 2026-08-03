@@ -45,7 +45,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
 
@@ -162,7 +162,7 @@ jobs:
             libsoup-3.0-dev
 
       - name: Install Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -246,7 +246,7 @@ jobs:
           ref: ${{ needs.validate.outputs.tag }}
           persist-credentials: false
       - name: Install cargo-audit 0.22.2
-        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
+        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
         with:
           tool: cargo-audit@0.22.2
       - name: Audit Rust dependencies
@@ -267,7 +267,7 @@ jobs:
           ref: ${{ needs.validate.outputs.tag }}
           persist-credentials: false
       - name: Install Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -367,7 +367,7 @@ jobs:
             patchelf
 
       - name: Install Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm

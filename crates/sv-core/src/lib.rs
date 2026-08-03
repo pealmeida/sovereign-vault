@@ -2549,7 +2549,7 @@ mod tests {
         drop(boot.handle);
         let old_salt = read_salt(&root).unwrap();
         let old_kek = MasterKey::from_passphrase(TEST_PASSPHRASE, &old_salt).unwrap();
-        let new_salt = [8u8; SALT_LEN];
+        let new_salt = sv_crypto::random_salt().unwrap();
         let new_kek = MasterKey::from_passphrase(NEW_TEST_PASSPHRASE, &new_salt).unwrap();
         keyring::stage_rewrap_under_new_kek(&root, &old_kek, &new_kek).unwrap();
         write_lifecycle(
@@ -2575,7 +2575,7 @@ mod tests {
         drop(boot.handle);
         let old_salt = read_salt(&root).unwrap();
         let old_kek = MasterKey::from_passphrase(TEST_PASSPHRASE, &old_salt).unwrap();
-        let new_salt = [9u8; SALT_LEN];
+        let new_salt = sv_crypto::random_salt().unwrap();
         let new_kek = MasterKey::from_passphrase(NEW_TEST_PASSPHRASE, &new_salt).unwrap();
         keyring::stage_rewrap_under_new_kek(&root, &old_kek, &new_kek).unwrap();
         write_lifecycle(
@@ -2731,7 +2731,7 @@ mod tests {
         drop(boot.handle);
         let old_salt = read_salt(&root).unwrap();
         let old_kek = MasterKey::from_passphrase(TEST_PASSPHRASE, &old_salt).unwrap();
-        let new_salt = [11u8; SALT_LEN];
+        let new_salt = sv_crypto::random_salt().unwrap();
         let new_kek = MasterKey::from_passphrase(NEW_TEST_PASSPHRASE, &new_salt).unwrap();
         keyring::stage_rewrap_under_new_kek(&root, &old_kek, &new_kek).unwrap();
         write_lifecycle(

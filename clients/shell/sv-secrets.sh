@@ -27,6 +27,34 @@ _svc_run() {
   "$runner" "$(_svc_loader)" "$@"
 }
 
+# Print eval-ready exports only after a loader has successfully written a
+# private runtime file.  Both loaders support --out; using it here keeps the
+# Python loader's no-secrets-on-stdout contract intact and prevents a failed
+# loader from being masked by a successful downstream command.
+_svc_export() (
+  local container="$1" tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/sv-secrets.XXXXXX")" || {
+    echo "[sv-secrets] failed to create private runtime file" >&2
+    return 1
+  }
+  if ! chmod 600 "$tmp"; then
+    rm -f -- "$tmp"
+    echo "[sv-secrets] failed to secure runtime file" >&2
+    return 1
+  fi
+  trap 'rm -f -- "$tmp"' EXIT
+  trap 'exit 1' HUP INT TERM
+
+  if ! _svc_run --container "$container" --out "$tmp"; then
+    echo "[sv-secrets] load failed" >&2
+    return 1
+  fi
+
+  # This wrapper deliberately emits secrets for `eval "$(...)"`; loaders
+  # themselves never stream those values to stdout in this path.
+  sed 's/^/export /' "$tmp"
+)
+
 # Load secrets into the CURRENT shell (must be sourced).
 sv_load() {
   local container="$1" src="${2:-${SECRETS_SOURCE:-auto}}"
@@ -46,8 +74,7 @@ if [ "${BASH_SOURCE[0]:-$0}" = "$0" ] && [ -n "${1:-}" ]; then
   export_flag=""
   for a in "$@"; do [ "$a" = "--export" ] && export_flag=1; done
   if [ -n "$export_flag" ]; then
-    # prefix each KEY=VALUE with `export ` so `eval` puts them in the env
-    _svc_run --container "$container" | sed 's/^/export /'
+    _svc_export "$container"
   else
     _svc_run --container "$container"
   fi
