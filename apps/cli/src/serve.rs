@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -135,44 +136,78 @@ async fn open_or_bootstrap(
 ) -> Result<(VaultHandle, [u8; 32], [u8; 32]), ServeError> {
     let root = &args.root;
 
-    // A vault is "fresh" when its master.salt (or keychain wrapper) is missing.
-    // The directory may exist with a stale .vault.lock from a previous failed
-    // bootstrap; that's expected and not a barrier to re-bootstrapping.
-    let salt_path = root.join("master.salt");
-    let fresh = !salt_path.exists();
+    let handle = match startup_action(root, args.recovery.is_some())? {
+        // Recovery must win even when the vault's on-disk state is incomplete:
+        // it is the only safe way to repair or open a vault without its normal
+        // custody credential.
+        StartupAction::Recovery => {
+            let phrase = args
+                .recovery
+                .as_ref()
+                .expect("recovery was checked above")
+                .join(" ");
+            VaultHandle::unlock_with_recovery(root, &phrase)
+                .map_err(|e| ServeError::Other(e.to_string()))?
+        }
+        StartupAction::Bootstrap => {
+            fs::create_dir_all(root)?;
+            let pp = args.passphrase.as_deref().ok_or_else(|| {
+                ServeError::Other("vault is uninitialized; supply --passphrase to bootstrap".into())
+            })?;
+            let BootstrapResult {
+                handle,
+                recovery_phrase: _,
+            } = VaultHandle::bootstrap(root, CustodyMode::Passphrase, Some(pp))
+                .map_err(|e| ServeError::Other(e.to_string()))?;
+            tracing::info!(root = %root.display(), "bootstrapped new vault");
+            handle
+        }
+        StartupAction::Unlock(custody) => {
+            VaultHandle::unlock(root, custody, args.passphrase.as_deref())
+                .map_err(|e| ServeError::Other(e.to_string()))?
+        }
+    };
 
-    if fresh {
-        std::fs::create_dir_all(root)?;
-        let pp = args.passphrase.as_ref().ok_or_else(|| {
-            ServeError::Other("vault root missing; supply --passphrase to bootstrap".into())
-        })?;
-        let BootstrapResult {
-            handle,
-            recovery_phrase: _,
-        } = VaultHandle::bootstrap(root, CustodyMode::Passphrase, Some(pp))
-            .map_err(|e| ServeError::Other(e.to_string()))?;
-        tracing::info!(root = %root.display(), "bootstrapped new vault");
-        let audit = handle.audit_hmac_key();
-        let agent = handle.agent_token_key();
-        return Ok((handle, audit, agent));
-    }
-
-    // Vault exists: unlock with passphrase or recovery words.
-    if let Some(ref words) = args.recovery {
-        let phrase = words.join(" ");
-        let handle = VaultHandle::unlock_with_recovery(root, &phrase)
-            .map_err(|e| ServeError::Other(e.to_string()))?;
-        let audit = handle.audit_hmac_key();
-        let agent = handle.agent_token_key();
-        return Ok((handle, audit, agent));
-    }
-
-    let pp = args.passphrase.as_deref();
-    let handle = VaultHandle::unlock(root, CustodyMode::Passphrase, pp)
-        .map_err(|e| ServeError::Other(e.to_string()))?;
     let audit = handle.audit_hmac_key();
     let agent = handle.agent_token_key();
     Ok((handle, audit, agent))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupAction {
+    Recovery,
+    Bootstrap,
+    Unlock(CustodyMode),
+}
+
+/// Choose the only safe startup path from the user input and on-disk vault state.
+///
+/// `master.salt` is deliberately absent for OS-keychain vaults, so it cannot
+/// distinguish a new vault from an initialized one. The manifest and keyring
+/// are the durable initialization artefacts checked by `VaultHandle::bootstrap`.
+fn startup_action(root: &std::path::Path, has_recovery: bool) -> Result<StartupAction, ServeError> {
+    if has_recovery {
+        return Ok(StartupAction::Recovery);
+    }
+
+    if vault_is_initialized(root)? {
+        let custody =
+            VaultHandle::detect_custody(root).map_err(|e| ServeError::Other(e.to_string()))?;
+        Ok(StartupAction::Unlock(custody))
+    } else {
+        Ok(StartupAction::Bootstrap)
+    }
+}
+
+fn vault_is_initialized(root: &std::path::Path) -> Result<bool, ServeError> {
+    for artifact in ["manifest.json", "keyring.svault"] {
+        match fs::symlink_metadata(root.join(artifact)) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
 }
 
 /// Fail-closed access controller: only explicitly safe modeless operations
@@ -344,6 +379,106 @@ mod tests {
             authorization_context: String::new(),
             import_summary: None,
         }
+    }
+
+    fn serve_args(root: PathBuf) -> ServeArgs {
+        ServeArgs {
+            root,
+            passphrase: None,
+            recovery: None,
+            ws_bind: "127.0.0.1:0".parse().unwrap(),
+            http_bind: "127.0.0.1:0".parse().unwrap(),
+            rate_limit: None,
+            agent_id: "test-agent".into(),
+            agent_token: "test-token".into(),
+        }
+    }
+
+    #[test]
+    fn initialized_saltless_vault_selects_os_keychain_unlock_not_bootstrap() {
+        let root = temp_root("os-keychain-startup");
+        // OS-keychain custody has no master.salt. A manifest/keyring is enough
+        // to establish that this is an existing vault without touching a live
+        // OS keychain in the unit test.
+        fs::write(root.join("manifest.json"), b"existing vault").unwrap();
+        fs::write(root.join("keyring.svault"), b"existing keyring").unwrap();
+
+        assert_eq!(
+            startup_action(&root, false).unwrap(),
+            StartupAction::Unlock(CustodyMode::OsKeychain)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_startup_is_prioritized_before_fresh_bootstrap() {
+        let root = temp_root("recovery-priority");
+
+        assert_eq!(
+            startup_action(&root, true).unwrap(),
+            StartupAction::Recovery
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_vault_bootstraps_with_passphrase() {
+        let root = temp_root("fresh-bootstrap");
+        let mut args = serve_args(root.clone());
+        args.passphrase = Some("fresh-bootstrap-passphrase".into());
+
+        let (handle, _, _) = open_or_bootstrap(&args).await.unwrap();
+        assert_eq!(handle.custody(), CustodyMode::Passphrase);
+        assert!(root.join("manifest.json").exists());
+        assert!(root.join("keyring.svault").exists());
+        drop(handle);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_startup_opens_existing_vault_before_bootstrap() {
+        let root = temp_root("recovery-existing");
+        let bootstrap = VaultHandle::bootstrap(
+            &root,
+            CustodyMode::Passphrase,
+            Some("recovery-existing-passphrase"),
+        )
+        .unwrap();
+        let recovery_phrase = bootstrap.recovery_phrase.clone();
+        drop(bootstrap);
+
+        let mut args = serve_args(root.clone());
+        args.recovery = Some(
+            recovery_phrase
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
+        );
+        let (handle, _, _) = open_or_bootstrap(&args).await.unwrap();
+        assert_eq!(handle.custody(), CustodyMode::Recovery);
+        drop(handle);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn existing_passphrase_vault_starts_with_detected_custody() {
+        let root = temp_root("passphrase-startup");
+        let passphrase = "existing-passphrase-startup";
+        let bootstrap =
+            VaultHandle::bootstrap(&root, CustodyMode::Passphrase, Some(passphrase)).unwrap();
+        drop(bootstrap);
+
+        let mut args = serve_args(root.clone());
+        args.passphrase = Some(passphrase.into());
+        let (handle, _, _) = open_or_bootstrap(&args).await.unwrap();
+        assert_eq!(handle.custody(), CustodyMode::Passphrase);
+        drop(handle);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
