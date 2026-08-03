@@ -273,9 +273,9 @@ fn read_headless_agent_token(token_file: Option<&std::path::Path>) -> Result<Str
 
 /// Read a local daemon credential only from a regular owner-only file.
 ///
-/// Check the opened file's metadata as well as the path entry so a symlink or
-/// a Unix path replacement cannot silently turn an explicitly configured
-/// secret file into a different credential source.
+/// Unix validates both the path and the opened descriptor, preventing a
+/// symlink or path-replacement attack from changing the credential source.
+#[cfg(unix)]
 fn read_owner_only_secret_file(path: &std::path::Path, label: &str) -> Result<String, String> {
     use std::io::Read as _;
 
@@ -322,6 +322,16 @@ fn read_owner_only_secret_file(path: &std::path::Path, label: &str) -> Result<St
         return Err(format!("{label} file is empty: {}", path.display()));
     }
     Ok(secret)
+}
+
+/// This CLI does not implement equivalent Windows ACL validation, so headless
+/// credential files are rejected rather than accepting a weaker guarantee.
+#[cfg(not(unix))]
+fn read_owner_only_secret_file(path: &std::path::Path, label: &str) -> Result<String, String> {
+    Err(format!(
+        "headless {label}-file hardening is only supported on Unix; use a supported environment credential source instead: {}",
+        path.display()
+    ))
 }
 
 fn parse_rate_limit(raw: &str) -> Result<Option<(usize, std::time::Duration)>, String> {
@@ -501,6 +511,14 @@ mod tests {
         assert!(read_owner_only_secret_file(&link, "agent token").is_err());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn daemon_secret_file_is_rejected_when_owner_only_hardening_is_unavailable() {
+        let path = temp_root("unsupported-secret-file").join("agent.token");
+        let error = read_owner_only_secret_file(&path, "agent token").unwrap_err();
+        assert!(error.contains("hardening is only supported on Unix"));
     }
 
     #[test]

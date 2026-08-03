@@ -25,6 +25,7 @@ use sv_mcp::{
     ResolvedAgent, ResolvedScope,
 };
 use tokio::net::TcpListener;
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{oneshot, Mutex};
 
@@ -108,12 +109,7 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     tracing::info!(ws = %args.ws_bind, http = %args.http_bind, "sovereign-vault headless gateway is up");
     tracing::info!(agent_id = %args.agent_id, "headless gateway accepts only the provisioned scoped agent");
 
-    let mut term = signal(SignalKind::terminate())?;
-    let mut intr = signal(SignalKind::interrupt())?;
-    tokio::select! {
-        _ = term.recv() => tracing::info!("received SIGTERM"),
-        _ = intr.recv() => tracing::info!("received SIGINT"),
-    }
+    wait_for_shutdown_signal().await?;
 
     let lock_event = AuditEvent::new(
         sv_audit::AuditAction::VaultLock,
@@ -128,6 +124,30 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     let _ = http_task.await;
 
     tracing::info!("shutdown complete");
+    Ok(())
+}
+
+/// Wait for an operating-system shutdown request.
+///
+/// Unix services need to handle SIGTERM for systemd-managed graceful
+/// shutdown; SIGINT remains useful when the daemon is run interactively.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> Result<(), ServeError> {
+    let mut term = signal(SignalKind::terminate())?;
+    let mut intr = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        _ = term.recv() => tracing::info!("received SIGTERM"),
+        _ = intr.recv() => tracing::info!("received SIGINT"),
+    }
+    Ok(())
+}
+
+/// Windows has no SIGTERM/SIGINT signal stream. Tokio's Ctrl-C future maps to
+/// the platform console control event and preserves graceful shutdown.
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> Result<(), ServeError> {
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("received Ctrl-C");
     Ok(())
 }
 

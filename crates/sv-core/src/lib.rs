@@ -191,9 +191,11 @@ impl VaultLock {
             // the symlink_metadata check and open(2), O_NOFOLLOW causes open to
             // fail with ELOOP on Unix. Map that to the same Misuse shape as the
             // pre-check so we never leak a symlink follow.
-            if error.kind() == std::io::ErrorKind::Other
-                || error.raw_os_error() == Some(libc::ELOOP)
-            {
+            let is_symlink_open_error = error.kind() == std::io::ErrorKind::Other;
+            #[cfg(unix)]
+            let is_symlink_open_error =
+                is_symlink_open_error || error.raw_os_error() == Some(libc::ELOOP);
+            if is_symlink_open_error {
                 CoreError::Misuse(format!(
                     "vault lock is not a regular file: {}",
                     path.display()
