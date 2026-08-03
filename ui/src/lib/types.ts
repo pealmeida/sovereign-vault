@@ -44,6 +44,19 @@ export interface ApprovalPrompt {
   mode: string | null;
   byte_size: number | null;
   otp_code: string | null;
+  import_summary?: ImportApprovalSummary | null;
+}
+
+/** Non-secret authority included in an agent-import approval prompt. */
+export interface ImportApprovalSummary {
+  mode: string;
+  agent_count: number;
+  agents: ImportApprovalAgent[];
+}
+
+export interface ImportApprovalAgent {
+  name: string;
+  scopes: AgentScope[];
 }
 
 export interface McpStatus {

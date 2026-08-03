@@ -15,6 +15,7 @@
 //! `hmac::Mac::verify_slice` (constant-time) before returning records; every
 //! write re-computes the tag before the atomic 0600 replacement.
 
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
@@ -80,6 +81,38 @@ pub struct AgentRecord {
     /// the per-container mode flow).
     #[serde(default)]
     pub scopes: Vec<AgentScope>,
+}
+
+/// Validated agent identity to import. Token material is generated only when
+/// the complete batch has passed validation and is ready to be persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentImportEntry {
+    /// Human-readable agent name.
+    pub name: String,
+    /// Scope grants to attach to the fresh credential.
+    pub scopes: Vec<AgentScope>,
+}
+
+/// Fresh credential returned for one atomically imported agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedAgent {
+    /// Imported agent name.
+    pub name: String,
+    /// Fresh stable agent identifier.
+    pub agent_id: String,
+    /// Fresh one-time token, returned only to the caller.
+    pub one_time_token: String,
+}
+
+/// Result of an atomic agent import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentImportResult {
+    /// Freshly imported identities.
+    pub imported: Vec<ImportedAgent>,
+    /// Names skipped because they already existed in create-only mode.
+    pub skipped: Vec<String>,
+    /// Names whose existing identities were revoked during replacement.
+    pub revoked: Vec<String>,
 }
 
 // ── on-disk structures ──────────────────────────────────────────────────────
@@ -372,6 +405,76 @@ pub fn create_agent(
     file.agents.push(record);
     write_file(root, hmac_key, &file)?;
     Ok((agent_id, token))
+}
+
+/// Import a complete, pre-validated batch of agent identities with one
+/// authenticated registry replacement. No registry mutation occurs until the
+/// full batch (including all fresh tokens) has been prepared successfully.
+pub fn import_agents_atomically(
+    root: &Path,
+    hmac_key: &[u8; 32],
+    entries: Vec<AgentImportEntry>,
+    replace_existing: bool,
+) -> Result<AgentImportResult> {
+    let mut names = HashSet::with_capacity(entries.len());
+    for entry in &entries {
+        if entry.name.is_empty() {
+            return Err(CoreError::Misuse("agent.name must not be empty".into()));
+        }
+        if !names.insert(entry.name.as_str()) {
+            return Err(CoreError::Misuse(format!(
+                "agent import contains duplicate name: {}",
+                entry.name
+            )));
+        }
+    }
+
+    let mut file = read_file(root, hmac_key)?;
+    let mut result = AgentImportResult {
+        imported: Vec::with_capacity(entries.len()),
+        skipped: Vec::new(),
+        revoked: Vec::new(),
+    };
+
+    for entry in entries {
+        let has_existing = file.agents.iter().any(|agent| agent.name == entry.name);
+        if has_existing && !replace_existing {
+            result.skipped.push(entry.name);
+            continue;
+        }
+        if has_existing {
+            for existing in file
+                .agents
+                .iter_mut()
+                .filter(|agent| agent.name == entry.name)
+            {
+                existing.revoked = true;
+            }
+            result.revoked.push(entry.name.clone());
+        }
+
+        let agent_id = fresh_agent_id()?;
+        let one_time_token = fresh_token()?;
+        file.agents.push(AgentRecord {
+            agent_id: agent_id.clone(),
+            name: entry.name.clone(),
+            token_hash: token_hash(hmac_key, &one_time_token),
+            created_at: Utc::now(),
+            expires_at: None,
+            revoked: false,
+            scopes: entry.scopes,
+        });
+        result.imported.push(ImportedAgent {
+            name: entry.name,
+            agent_id,
+            one_time_token,
+        });
+    }
+
+    // `write_file` uses an atomic replacement; failures leave the previous
+    // authenticated registry in place rather than partially revoking agents.
+    write_file(root, hmac_key, &file)?;
+    Ok(result)
 }
 
 /// Ensure a "Default" agent exists whose token is the current `pairing_secret`.
