@@ -209,10 +209,6 @@ The research paper lives in [`docs/thesis/`](./docs/thesis/) ([PDF](./docs/thesi
 
 Apache-2.0. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
 
-## Lineage
-
-Originated as a proof-of-concept inside [agentic-sovereign-ecosystem](https://github.com/pealmeida/agentic-sovereign-ecosystem), then rewritten Rust-native to drop the Node bridge and the Mission Control / Digital Twin coupling.
-
 ## Contributing
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md). Report vulnerabilities via [SECURITY.md](./SECURITY.md), not the public issue tracker.
