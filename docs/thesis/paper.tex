@@ -13,9 +13,9 @@
 \usepackage{graphicx}
 \usepackage{hyperref}
 \hypersetup{colorlinks=true,linkcolor=black,citecolor=black,urlcolor=black}
-\newcommand{\codigo}[1]{\texttt{\detokenize{#1}}}
+\DeclareUrlCommand\codigo{\urlstyle{tt}}
 \newcommand{\micro}{\,$\mu$s}
-\newcommand{\nota}[1]{\begin{center}\fbox{\begin{minipage}{0.90\textwidth}\textbf{#1}\end{minipage}}\end{center}}
+\newcommand{\svnota}[1]{\begin{center}\fbox{\begin{minipage}{0.90\textwidth}\textbf{#1}\end{minipage}}\end{center}}
 \titulo{Arquitetura de Soberania de Dados para Agentes de IA Pessoais: Um Modelo Local-First Baseado em Protocolos Descentralizados}
 \autor{Pedro Oliveira}
 \local{São Carlos}
@@ -26,7 +26,6 @@
 
 \begin{document}
 \pretextual
-\imprimircapa
 \begin{center}
 \textbf{PROJETO DE PESQUISA}\\[1.5em]
 Instituição: USP/ICMC\\
@@ -75,7 +74,7 @@ Propor e desenvolver uma arquitetura de software baseada nos princípios Local-F
 \item Avaliar, em ambiente controlado, a latência interna do gateway local e a cobertura de bloqueio de uma bateria pré-especificada de tentativas de acesso não autorizado.
 \end{enumerate}
 
-\nota{\textbf{Escopo empírico.} A instância do Sovereign Vault restringe-se ao controle de credenciais e segredos locais identificados por contêiner e arquivo. Ela demonstra um padrão de mediação; indexação vetorial, recuperação semântica de documentos e processamento local de embeddings não integram o artefato avaliado. Esses elementos, assim como contêineres de contexto, constam como trabalho futuro em \codigo{docs/adr/0012-context-containers.md}.}
+\svnota{\textbf{Escopo empírico.} A instância do Sovereign Vault restringe-se ao controle de credenciais e segredos locais identificados por contêiner e arquivo. Ela demonstra um padrão de mediação; indexação vetorial, recuperação semântica de documentos e processamento local de embeddings não integram o artefato avaliado. Esses elementos, assim como contêineres de contexto, constam como trabalho futuro em \codigo{docs/adr/0012-context-containers.md}.}
 
 \section{Organização do Trabalho}
 O trabalho está organizado em capítulos. O Capítulo 2 detalha a fundamentação teórica e o estado da arte das tecnologias de suporte. O Capítulo 3 estabelece o percurso metodológico fundamentado em Design Science Research (DSR), descrevendo a arquitetura e a estratégia de validação do artefato. O Capítulo 4 apresenta os resultados disponíveis e suas fronteiras de evidência. Os capítulos subsequentes poderão abordar discussão e considerações finais.
@@ -154,7 +153,7 @@ O mascaramento heurístico de saída cobre exatamente e-mail, CPF, CNPJ, número
 Nas operações MCP documentadas, a semente privada e as chaves simétricas não são retornadas ao agente; somente assinatura, cifra ou texto decifrado são retornados após autorização (\codigo{crates/sv-core/src/transit.rs:245-330,368-392}; \codigo{crates/sv-mcp/src/lib.rs:1715-1740}). A zeroização ponta-a-ponta da semente Ed25519 depende também da disciplina de armazenamento do chamador em \codigo{sv-core}, e não apenas de \codigo{sv-crypto}. No desktop, operações de trânsito e assinatura exigem aprovação por operação. Esta versão não fornece autorização vinculada à chave/uso nem apresenta ao usuário uma descrição verificável do conteúdo a assinar ou decifrar; portanto o resultado de protocolo não elimina risco de uso como oráculo.
 
 \phantomsection\label{nota:headless}
-\nota{\textbf{Aviso de segurança --- modo headless.} Durante o ciclo de rigor DSR, a revisão de código identificou apagamento de escopos e um oráculo modeless de criptografia/corretagem. A correção aplicada preserva os escopos persistidos do agente ao autenticá-lo e recusa, em modo headless, operações modeless que portam ou usam segredos (cifra de trânsito, decifragem, assinatura e corretagem), de forma \textit{fail-closed}; essas operações devem usar o aplicativo desktop (\codigo{apps/cli/src/serve.rs}). Assim, o headless mantém leituras e escritas DIRECT ordinárias, mas não oferece consentimento humano para operações secretas.}
+\svnota{\textbf{Aviso de segurança --- modo headless.} Durante o ciclo de rigor DSR, a revisão de código identificou apagamento de escopos e um oráculo modeless de criptografia/corretagem. A correção aplicada preserva os escopos persistidos do agente ao autenticá-lo e recusa, em modo headless, operações modeless que portam ou usam segredos (cifra de trânsito, decifragem, assinatura e corretagem), de forma \textit{fail-closed}; essas operações devem usar o aplicativo desktop (\codigo{apps/cli/src/serve.rs}). Assim, o headless mantém leituras e escritas DIRECT ordinárias, mas não oferece consentimento humano para operações secretas.}
 
 \subsection{Human-in-the-loop e Auditoria}
 A interface desktop foi implementada em Tauri com Content Security Policy e capacidades explícitas (\codigo{apps/desktop/src-tauri/tauri.conf.json:24-26}; \codigo{apps/desktop/src-tauri/capabilities/default.json:1-9}). O presente estudo não mede comparativamente superfície de injeção, isolamento de segurança ou consumo de memória em relação ao Electron.
@@ -164,7 +163,7 @@ Operações sensíveis geram registros encadeados por HMAC-SHA256 e verificados 
 \section{Modelo de Execução e Protocolo de Segurança}
 No caminho desktop WebSocket autenticado, o fluxo de solicitações passa por autenticação, validação de parâmetros e caminhos, verificação de escopo, política de consentimento quando aplicável, operação no cofre, filtragem ANONYMIZED quando aplicável e auditoria. Leituras em contêineres DIRECT retornam dados sem consentimento por projeto; por isso, contêineres DIRECT ficam fora da garantia de mediação humana. Trata-se de um \textit{trade-off} deliberado que o usuário deve configurar conscientemente. Nas operações criptográficas, o gateway executa localmente a operação e retorna a saída do protocolo, e não bytes de chave; a limitação de oráculo e de transparência de consentimento descrita acima permanece aplicável.
 
-\nota{\textbf{Modelo de ameaça e limites.} O estudo avalia um usuário, uma máquina e um gateway local desbloqueado. O adversário principal é um agente MCP autenticado e potencialmente comprometido. Estão fora de escopo: comprometimento do sistema operacional, malware ou processo sob a mesma conta do usuário, inspeção de memória, vulnerabilidades em dependências nativas/TCB, retenção de dados pelo provedor de IA e rollback completo da auditoria. Roubo de token também está fora de escopo: o token está em claro no ambiente do cliente; como trabalho futuro, recomenda-se arquivo com permissão 0600 ou chaveiro do sistema operacional. Atacante adaptativo está fora de escopo da bateria de execução única; teste adaptativo é trabalho futuro. Leituras DIRECT retornam dados sem consentimento por projeto, e contêineres DIRECT estão fora da garantia de mediação humana; esse \textit{trade-off} deve ser configurado conscientemente pelo usuário. A confidencialidade em repouso protege conteúdo cifrado, mas nomes e metadados operacionais podem permanecer visíveis. O modo headless preserva escopos e bloqueia operações secretas modeless; os resultados experimentais de menor privilégio e mediação humana, porém, referem-se ao gateway desktop WebSocket.}
+\svnota{\textbf{Modelo de ameaça e limites.} O estudo avalia um usuário, uma máquina e um gateway local desbloqueado. O adversário principal é um agente MCP autenticado e potencialmente comprometido. Estão fora de escopo: comprometimento do sistema operacional, malware ou processo sob a mesma conta do usuário, inspeção de memória, vulnerabilidades em dependências nativas/TCB, retenção de dados pelo provedor de IA e rollback completo da auditoria. Roubo de token também está fora de escopo: o token está em claro no ambiente do cliente; como trabalho futuro, recomenda-se arquivo com permissão 0600 ou chaveiro do sistema operacional. Atacante adaptativo está fora de escopo da bateria de execução única; teste adaptativo é trabalho futuro. Leituras DIRECT retornam dados sem consentimento por projeto, e contêineres DIRECT estão fora da garantia de mediação humana; esse \textit{trade-off} deve ser configurado conscientemente pelo usuário. A confidencialidade em repouso protege conteúdo cifrado, mas nomes e metadados operacionais podem permanecer visíveis. O modo headless preserva escopos e bloqueia operações secretas modeless; os resultados experimentais de menor privilégio e mediação humana, porém, referem-se ao gateway desktop WebSocket.}
 
 \section{Estratégia de Desenvolvimento do Artefato}
 O protótipo é codificado em Rust. A proibição de \codigo{unsafe} nos crates próprios reduz classes de erros de corrupção de memória no código de aplicação auditado (por exemplo, \codigo{crates/sv-mcp/src/lib.rs:18}). Não se infere daí ausência de vulnerabilidades críticas, isolamento de memória no SO ou redução mensurada de latência. Tauri foi escolhido para a interface com CSP e capacidades explícitas, sem alegação comparativa perante Electron.
@@ -175,7 +174,7 @@ A validação utiliza metodologias de avaliação naturalísticas e artificiais 
 \subsection{Avaliação de Latência}
 Para uma leitura local mediada, define-se:
 \begin{equation}
-T_{gateway}=T_{parse+validacao+escopo}+T_{cofre}+I_{anon}(T_{mascaramento})+I_{consentimento}(T_{espera\ humana}+T_{despacho}).
+\resizebox{\textwidth}{!}{$\displaystyle T_{gateway}=T_{parse+validacao+escopo}+T_{cofre}+I_{anon}(T_{mascaramento})+I_{consentimento}(T_{espera\ humana}+T_{despacho})$}
 \label{eq:gateway}
 \end{equation}
 O indicador $I$ vale 1 somente quando o modo correspondente é aplicado. No microbenchmark stdio atual, o termo $T_{parse+validacao+escopo}$ observa somente validação de parâmetros e caminho: o transporte usa \codigo{PairState::AlreadyPaired(None)}, portanto não há resolução de agente nem aplicação de escopo nesse caminho. O custo de \codigo{enforce_scopes} não é medido neste microbenchmark; ele é exercido separadamente na bateria adversarial, no transporte WebSocket. Para uma única chamada MCP instrumentada, define-se separadamente:
@@ -294,16 +293,16 @@ As próximas iterações devem: (i) vincular autorização criptográfica a refe
 \appendix
 \chapter{REPRODUTIBILIDADE DA EVIDÊNCIA ATUAL}
 Os artefatos analisados são \codigo{target/thesis-eval/latency.csv}, \codigo{adversarial.csv} e \codigo{micro.csv}. O comando registrado para produzir a execução preliminar de desenvolvimento é:
-\begin{verbatim}
+{\footnotesize\begin{verbatim}
 cargo run --release -p thesis-eval -- all --out target/thesis-eval --iterations 1000
-\end{verbatim}
+\end{verbatim}}
 O commit do repositório é \codigo{dfb0a49f7360aedf37ee89152b99e2d970b6cfd6}; o perfil é \codigo{release}; a plataforma registrada na documentação de avaliação é Linux 7.0, CPU 11th Gen Intel Core i7-11600H (12 threads) a 2,90 GHz, 30 GiB RAM e \codigo{rustc 1.96.1}, capturada em 31 jul. 2026. Os campos de armazenamento e modo de energia estão a finalizar na execução definitiva. Para ligar essa descrição definitivamente aos arquivos, registrar também SO/kernel, CPU, RAM, armazenamento, \codigo{rustc}, perfil, comando, modo de energia e data em cada execução final.
 
-\begin{verbatim}
+{\footnotesize\begin{verbatim}
 latency.csv:     2e914c1bbd7b290c9aa4c5e143227f08b6f581884d436ccbbd965df7d2649adc
 adversarial.csv: 845a1d042ba68d52123d726c415dc2b21e50f39e3f708ccfc3a18788d2e81d5f
 micro.csv:       d526ed70ebf659e72247a53ddd4de27dbf2a3ffc789c421b1d4e95fc056bf4c6
-\end{verbatim}
+\end{verbatim}}
 
 \postextual
 \begin{thebibliography}{99}
