@@ -211,8 +211,9 @@ fn vault_is_initialized(root: &std::path::Path) -> Result<bool, ServeError> {
 }
 
 /// Fail-closed access controller: only explicitly safe modeless operations
-/// pass through. Container modes requiring human mediation and all
-/// secret-bearing/key-creating operations are rejected because no UI exists.
+/// pass through. Mode-bearing container operations are permitted only for
+/// DIRECT containers; all other modes require desktop mediation. Secret-
+/// bearing/key-creating operations are rejected because no UI exists.
 struct HeadlessAccessController;
 
 #[async_trait::async_trait]
@@ -224,12 +225,13 @@ impl AccessController for HeadlessAccessController {
                     .into(),
             );
         }
-        match request.mode {
-            Some(mode) if mode_needs_ui(mode) => {
-                Err("headless mode cannot mediate this access; use the desktop app".into())
-            }
-            _ => Ok(()),
+        if is_headless_container_action(request.action)
+            && !headless_allows_container_mode(request.mode)
+        {
+            return Err("headless cannot mediate this mode; use the desktop app".into());
         }
+
+        Ok(())
     }
 }
 
@@ -250,11 +252,34 @@ fn is_headless_allowed_action(action: AccessAction) -> bool {
     )
 }
 
-fn mode_needs_ui(mode: SecurityMode) -> bool {
+/// Returns whether an action operates on a specific container and therefore
+/// must carry a mode. `ListContainers` is intentionally excluded: it is a
+/// modeless vault-metadata operation, not access to a container's contents.
+fn is_headless_container_action(action: AccessAction) -> bool {
     matches!(
-        mode,
-        SecurityMode::Approval | SecurityMode::Otp | SecurityMode::Zkp | SecurityMode::Anonymized
+        action,
+        AccessAction::ListFiles
+            | AccessAction::ReadFile
+            | AccessAction::WriteFile
+            | AccessAction::DeleteFile
+            | AccessAction::CreateContainer
+            | AccessAction::DestroyContainer
     )
+}
+
+/// Explicitly enumerate every security mode. Do not replace this with a
+/// permissive wildcard: adding a mode must fail compilation until headless
+/// behavior is deliberately decided, and defaults to denial here.
+fn headless_allows_container_mode(mode: Option<SecurityMode>) -> bool {
+    match mode {
+        Some(SecurityMode::Direct) => true,
+        Some(SecurityMode::Approval) => false,
+        Some(SecurityMode::Otp) => false,
+        Some(SecurityMode::Anonymized) => false,
+        Some(SecurityMode::Zkp) => false,
+        Some(SecurityMode::Native) => false,
+        None => false,
+    }
 }
 
 struct HeadlessAuthenticator {
@@ -540,18 +565,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn headless_controller_allows_safe_direct_actions() {
+    async fn headless_controller_allows_direct_container_read_write_and_list() {
         for action in [
             AccessAction::ReadFile,
             AccessAction::WriteFile,
             AccessAction::ListFiles,
-            AccessAction::Verify,
         ] {
             HeadlessAccessController
                 .authorize(request(action, Some(SecurityMode::Direct)))
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn headless_controller_denies_native_container_read_write_delete_and_creation() {
+        for action in [
+            AccessAction::ReadFile,
+            AccessAction::WriteFile,
+            AccessAction::DeleteFile,
+            AccessAction::CreateContainer,
+        ] {
+            let error = HeadlessAccessController
+                .authorize(request(action, Some(SecurityMode::Native)))
+                .await
+                .unwrap_err();
+            assert!(error.contains("headless cannot mediate this mode"));
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_controller_denies_all_other_container_modes() {
+        for mode in [
+            SecurityMode::Approval,
+            SecurityMode::Otp,
+            SecurityMode::Zkp,
+            SecurityMode::Anonymized,
+        ] {
+            for action in [
+                AccessAction::ListFiles,
+                AccessAction::ReadFile,
+                AccessAction::WriteFile,
+                AccessAction::DeleteFile,
+                AccessAction::CreateContainer,
+                AccessAction::DestroyContainer,
+            ] {
+                let error = HeadlessAccessController
+                    .authorize(request(action, Some(mode)))
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("headless cannot mediate this mode"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_controller_denies_modeless_container_operations() {
+        let error = HeadlessAccessController
+            .authorize(request(AccessAction::ReadFile, None))
+            .await
+            .unwrap_err();
+        assert!(error.contains("headless cannot mediate this mode"));
     }
 
     #[tokio::test]
