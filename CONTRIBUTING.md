@@ -1,6 +1,6 @@
 # Contributing to Sovereign Vault
 
-Thanks for your interest. This project is pre-alpha; expect rough edges and shifting APIs. PRs are welcome — please open a discussion first for non-trivial changes so we can align on direction.
+Thanks for your interest. This project is an early release; expect rough edges and shifting APIs. PRs are welcome — please open a discussion first for non-trivial changes so we can align on direction.
 
 ## Ground rules
 
@@ -27,10 +27,10 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Tests
-cargo test --workspace
+cargo test --workspace --all-features
 
 # UI typecheck
-( cd ui && npm install && npm run check )
+( cd ui && npm ci && npm run check )
 ```
 
 ### Running the desktop app in dev mode

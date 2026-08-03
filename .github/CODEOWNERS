@@ -7,6 +7,12 @@
 /crates/sv-recovery/    @pealmeida
 /crates/sv-audit/       @pealmeida
 
+# Desktop app and core crates get explicit ownership.
+/apps/desktop/          @pealmeida
+/crates/sv-core/         @pealmeida
+/crates/sv-mcp/          @pealmeida
+/crates/sv-storage/      @pealmeida
+
 # CI / supply-chain config.
 /.github/               @pealmeida
 /deny.toml              @pealmeida
