@@ -10,8 +10,8 @@
 #   $EDITOR ~/.config/sovereign-vault.passphrase
 #   chmod 0600 ~/.config/sovereign-vault.passphrase
 #
-# Pairing secret is printed to the journal — capture once and store the
-# credential out-of-band.
+# Provision a scoped agent in the desktop app first. Then create the owner-only
+# credentials below (see docs/USER-GUIDE.md) before starting this service.
 
 [Unit]
 Description=Sovereign Vault headless gateway (MCP + HTTP)
@@ -20,6 +20,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Required values: SV_AGENT_ID=ag_... and
+# SV_AGENT_TOKEN_FILE=%h/.config/sovereign-vault/agent.token. Both files must be 0600.
+EnvironmentFile=-%h/.config/sovereign-vault/serve.env
 ExecStart=/usr/local/bin/sovereign-vault serve \
     --root %h/.local/share/sovereign-vault \
     --passphrase-file %h/.config/sovereign-vault.passphrase \

@@ -620,43 +620,18 @@ struct DesktopAgentAuthenticator {
     shared_secret: String,
 }
 
-fn parse_access_action(s: &str) -> Option<sv_mcp::AccessAction> {
-    match s {
-        "list" | "list_containers" => Some(sv_mcp::AccessAction::ListContainers),
-        "list_files" => Some(sv_mcp::AccessAction::ListFiles),
-        "read" | "read_file" => Some(sv_mcp::AccessAction::ReadFile),
-        "write" | "write_file" => Some(sv_mcp::AccessAction::WriteFile),
-        "delete" | "delete_file" => Some(sv_mcp::AccessAction::DeleteFile),
-        "create_container" => Some(sv_mcp::AccessAction::CreateContainer),
-        "create_transit_key" => Some(sv_mcp::AccessAction::CreateTransitKey),
-        "list_transit_keys" => Some(sv_mcp::AccessAction::ListTransitKeys),
-        "encrypt" => Some(sv_mcp::AccessAction::Encrypt),
-        "decrypt" => Some(sv_mcp::AccessAction::Decrypt),
-        "create_signing_key" => Some(sv_mcp::AccessAction::CreateSigningKey),
-        "list_signing_keys" => Some(sv_mcp::AccessAction::ListSigningKeys),
-        "sign" => Some(sv_mcp::AccessAction::Sign),
-        "verify" => Some(sv_mcp::AccessAction::Verify),
-        "create_broker_secret" => Some(sv_mcp::AccessAction::CreateBrokerSecret),
-        "list_broker_secrets" => Some(sv_mcp::AccessAction::ListBrokerSecrets),
-        "broker" | "broker_request" => Some(sv_mcp::AccessAction::Broker),
-        _ => None,
-    }
-}
-
-fn resolve_scopes(scopes: &[sv_core::agents::AgentScope]) -> Vec<sv_mcp::ResolvedScope> {
+fn resolve_scopes(
+    scopes: &[sv_core::agents::AgentScope],
+) -> Result<Vec<sv_mcp::ResolvedScope>, String> {
     scopes
         .iter()
-        .map(|s| sv_mcp::ResolvedScope {
-            container_glob: s.container_glob.clone(),
-            actions: s
-                .actions
-                .iter()
-                .filter_map(|a| parse_access_action(a))
-                .collect(),
-            mode_ceiling: s
-                .mode_ceiling
-                .as_deref()
-                .and_then(|m| SecurityMode::parse(m).ok()),
+        .map(|s| {
+            sv_mcp::AgentScope {
+                container_glob: s.container_glob.clone(),
+                actions: s.actions.clone(),
+                mode_ceiling: s.mode_ceiling.clone(),
+            }
+            .resolve()
         })
         .collect()
 }
@@ -686,7 +661,7 @@ impl sv_mcp::AgentAuthenticator for DesktopAgentAuthenticator {
             .map_err(estr)?;
         Ok(sv_mcp::ResolvedAgent {
             agent_id: record.agent_id,
-            scopes: resolve_scopes(&record.scopes),
+            scopes: resolve_scopes(&record.scopes)?,
         })
     }
 }
@@ -762,9 +737,14 @@ fn record_desktop_event(state: &VaultState, event: AuditEvent) {
 }
 
 fn approval_requirement(request: &sv_mcp::AccessRequest) -> Result<ApprovalPromptKind, String> {
-    // Broker is the highest-risk action and ALWAYS requires approval, never
-    // DIRECT, regardless of any (absent) container mode.
-    if matches!(request.action, sv_mcp::AccessAction::Broker) {
+    // Broker and agent-management actions are high risk and ALWAYS require
+    // explicit approval, regardless of any (absent) container mode.
+    if matches!(
+        request.action,
+        sv_mcp::AccessAction::Broker
+            | sv_mcp::AccessAction::ImportAgents
+            | sv_mcp::AccessAction::ExportAgents
+    ) {
         return Ok(ApprovalPromptKind::Click);
     }
     // Transit + signing carry no container mode; gate them on a click, except
@@ -1756,6 +1736,33 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn modeless_request(action: sv_mcp::AccessAction) -> sv_mcp::AccessRequest {
+        sv_mcp::AccessRequest {
+            transport: sv_mcp::AccessTransport::McpWs,
+            action,
+            container: None,
+            file_name: None,
+            mode: None,
+            byte_size: None,
+            agent_id: Some("ag_test".into()),
+            otp: None,
+            authorization_context: String::new(),
+        }
+    }
+
+    #[test]
+    fn agent_management_actions_require_desktop_approval() {
+        for action in [
+            sv_mcp::AccessAction::ImportAgents,
+            sv_mcp::AccessAction::ExportAgents,
+        ] {
+            assert!(matches!(
+                approval_requirement(&modeless_request(action)),
+                Ok(ApprovalPromptKind::Click)
+            ));
+        }
+    }
 
     /// Helper to create a test challenge with known state.
     fn make_test_challenge(code: &str, modal_id: u64) -> OtpChallenge {

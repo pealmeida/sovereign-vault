@@ -215,6 +215,67 @@ pub struct AgentScope {
     pub mode_ceiling: Option<String>,
 }
 
+impl AgentScope {
+    /// Validate and resolve a persisted/imported scope without silently
+    /// discarding any part of its authority restriction.
+    pub fn resolve(&self) -> std::result::Result<ResolvedScope, String> {
+        validate_agent_scope(self)?;
+        Ok(ResolvedScope {
+            container_glob: self.container_glob.clone(),
+            actions: self
+                .actions
+                .iter()
+                .map(|action| AccessAction::parse_scope_action(action))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            mode_ceiling: self
+                .mode_ceiling
+                .as_deref()
+                .map(|mode| {
+                    SecurityMode::parse(mode).map_err(|error| {
+                        format!("invalid agent scope mode_ceiling {mode:?}: {error}")
+                    })
+                })
+                .transpose()?,
+        })
+    }
+}
+
+/// Validate one agent scope before it is persisted or resolved.
+///
+/// Scope parsing must fail closed: dropping an unknown action or an invalid
+/// mode ceiling would turn a malformed restriction into broader authority.
+pub fn validate_agent_scope(scope: &AgentScope) -> std::result::Result<(), String> {
+    validate_scope_glob(&scope.container_glob)?;
+    if scope.actions.is_empty() {
+        return Err("agent scope.actions must contain at least one action".into());
+    }
+    for action in &scope.actions {
+        AccessAction::parse_scope_action(action)?;
+    }
+    if let Some(mode) = scope.mode_ceiling.as_deref() {
+        SecurityMode::parse(mode)
+            .map_err(|error| format!("invalid agent scope mode_ceiling {mode:?}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn validate_scope_glob(glob: &str) -> std::result::Result<(), String> {
+    if glob.is_empty() {
+        return Err("agent scope.container_glob must not be empty".into());
+    }
+    if glob.len() > 128
+        || glob.starts_with('/')
+        || glob.ends_with('/')
+        || glob.split('/').any(str::is_empty)
+        || !glob
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '*' | '/'))
+    {
+        return Err(format!("invalid agent scope.container_glob: {glob:?}"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentImportEnvelope {
@@ -494,6 +555,34 @@ pub enum AccessAction {
 }
 
 impl AccessAction {
+    /// Parse the stable action names accepted in agent scopes.
+    pub fn parse_scope_action(action: &str) -> std::result::Result<Self, String> {
+        match action {
+            "list" | "list_containers" => Ok(Self::ListContainers),
+            "list_files" => Ok(Self::ListFiles),
+            "read" | "read_file" => Ok(Self::ReadFile),
+            "write" | "write_file" => Ok(Self::WriteFile),
+            "delete" | "delete_file" => Ok(Self::DeleteFile),
+            "create_container" => Ok(Self::CreateContainer),
+            "destroy" | "destroy_container" => Ok(Self::DestroyContainer),
+            "create_transit_key" => Ok(Self::CreateTransitKey),
+            "list_transit_keys" => Ok(Self::ListTransitKeys),
+            "encrypt" => Ok(Self::Encrypt),
+            "decrypt" => Ok(Self::Decrypt),
+            "create_signing_key" => Ok(Self::CreateSigningKey),
+            "list_signing_keys" => Ok(Self::ListSigningKeys),
+            "sign" => Ok(Self::Sign),
+            "verify" => Ok(Self::Verify),
+            "create_broker_secret" => Ok(Self::CreateBrokerSecret),
+            "list_broker_secrets" => Ok(Self::ListBrokerSecrets),
+            "broker" | "broker_request" => Ok(Self::Broker),
+            "vault_info" | "info" => Ok(Self::VaultInfo),
+            "export_agents" => Ok(Self::ExportAgents),
+            "import_agents" => Ok(Self::ImportAgents),
+            _ => Err(format!("unknown agent scope action: {action}")),
+        }
+    }
+
     fn audit_action(self) -> AuditAction {
         match self {
             Self::ListContainers => AuditAction::ListContainers,
@@ -1740,6 +1829,15 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                                 "cannot import expiring agent {}; expiry preservation is unsupported",
                                 entry.name
                             ));
+                        }
+                        if entry.scopes.is_empty() {
+                            return Err(format!(
+                                "cannot import unscoped agent {}; at least one concrete scope is required",
+                                entry.name
+                            ));
+                        }
+                        for scope in &entry.scopes {
+                            validate_agent_scope(scope)?;
                         }
                         Ok(AgentImportEntry {
                             name: entry.name,
@@ -3074,7 +3172,15 @@ mod tests {
             let arc = server.handle.clone();
             let mut guard = arc.lock().await;
             let v = guard.as_mut().unwrap();
-            v.create_agent("alpha", Vec::new()).unwrap();
+            v.create_agent(
+                "alpha",
+                vec![AgentScope {
+                    container_glob: "alpha/**".into(),
+                    actions: vec!["read".into()],
+                    mode_ceiling: None,
+                }],
+            )
+            .unwrap();
             v.create_agent(
                 "beta",
                 vec![AgentScope {
@@ -3173,6 +3279,111 @@ mod tests {
             handle.as_ref().unwrap().list_agents().unwrap()
         };
         assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_invalid_mode_ceiling_without_changing_registry() {
+        let server = server();
+        let mut pair = PairState::AlreadyPaired(None);
+        {
+            let mut handle = server.handle.lock().await;
+            handle
+                .as_mut()
+                .unwrap()
+                .create_agent("existing", Vec::new())
+                .unwrap();
+        }
+        let before = {
+            let handle = server.handle.lock().await;
+            handle.as_ref().unwrap().list_agents().unwrap()
+        };
+        let envelope = json!({
+            "version": 1,
+            "exported_at_unix": 0,
+            "agent_count": 1,
+            "agents": [{
+                "name": "invalid-ceiling",
+                "scopes": [{
+                    "container_glob": "notes/**",
+                    "actions": ["read"],
+                    "mode_ceiling": "DIRECTT"
+                }],
+                "expires_at": null,
+                "revoked": false
+            }]
+        });
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.import_agents","arguments":{{"envelope":{}}}}}}}"#,
+            serde_json::to_string(&envelope).unwrap()
+        );
+        let response = server
+            .dispatch(&request, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("mode_ceiling"));
+
+        let after = {
+            let handle = server.handle.lock().await;
+            handle.as_ref().unwrap().list_agents().unwrap()
+        };
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_unscoped_agent() {
+        let server = server();
+        let mut pair = PairState::AlreadyPaired(None);
+        let envelope = json!({
+            "version": 1,
+            "exported_at_unix": 0,
+            "agent_count": 1,
+            "agents": [{
+                "name": "unscoped",
+                "scopes": [],
+                "expires_at": null,
+                "revoked": false
+            }]
+        });
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.import_agents","arguments":{{"envelope":{}}}}}}}"#,
+            serde_json::to_string(&envelope).unwrap()
+        );
+        let response = server
+            .dispatch(&request, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cannot import unscoped agent"));
+    }
+
+    #[test]
+    fn scope_validation_rejects_unknown_actions_and_invalid_globs() {
+        let unknown_action = AgentScope {
+            container_glob: "notes/**".into(),
+            actions: vec!["read_everything".into()],
+            mode_ceiling: None,
+        };
+        assert!(validate_agent_scope(&unknown_action)
+            .unwrap_err()
+            .contains("unknown agent scope action"));
+
+        for container_glob in ["", "/notes", "notes/", "notes?", "notes//private"] {
+            let invalid_glob = AgentScope {
+                container_glob: container_glob.into(),
+                actions: vec!["read".into()],
+                mode_ceiling: None,
+            };
+            assert!(validate_agent_scope(&invalid_glob)
+                .unwrap_err()
+                .contains("container_glob"));
+        }
     }
 
     #[tokio::test]

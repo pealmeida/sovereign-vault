@@ -212,7 +212,6 @@ fn is_headless_allowed_action(action: AccessAction) -> bool {
             | AccessAction::Verify
             | AccessAction::DestroyContainer
             | AccessAction::VaultInfo
-            | AccessAction::ExportAgents
     )
 }
 
@@ -258,43 +257,16 @@ impl HeadlessAuthenticator {
     }
 }
 
-fn parse_access_action(action: &str) -> Option<AccessAction> {
-    Some(match action {
-        "list" | "list_containers" => AccessAction::ListContainers,
-        "list_files" => AccessAction::ListFiles,
-        "read" | "read_file" => AccessAction::ReadFile,
-        "write" | "write_file" => AccessAction::WriteFile,
-        "delete" | "delete_file" => AccessAction::DeleteFile,
-        "create_container" => AccessAction::CreateContainer,
-        "create_transit_key" => AccessAction::CreateTransitKey,
-        "list_transit_keys" => AccessAction::ListTransitKeys,
-        "encrypt" => AccessAction::Encrypt,
-        "decrypt" => AccessAction::Decrypt,
-        "create_signing_key" => AccessAction::CreateSigningKey,
-        "list_signing_keys" => AccessAction::ListSigningKeys,
-        "sign" => AccessAction::Sign,
-        "verify" => AccessAction::Verify,
-        "create_broker_secret" => AccessAction::CreateBrokerSecret,
-        "list_broker_secrets" => AccessAction::ListBrokerSecrets,
-        "broker" | "broker_request" => AccessAction::Broker,
-        _ => return None,
-    })
-}
-
-fn resolve_scopes(scopes: &[sv_core::agents::AgentScope]) -> Vec<ResolvedScope> {
+fn resolve_scopes(scopes: &[sv_core::agents::AgentScope]) -> Result<Vec<ResolvedScope>, String> {
     scopes
         .iter()
-        .map(|scope| ResolvedScope {
-            container_glob: scope.container_glob.clone(),
-            actions: scope
-                .actions
-                .iter()
-                .filter_map(|action| parse_access_action(action))
-                .collect(),
-            mode_ceiling: scope
-                .mode_ceiling
-                .as_deref()
-                .and_then(|mode| SecurityMode::parse(mode).ok()),
+        .map(|scope| {
+            sv_mcp::AgentScope {
+                container_glob: scope.container_glob.clone(),
+                actions: scope.actions.clone(),
+                mode_ceiling: scope.mode_ceiling.clone(),
+            }
+            .resolve()
         })
         .collect()
 }
@@ -314,7 +286,7 @@ impl AgentAuthenticator for HeadlessAuthenticator {
         }
         Ok(ResolvedAgent {
             agent_id: record.agent_id,
-            scopes: resolve_scopes(&record.scopes),
+            scopes: resolve_scopes(&record.scopes)?,
         })
     }
 }
@@ -403,7 +375,9 @@ mod tests {
         );
         assert_eq!(resolved.scopes[0].mode_ceiling, Some(SecurityMode::Otp));
         assert!(authenticator.authenticate(None, &token).is_err());
-        assert!(authenticator.authenticate(Some("ag_other"), &token).is_err());
+        assert!(authenticator
+            .authenticate(Some("ag_other"), &token)
+            .is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -442,6 +416,15 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn headless_controller_denies_agent_export() {
+        let error = HeadlessAccessController
+            .authorize(request(AccessAction::ExportAgents, None))
+            .await
+            .unwrap_err();
+        assert!(error.contains("only permits explicitly safe"));
     }
 
     #[test]
