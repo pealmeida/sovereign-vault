@@ -1,12 +1,12 @@
 //! Read-only HTTP service for Sovereign Vault.
 //!
-//! Exposes three localhost-only endpoints:
+//! Exposes localhost-only endpoints:
 //!
 //! * `GET /health` — liveness probe (no auth, no data).
 //! * `GET /.well-known/agent.json` — A2A-style agent card describing the
 //!   MCP tool surface for discovery.
-//! * `GET /.well-known/mcp-pairing` — returns the per-launch pairing
-//!   secret to MCP bridges spawned on the same machine.
+//! * `GET /.well-known/mcp-pairing` — optionally returns the per-launch
+//!   pairing secret to MCP bridges spawned on the same machine.
 //!
 //! All endpoints reject non-loopback hosts. No mutation surface here —
 //! state-changing calls go through MCP only.
@@ -55,7 +55,7 @@ pub type Result<T> = std::result::Result<T, HttpError>;
 
 /// Read-only HTTP server.
 pub struct HttpServer {
-    pairing_secret: String,
+    pairing_secret: Option<String>,
 }
 
 impl HttpServer {
@@ -63,7 +63,17 @@ impl HttpServer {
     /// `/.well-known/mcp-pairing` endpoint.
     pub fn new(pairing_secret: impl Into<String>) -> Self {
         Self {
-            pairing_secret: pairing_secret.into(),
+            pairing_secret: Some(pairing_secret.into()),
+        }
+    }
+
+    /// Build a server without the pairing-secret endpoint.
+    ///
+    /// Headless deployments use scoped agent credentials and must not expose
+    /// any bearer credential through an unauthenticated loopback endpoint.
+    pub fn without_pairing() -> Self {
+        Self {
+            pairing_secret: None,
         }
     }
 
@@ -91,7 +101,7 @@ impl HttpServer {
             return Err(HttpError::Forbidden);
         }
         tracing::info!(%addr, "HTTP listening");
-        let secret = self.pairing_secret.clone();
+        let pairing_secret = self.pairing_secret.clone();
         let connection_limit = Arc::new(Semaphore::new(MAX_HTTP_CONNECTIONS));
         loop {
             tokio::select! {
@@ -115,13 +125,13 @@ impl HttpServer {
                             continue;
                         }
                     };
-                    let secret = secret.clone();
+                    let pairing_secret = pairing_secret.clone();
                     let io = TokioIo::new(stream);
                     tokio::spawn(async move {
                         let _permit = permit;
                         let svc = service_fn(move |req| {
-                            let secret = secret.clone();
-                            async move { Ok::<_, Infallible>(handle(req, &secret).await) }
+                            let pairing_secret = pairing_secret.clone();
+                            async move { Ok::<_, Infallible>(handle(req, pairing_secret.as_deref()).await) }
                         });
                         let mut builder = hyper::server::conn::http1::Builder::new();
                         builder
@@ -150,7 +160,7 @@ impl HttpServer {
     }
 }
 
-async fn handle(req: Request<Incoming>, pairing_secret: &str) -> Response<Full<Bytes>> {
+async fn handle(req: Request<Incoming>, pairing_secret: Option<&str>) -> Response<Full<Bytes>> {
     if !host_is_loopback(&req) {
         return json_response(
             StatusCode::FORBIDDEN,
@@ -174,9 +184,10 @@ async fn handle(req: Request<Incoming>, pairing_secret: &str) -> Response<Full<B
             }),
         ),
         "/.well-known/agent.json" => json_response(StatusCode::OK, &agent_card()),
-        "/.well-known/mcp-pairing" => {
-            json_response(StatusCode::OK, &json!({ "secret": pairing_secret }))
-        }
+        "/.well-known/mcp-pairing" => match pairing_secret {
+            Some(secret) => json_response(StatusCode::OK, &json!({ "secret": secret })),
+            None => json_response(StatusCode::NOT_FOUND, &json!({ "error": "not found" })),
+        },
         _ => json_response(StatusCode::NOT_FOUND, &json!({ "error": "not found" })),
     }
 }
@@ -287,7 +298,13 @@ mod tests {
 
     #[tokio::test]
     async fn prebound_non_loopback_listener_is_rejected() {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let listener = match tokio::net::TcpListener::bind("0.0.0.0:0").await {
+            Ok(listener) => listener,
+            // Restricted CI sandboxes can prohibit non-loopback binds before
+            // the server gets a chance to reject the listener itself.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("binding non-loopback test listener: {error}"),
+        };
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
         let error = HttpServer::new("secret")
             .serve_listener(listener, shutdown_rx)
@@ -298,7 +315,11 @@ mod tests {
 
     #[tokio::test]
     async fn every_endpoint_rejects_a_rebinding_host() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("binding loopback test listener: {error}"),
+        };
         let addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -324,6 +345,39 @@ mod tests {
             assert!(response.starts_with("HTTP/1.1 403"), "{path}: {response}");
             assert!(!response.contains("never-expose"));
         }
+
+        let _ = shutdown_tx.send(());
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pairing_endpoint_can_be_disabled() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("binding loopback test listener: {error}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            HttpServer::without_pairing()
+                .serve_listener(listener, shutdown_rx)
+                .await
+                .unwrap();
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"GET /.well-known/mcp-pairing HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8(response)
+            .unwrap()
+            .starts_with("HTTP/1.1 404"));
 
         let _ = shutdown_tx.send(());
         task.await.unwrap();

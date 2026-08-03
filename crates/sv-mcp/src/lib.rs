@@ -18,10 +18,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -203,6 +203,7 @@ pub struct SigningKeyInfo {
 /// as an MCP-layer DTO so that sv-mcp does not need to depend on sv-core (which
 /// would create a cycle).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AgentScope {
     /// Glob matched against the container name (e.g. `notes/**`).
     pub container_glob: String,
@@ -212,6 +213,24 @@ pub struct AgentScope {
     /// container's own mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_ceiling: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentImportEnvelope {
+    version: u32,
+    exported_at_unix: u64,
+    agent_count: usize,
+    agents: Vec<AgentImportEnvelopeEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentImportEnvelopeEntry {
+    name: String,
+    scopes: Vec<AgentScope>,
+    expires_at: Option<String>,
+    revoked: bool,
 }
 
 /// Agent-safe metadata for one agent identity.
@@ -230,6 +249,37 @@ pub struct AgentInfo {
     pub expires_at: Option<String>,
     /// Whether the agent has been revoked.
     pub revoked: bool,
+}
+
+/// One fully validated agent identity to import in an atomic batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentImportEntry {
+    /// Human-readable agent name.
+    pub name: String,
+    /// Scope grants for the fresh token.
+    pub scopes: Vec<AgentScope>,
+}
+
+/// A fresh credential created by an atomic import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedAgent {
+    /// Imported agent name.
+    pub name: String,
+    /// Fresh stable agent identifier.
+    pub agent_id: String,
+    /// Fresh one-time token, shown once.
+    pub one_time_token: String,
+}
+
+/// Result of an atomic agent import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentImportResult {
+    /// Agents that received fresh credentials.
+    pub imported: Vec<ImportedAgent>,
+    /// Existing names skipped in create-only mode.
+    pub skipped: Vec<String>,
+    /// Existing names revoked by replacement mode.
+    pub revoked: Vec<String>,
 }
 
 /// One destination allowlist entry for a brokered secret.
@@ -313,6 +363,13 @@ pub trait VaultFacade: Send + Sync {
     ) -> std::result::Result<(String, String), String>;
     /// Revoke an agent by id.
     fn revoke_agent(&self, agent_id: &str) -> std::result::Result<(), String>;
+    /// Import a complete agent batch with one atomic registry replacement.
+    /// Implementations must leave the prior registry unchanged on failure.
+    fn import_agents_atomically(
+        &self,
+        entries: Vec<AgentImportEntry>,
+        replace_existing: bool,
+    ) -> std::result::Result<AgentImportResult, String>;
     /// Create a new symmetric transit key.
     fn transit_create_key(&self, name: &str) -> std::result::Result<TransitKeyInfo, String>;
     /// List symmetric transit keys.
@@ -1644,63 +1701,64 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 let envelope = args
                     .get("envelope")
                     .ok_or_else(|| "envelope is required".to_string())?;
-                let version = envelope
-                    .get("version")
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| "envelope.version missing or not a number".to_string())?;
-                if version != 1 {
-                    return Err(format!("unsupported envelope version: {version}"));
+                // Deserialize and validate the *entire* envelope before
+                // touching the registry. This keeps malformed later entries
+                // from revoking valid existing agents.
+                let envelope: AgentImportEnvelope = serde_json::from_value(envelope.clone())
+                    .map_err(|e| format!("invalid agent import envelope: {e}"))?;
+                if envelope.version != 1 {
+                    return Err(format!(
+                        "unsupported envelope version: {}",
+                        envelope.version
+                    ));
                 }
-                let mode = args
+                let _exported_at_unix = envelope.exported_at_unix;
+                if envelope.agent_count != envelope.agents.len() {
+                    return Err("envelope.agent_count does not match agents length".into());
+                }
+                let replace_existing = match args
                     .get("mode")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("create_only");
-                let agents = envelope
-                    .get("agents")
-                    .and_then(|v| v.as_array())
-                    .ok_or_else(|| "envelope.agents missing or not an array".to_string())?;
-                let existing = handle.list_agents()?;
-                let mut imported = Vec::with_capacity(agents.len());
-                let mut skipped = Vec::new();
-                let mut revoked_names = Vec::new();
-                for entry in agents {
-                    let name = entry
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "agent.name missing".to_string())?;
-                    if existing.iter().any(|a| a.name == name) {
-                        if mode == "create_only" {
-                            skipped.push(name.to_string());
-                            continue;
+                    .unwrap_or("create_only")
+                {
+                    "create_only" => false,
+                    "create_or_replace" => true,
+                    other => return Err(format!("unsupported import mode: {other}")),
+                };
+                let entries = envelope
+                    .agents
+                    .into_iter()
+                    .map(|entry| {
+                        if entry.revoked {
+                            return Err(format!(
+                                "cannot import revoked agent {}; revoke it in the destination instead",
+                                entry.name
+                            ));
                         }
-                        if let Some(target) = existing.iter().find(|a| a.name == name) {
-                            handle.revoke_agent(&target.agent_id)?;
-                            revoked_names.push(name.to_string());
+                        if entry.expires_at.is_some() {
+                            return Err(format!(
+                                "cannot import expiring agent {}; expiry preservation is unsupported",
+                                entry.name
+                            ));
                         }
-                    }
-                    let scopes_json = entry
-                        .get("scopes")
-                        .and_then(|v| v.as_array())
-                        .cloned()
-                        .unwrap_or_default();
-                    let scopes: Vec<AgentScope> = serde_json::from_value(
-                        serde_json::Value::Array(scopes_json),
-                    )
-                    .map_err(|e| format!("invalid scope for {name}: {e}"))?;
-                    let (agent_id, token) = handle.create_agent(name, scopes)?;
-                    imported.push(json!({
-                        "name": name,
-                        "agent_id": agent_id,
-                        "one_time_token": token,
-                    }));
-                }
+                        Ok(AgentImportEntry {
+                            name: entry.name,
+                            scopes: entry.scopes,
+                        })
+                    })
+                    .collect::<std::result::Result<Vec<_>, String>>()?;
+                let result = handle.import_agents_atomically(entries, replace_existing)?;
                 Ok(json!({
-                    "imported_count": imported.len(),
-                    "skipped_count": skipped.len(),
-                    "revoked_count": revoked_names.len(),
-                    "imported": imported,
-                    "skipped": skipped,
-                    "revoked": revoked_names,
+                    "imported_count": result.imported.len(),
+                    "skipped_count": result.skipped.len(),
+                    "revoked_count": result.revoked.len(),
+                    "imported": result.imported.into_iter().map(|agent| json!({
+                        "name": agent.name,
+                        "agent_id": agent.agent_id,
+                        "one_time_token": agent.one_time_token,
+                    })).collect::<Vec<_>>(),
+                    "skipped": result.skipped,
+                    "revoked": result.revoked,
                 }))
             }
             "vault.create_transit_key" => {
@@ -2743,18 +2801,28 @@ mod tests {
             id_hasher.update(name.as_bytes());
             id_hasher.update(seq.to_le_bytes());
             let id_digest = id_hasher.finalize();
-            let id_hex: String = id_digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+            let id_hex: String = id_digest
+                .iter()
+                .take(8)
+                .map(|b| format!("{b:02x}"))
+                .collect();
             let id = format!("ag_{id_hex}");
             let mut token_hasher = Sha256::new();
             token_hasher.update(name.as_bytes());
             token_hasher.update(seq.to_le_bytes());
-            token_hasher.update(std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-                .to_le_bytes());
+            token_hasher.update(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+                    .to_le_bytes(),
+            );
             let token_digest = token_hasher.finalize();
-            let token_hex: String = token_digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+            let token_hex: String = token_digest
+                .iter()
+                .take(8)
+                .map(|b| format!("{b:02x}"))
+                .collect();
             let token = format!("tok_{token_hex}");
             counter.push(AgentInfo {
                 agent_id: id.clone(),
@@ -2774,6 +2842,55 @@ mod tests {
                 .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
             a.revoked = true;
             Ok(())
+        }
+
+        fn import_agents_atomically(
+            &self,
+            entries: Vec<AgentImportEntry>,
+            replace_existing: bool,
+        ) -> std::result::Result<AgentImportResult, String> {
+            let mut registry = self.agents.lock().unwrap();
+            let mut planned = registry.clone();
+            let mut imported = Vec::with_capacity(entries.len());
+            let mut skipped = Vec::new();
+            let mut revoked = Vec::new();
+
+            for entry in entries {
+                let has_existing = planned.iter().any(|agent| agent.name == entry.name);
+                if has_existing && !replace_existing {
+                    skipped.push(entry.name);
+                    continue;
+                }
+                if has_existing {
+                    for agent in planned.iter_mut().filter(|agent| agent.name == entry.name) {
+                        agent.revoked = true;
+                    }
+                    revoked.push(entry.name.clone());
+                }
+                let sequence = planned.len() as u32 + 1;
+                let agent_id = format!("ag_import_{sequence}");
+                let one_time_token = format!("tok_import_{sequence}");
+                planned.push(AgentInfo {
+                    agent_id: agent_id.clone(),
+                    name: entry.name.clone(),
+                    scopes: entry.scopes,
+                    created_at: "1970-01-01T00:00:00Z".into(),
+                    expires_at: None,
+                    revoked: false,
+                });
+                imported.push(ImportedAgent {
+                    name: entry.name,
+                    agent_id,
+                    one_time_token,
+                });
+            }
+
+            *registry = planned;
+            Ok(AgentImportResult {
+                imported,
+                skipped,
+                revoked,
+            })
         }
 
         fn create_container(
@@ -2958,11 +3075,14 @@ mod tests {
             let mut guard = arc.lock().await;
             let v = guard.as_mut().unwrap();
             v.create_agent("alpha", Vec::new()).unwrap();
-            v.create_agent("beta", vec![AgentScope {
-                container_glob: "notes/**".into(),
-                actions: vec!["read".into()],
-                mode_ceiling: None,
-            }])
+            v.create_agent(
+                "beta",
+                vec![AgentScope {
+                    container_glob: "notes/**".into(),
+                    actions: vec!["read".into()],
+                    mode_ceiling: None,
+                }],
+            )
             .unwrap();
         }
 
@@ -2972,7 +3092,9 @@ mod tests {
             .dispatch(export_req, &mut pair, AccessTransport::McpWs)
             .await
             .unwrap();
-        let export_text = export_resp["result"]["content"][0]["text"].as_str().unwrap();
+        let export_text = export_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
         let envelope: Value = serde_json::from_str(export_text).unwrap();
         assert_eq!(envelope["version"], 1);
         let exported_agents = envelope["agents"].as_array().unwrap();
@@ -2992,7 +3114,9 @@ mod tests {
             .dispatch(&import_req, &mut pair, AccessTransport::McpWs)
             .await
             .unwrap();
-        let import_text = import_resp["result"]["content"][0]["text"].as_str().unwrap();
+        let import_text = import_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
         let import_out: Value = serde_json::from_str(import_text).unwrap();
         assert_eq!(import_out["imported_count"], 2);
         assert_eq!(import_out["revoked_count"], 2);
@@ -3009,6 +3133,49 @@ mod tests {
         assert!(!export_text.contains("tok_"));
     }
 
+    #[tokio::test]
+    async fn malformed_agent_import_leaves_registry_unchanged() {
+        let server = server();
+        let mut pair = PairState::AlreadyPaired(None);
+        {
+            let mut handle = server.handle.lock().await;
+            handle
+                .as_mut()
+                .unwrap()
+                .create_agent("alpha", Vec::new())
+                .unwrap();
+        }
+        let before = {
+            let handle = server.handle.lock().await;
+            handle.as_ref().unwrap().list_agents().unwrap()
+        };
+        let envelope = json!({
+            "version": 1,
+            "exported_at_unix": 0,
+            "agent_count": 2,
+            "agents": [
+                {"name": "alpha", "scopes": [], "expires_at": null, "revoked": false},
+                {"name": "later-invalid", "scopes": "not-an-array", "expires_at": null, "revoked": false}
+            ]
+        });
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"vault.import_agents","arguments":{{"envelope":{},"mode":"create_or_replace"}}}}}}"#,
+            serde_json::to_string(&envelope).unwrap()
+        );
+        let response = server
+            .dispatch(&request, &mut pair, AccessTransport::McpWs)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+
+        let after = {
+            let handle = server.handle.lock().await;
+            handle.as_ref().unwrap().list_agents().unwrap()
+        };
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
     async fn transit_key_create_then_list_roundtrip() {
         let server = server();
         let mut pair = PairState::AlreadyPaired(None);
@@ -3735,7 +3902,13 @@ mod tests {
 
     #[tokio::test]
     async fn prebound_non_loopback_listener_is_rejected() {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let listener = match tokio::net::TcpListener::bind("0.0.0.0:0").await {
+            Ok(listener) => listener,
+            // Restricted CI sandboxes can prohibit non-loopback binds before
+            // the server gets a chance to reject the listener itself.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("binding non-loopback test listener: {error}"),
+        };
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
         let error = Arc::new(server())
             .serve_ws_listener(listener, shutdown_rx)

@@ -2192,6 +2192,48 @@ impl sv_mcp::VaultFacade for VaultHandle {
     fn revoke_agent(&self, agent_id: &str) -> std::result::Result<(), String> {
         VaultHandle::revoke_agent(self, agent_id).map_err(|e| e.to_string())
     }
+
+    fn import_agents_atomically(
+        &self,
+        entries: Vec<sv_mcp::AgentImportEntry>,
+        replace_existing: bool,
+    ) -> std::result::Result<sv_mcp::AgentImportResult, String> {
+        let entries = entries
+            .into_iter()
+            .map(|entry| crate::agents::AgentImportEntry {
+                name: entry.name,
+                scopes: entry
+                    .scopes
+                    .into_iter()
+                    .map(|scope| crate::agents::AgentScope {
+                        container_glob: scope.container_glob,
+                        actions: scope.actions,
+                        mode_ceiling: scope.mode_ceiling,
+                    })
+                    .collect(),
+            })
+            .collect();
+        crate::agents::import_agents_atomically(
+            self.root(),
+            &self.agent_token_key(),
+            entries,
+            replace_existing,
+        )
+        .map(|result| sv_mcp::AgentImportResult {
+            imported: result
+                .imported
+                .into_iter()
+                .map(|agent| sv_mcp::ImportedAgent {
+                    name: agent.name,
+                    agent_id: agent.agent_id,
+                    one_time_token: agent.one_time_token,
+                })
+                .collect(),
+            skipped: result.skipped,
+            revoked: result.revoked,
+        })
+        .map_err(|e| e.to_string())
+    }
 }
 
 /// Generate a fresh URL-safe-base64 32-byte pairing secret using the OS RNG
