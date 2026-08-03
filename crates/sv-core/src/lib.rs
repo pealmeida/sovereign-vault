@@ -536,6 +536,23 @@ impl VaultHandle {
         Ok(sv_storage::manifest_migration_digest(root)?)
     }
 
+    /// Detect the normal custody mode recorded by an existing vault.
+    ///
+    /// Passphrase custody is recorded by the private `master.salt` file.
+    /// OS-keychain custody deliberately has no salt file, including legacy
+    /// vaults that predate the keyring. This is the same discriminator used
+    /// by the keychain unlock path, so callers can select custody before
+    /// asking for a passphrase or accessing the OS keychain.
+    pub fn detect_custody(root: &Path) -> Result<CustodyMode> {
+        let salt = root.join(SALT_FILENAME);
+        if path_entry_exists(&salt) {
+            ensure_regular_file(&salt, "passphrase salt")?;
+            Ok(CustodyMode::Passphrase)
+        } else {
+            Ok(CustodyMode::OsKeychain)
+        }
+    }
+
     /// Authenticate one exact legacy manifest and permanently require
     /// manifest authentication for this vault.
     ///
