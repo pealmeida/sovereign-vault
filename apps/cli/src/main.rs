@@ -206,21 +206,26 @@ async fn run_serve(cli: ServeCli) -> Result<(), String> {
             "cannot determine vault root; set --root or ensure $HOME is set".to_string()
         })?;
 
+    if cli.passphrase_file.is_some() && cli.passphrase_env.is_some() {
+        return Err("set either --passphrase-file or --passphrase-env, not both".into());
+    }
     let passphrase = if let Some(ref path) = cli.passphrase_file {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("reading passphrase file {}: {e}", path.display()))?;
-        Some(content.trim().to_string())
+        Some(read_owner_only_secret_file(path, "passphrase")?)
     } else if let Some(ref var) = cli.passphrase_env {
-        std::env::var(var).ok()
+        Some(
+            std::env::var(var)
+                .map_err(|_| format!("passphrase environment variable is not set: {var}"))?,
+        )
     } else {
         None
     };
 
     let recovery = if let Some(ref var) = cli.recovery_env {
         let words: Vec<String> = std::env::var(var)
-            .ok()
-            .map(|s| s.split_whitespace().map(|w| w.to_string()).collect())
-            .unwrap_or_default();
+            .map_err(|_| format!("recovery environment variable is not set: {var}"))?
+            .split_whitespace()
+            .map(|w| w.to_string())
+            .collect();
         if words.is_empty() {
             None
         } else {
@@ -263,31 +268,60 @@ fn read_headless_agent_token(token_file: Option<&std::path::Path>) -> Result<Str
     let path = token_file.ok_or_else(|| {
         "headless serve requires SV_AGENT_TOKEN or a 0600 SV_AGENT_TOKEN_FILE".to_string()
     })?;
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| format!("reading agent token file {}: {e}", path.display()))?;
+    read_owner_only_secret_file(path, "agent token")
+}
+
+/// Read a local daemon credential only from a regular owner-only file.
+///
+/// Check the opened file's metadata as well as the path entry so a symlink or
+/// a Unix path replacement cannot silently turn an explicitly configured
+/// secret file into a different credential source.
+fn read_owner_only_secret_file(path: &std::path::Path, label: &str) -> Result<String, String> {
+    use std::io::Read as _;
+
+    let path_metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("reading {label} file {}: {e}", path.display()))?;
+    if path_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{label} file must not be a symbolic link: {}",
+            path.display()
+        ));
+    }
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("reading {label} file {}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("reading {label} file {}: {e}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!(
-            "agent token path is not a regular file: {}",
+            "{label} file is not a regular file: {}",
             path.display()
         ));
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+            return Err(format!(
+                "{label} file changed while opening it: {}",
+                path.display()
+            ));
+        }
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(format!(
-                "agent token file must be owner-only (0600): {}",
+                "{label} file must be owner-only (0600): {}",
                 path.display()
             ));
         }
     }
-    let token = std::fs::read_to_string(path)
-        .map_err(|e| format!("reading agent token file {}: {e}", path.display()))?;
-    let token = token.trim().to_string();
-    if token.is_empty() {
-        return Err(format!("agent token file is empty: {}", path.display()));
+    let mut secret = String::new();
+    file.read_to_string(&mut secret)
+        .map_err(|e| format!("reading {label} file {}: {e}", path.display()))?;
+    let secret = secret.trim().to_string();
+    if secret.is_empty() {
+        return Err(format!("{label} file is empty: {}", path.display()));
     }
-    Ok(token)
+    Ok(secret)
 }
 
 fn parse_rate_limit(raw: &str) -> Result<Option<(usize, std::time::Duration)>, String> {
@@ -442,6 +476,31 @@ mod tests {
         assert!(parse_rate_limit("abc/60000").is_err());
         assert!(parse_rate_limit("100/xyz").is_err());
         assert!(parse_rate_limit("100").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_secret_file_must_be_owner_only_and_not_a_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let root = temp_root("secret-file-permissions");
+        std::fs::create_dir_all(&root).unwrap();
+        let secret = root.join("agent.token");
+        std::fs::write(&secret, "credential").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_owner_only_secret_file(&secret, "agent token").is_err());
+
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_owner_only_secret_file(&secret, "agent token").unwrap(),
+            "credential"
+        );
+
+        let link = root.join("agent.token.link");
+        symlink(&secret, &link).unwrap();
+        assert!(read_owner_only_secret_file(&link, "agent token").is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

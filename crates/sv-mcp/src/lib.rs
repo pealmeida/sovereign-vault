@@ -2094,8 +2094,8 @@ fn enforce_scopes(
                     agent.agent_id
                 ));
             }
-            AccessAction::Verify => return Ok(()),
-            AccessAction::CreateTransitKey
+            AccessAction::Verify
+            | AccessAction::CreateTransitKey
             | AccessAction::ListTransitKeys
             | AccessAction::Encrypt
             | AccessAction::Decrypt
@@ -4001,6 +4001,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[test]
+    fn scoped_agent_cannot_verify_without_an_explicit_verify_grant() {
+        let agent = ResolvedAgent {
+            agent_id: "ag_1".into(),
+            scopes: vec![ResolvedScope {
+                container_glob: "notes".into(),
+                actions: vec![AccessAction::ReadFile],
+                mode_ceiling: None,
+            }],
+        };
+        let request = simple_request(AccessTransport::McpWs, AccessAction::Verify, String::new());
+
+        assert!(enforce_scopes(&agent, &request).is_err());
+
+        let granted = ResolvedAgent {
+            scopes: vec![ResolvedScope {
+                container_glob: "notes".into(),
+                actions: vec![AccessAction::Verify],
+                mode_ceiling: None,
+            }],
+            ..agent
+        };
+        assert!(enforce_scopes(&granted, &request).is_ok());
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@
 //   3. Hold the WebSocket open and proxy stdin ↔ WS until opencode closes.
 
 import { spawn, execSync } from "node:child_process";
-import { readFileSync, statSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { randomBytes, createHash } from "node:crypto";
 import { connect as netConnect } from "node:net";
@@ -170,12 +170,16 @@ class WsClient {
 
 // node:net without breaking older node versions — require lazily.
 async function bootHeadlessFallback() {
-  let root; let passphrase;
+  let root; let passphrase; let passphraseFile;
   const agentId = process.env.SV_AGENT_ID;
   let agentToken = process.env.SV_AGENT_TOKEN;
   if (!agentToken && process.env.SV_AGENT_TOKEN_FILE) {
     const tokenFile = process.env.SV_AGENT_TOKEN_FILE;
-    const mode = statSync(tokenFile).mode & 0o777;
+    const metadata = lstatSync(tokenFile);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error("SV_AGENT_TOKEN_FILE must be a regular file, not a symbolic link");
+    }
+    const mode = metadata.mode & 0o777;
     if ((mode & 0o077) !== 0) throw new Error("SV_AGENT_TOKEN_FILE must be owner-only (0600)");
     agentToken = readFileSync(tokenFile, "utf8").trim();
   }
@@ -183,7 +187,7 @@ async function bootHeadlessFallback() {
     throw new Error("headless fallback requires SV_AGENT_ID and SV_AGENT_TOKEN (or SV_AGENT_TOKEN_FILE)");
   }
   if (process.env.SV_PASSPHRASE_FILE) {
-    passphrase = readFileSync(process.env.SV_PASSPHRASE_FILE, "utf8").trim();
+    passphraseFile = process.env.SV_PASSPHRASE_FILE;
     root = process.env.SV_ROOT || defaultRoot();
     log("using passphrase-file mode (real vault)");
   } else if (process.env.SV_BRIDGE_TEST_ROOT) {
@@ -195,10 +199,20 @@ async function bootHeadlessFallback() {
     // desktop app. Don't try to bootstrap.
     return null;
   }
-  const sub = spawn(BIN, [
-    "serve", "--root", root, "--passphrase-env", "SV_BRIDGE_PASS",
+  const serveArgs = [
+    "serve", "--root", root,
     "--bind", "127.0.0.1:9944", "--http-bind", "127.0.0.1:9943",
-  ], { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, SV_BRIDGE_PASS: passphrase }, detached: false });
+  ];
+  const childEnv = { ...process.env };
+  if (passphraseFile) {
+    // Keep a real vault passphrase out of this bridge process and the child
+    // environment. The CLI opens and validates the configured owner-only file.
+    serveArgs.push("--passphrase-file", passphraseFile);
+  } else {
+    serveArgs.push("--passphrase-env", "SV_BRIDGE_PASS");
+    childEnv.SV_BRIDGE_PASS = passphrase;
+  }
+  const sub = spawn(BIN, serveArgs, { stdio: ["ignore", "ignore", "pipe"], env: childEnv, detached: false });
   return new Promise((resolve, reject) => {
     let buf = "";
     let stderrLineBuffer = "";
