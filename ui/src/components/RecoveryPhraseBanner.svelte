@@ -53,6 +53,11 @@
     your passphrase or keychain entry. Write it down and store it safely.
     It will <strong>never</strong> be shown again.
   </p>
+  <ul style="color:var(--muted);font-size:0.85rem;margin:-0.5rem 0 1rem 1.25rem;line-height:1.5">
+    <li>Recommended: a <abbr title="Paper stored in a fireproof safe or safe-deposit box">paper backup</abbr> you control.</li>
+    <li>Cloud-synced notes apps expose this phrase to anyone with the account.</li>
+    <li>The phrase restores the DEK directly, bypassing the KEK. Anyone who reads it <em>owns the vault</em>.</li>
+  </ul>
 
   {#if !verificationOpen}
     <pre class="font-mono" style="

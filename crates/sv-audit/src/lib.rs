@@ -141,6 +141,10 @@ pub enum AuditAction {
     AgentList,
     /// Revoke an agent identity.
     AgentRevoke,
+    /// Bulk export agent identities (no token material included).
+    AgentExport,
+    /// Bulk import agent identities (mints fresh tokens).
+    AgentImport,
     /// Create a transit key.
     CreateTransitKey,
     /// List transit keys.

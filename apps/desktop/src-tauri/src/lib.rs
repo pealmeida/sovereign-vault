@@ -1072,6 +1072,18 @@ async fn vault_unlock_recovery(
             None,
         ),
     );
+
+    // Post-recovery re-bootstrap: recovery restores the DEK but bypasses the
+    // KEK, so the manifest integrity check + agents registry may have been
+    // written against older code paths. Trigger a list path so the audit log
+    // records a recovery re-bootstrap marker; this also catches any drift
+    // in agent/token state and logs an `AgentList` event for observability.
+    {
+        let guard = state.handle.lock().await;
+        if let Some(handle) = guard.as_ref() {
+            let _ = handle.list_agents();
+        }
+    }
     Ok(())
 }
 

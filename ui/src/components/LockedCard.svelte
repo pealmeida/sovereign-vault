@@ -172,7 +172,14 @@
 
     {#if tab === 'recovery'}
       <label class="field">
-        <span>Recovery phrase (24 words)</span>
+        <span>
+          Recovery phrase
+          <abbr
+            title="Enter the 24 words exactly as they were issued, separated by single spaces. Order matters; case does not. The phrase restores the data-encryption key if the passphrase or OS keychain entry is lost."
+            tabindex="0"
+            style="text-decoration:underline dotted;cursor:help"
+          >24 words</abbr>
+        </span>
         <textarea
           rows={3}
           placeholder="word1 word2 word3..."
@@ -180,8 +187,14 @@
           autocomplete="off"
           autocapitalize="none"
           spellcheck="false"
+          aria-describedby="recovery-hint"
         ></textarea>
       </label>
+      <p id="recovery-hint" style="color:var(--muted);font-size:0.85rem;margin-top:0.25rem">
+        Words are separated by single spaces; extra whitespace is tolerated.
+        Verification rejects a phrase that contains the wrong word count or
+        words outside the BIP-39 English wordlist.
+      </p>
       {#if !isInit && vaultStore.status?.has_keyring && !vaultStore.status?.has_passphrase_salt}
         <p style="color:var(--muted);font-size:0.85rem">
           Recovery unlock can repair a broken OS Keychain wrapper for this vault.
