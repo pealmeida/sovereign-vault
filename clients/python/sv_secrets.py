@@ -15,9 +15,8 @@ Source switch (env var, no code change):
     SECRETS_SOURCE=env    local .env only
 
 CLI:
-    python sv_secrets.py --container env-myproject                 # print .env to stdout
     python sv_secrets.py --container env-myproject --out .env.runtime
-    SECRETS_SOURCE=env python sv_secrets.py --container env-myproject
+    SECRETS_SOURCE=env python sv_secrets.py --container env-myproject --out .env.runtime
 
 Knobs (env): SV_BIN, SV_TIMEOUT_MS (default 30000), SV_OTP, SV_CACHE_TTL_MS (default 0=off).
 """
@@ -249,8 +248,9 @@ def load_secrets(container, file=DEFAULT_FILE, env_path=DEFAULT_ENV_PATH,
         vars = try_vault()
         _write_cache(container, file, vars)
         return "vault", vars
-    except Exception as e:
-        sys.stderr.write(f"[sv-secrets] vault unavailable ({e}); falling back to {env_path}\n")
+    except Exception:
+        # The vault error can include provider-controlled content, so never log it.
+        sys.stderr.write(f"[sv-secrets] vault unavailable; falling back to {env_path}\n")
         return "env", parse_dotenv(_read_env_file(env_path))
 
 
@@ -277,18 +277,19 @@ def _main(argv):
         sys.stderr.write("usage: python sv_secrets.py --container <name> [--file .env] "
                          "[--source auto|vault|env] [--out path] [--cache-ttl <ms>] [--clear-cache]\n")
         return 2
+    if not out:
+        sys.stderr.write("[sv-secrets] refusing to write secret values to stdout; pass --out <path>\n")
+        return 2
     try:
         source, vars = load_secrets(container=container, file=file, source=source, cache_ttl_ms=cache_ttl_ms)
         sys.stderr.write(f"[sv-secrets] {len(vars)} keys from {source}\n")
         text = _to_dotenv(vars)
-        if out:
-            _write_private_text(Path(out), text)
-            sys.stderr.write(f"[sv-secrets] wrote {out}\n")
-        else:
-            sys.stdout.write(text)
+        _write_private_text(Path(out), text)
+        sys.stderr.write(f"[sv-secrets] wrote {out}\n")
         return 0
-    except Exception as e:
-        sys.stderr.write(f"[sv-secrets] ERROR {e}\n")
+    except Exception:
+        # Parsing/provider errors can contain secret-bearing file content.
+        sys.stderr.write("[sv-secrets] ERROR failed to load or write secrets\n")
         return 1
 
 
