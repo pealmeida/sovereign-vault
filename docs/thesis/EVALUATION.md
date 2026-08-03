@@ -76,6 +76,63 @@ out to measure.
 - Absolute numbers are build- and host-dependent; use `--release` and report the
   machine.
 
+### Cross-platform reproduction (Linux)
+
+Re-running the release harness (1000 reads/cell, `--release`) on a second host —
+Linux 7.0, 11th Gen Intel Core i7-11600H (12 threads) @ 2.90 GHz, 30 GiB RAM,
+rustc 1.96.1, captured 2026-07-31 — reproduces the §3.9.1 findings with different
+absolute magnitudes:
+
+| Mode | Bytes | T_filter (validate) | T_filter (PII) | T_hitl (authorize) | T_vault (execute) | **T_total** |
+|---|---|---|---|---|---|---|
+| direct | 128 | 9.00 | 0.03 | 0.09 | 5.58 | **14.70** (p95 23.12) |
+| direct | 1024 | 10.03 | 0.03 | 0.10 | 7.61 | **17.77** (p95 32.39) |
+| direct | 16384 | 10.94 | 0.03 | 0.09 | 25.58 | **36.64** (p95 41.29) |
+| approval | 16384 | 9.52 | 0.03 | 0.08 | 24.77 | **34.41** (p95 36.85) |
+| otp | 16384 | 10.13 | 0.03 | 0.08 | 24.99 | **35.23** (p95 40.15) |
+| anon | 128 | 8.51 | 1.97 | 0.09 | 5.17 | **15.74** (p95 19.08) |
+| anon | 1024 | 8.82 | 10.69 | 0.08 | 6.48 | **26.07** (p95 29.79) |
+| anon | 16384 | 11.22 | 152.55 | 0.10 | 25.91 | **189.79** (p95 262.19) |
+
+**Reading it.** The decomposition is identical in shape to the Windows table:
+request validation/scope (`T_filter` validate ≈ 9–11 µs) and local retrieval
+(`T_vault` ≈ 5–26 µs, growing with payload) dominate the non-anonymised path;
+the PII filter is effectively free for non-`ANONYMIZED` modes (≈0.03 µs — just
+the mode check) and becomes the dominant added cost for `ANONYMIZED` reads,
+scaling with content (≈2 µs at 128 B → ≈153 µs at 16 KB). Absolute latencies are
+roughly an order of magnitude lower than the Windows host on small payloads
+(direct 128 B: 14.7 µs vs 131.8 µs), consistent with host-dependent `T_vault`;
+the **central §3.9.1 finding is host-invariant** — the security barrier the
+gateway introduces is sub-millisecond and small relative to local retrieval,
+except for the content-proportional PII sanitisation cost.
+
+### Component micro-measurement (isolated, Eq. 1 completeness)
+
+The `micro` subcommand times the two content-sensitive components **outside the
+gateway** — `sv_storage` decrypt+read and `sv_privacy::redact` — each in a tight
+loop with no dispatch overhead (`cargo run --release -p thesis-eval -- micro
+--iterations 1000`, same Linux host):
+
+| Bytes | decrypt mean (µs) | decrypt p95 | filter mean (µs) | filter p95 |
+|---|---|---|---|---|
+| 128 | 4.14 | 4.18 | 1.17 | 1.87 |
+| 1024 | 4.97 | 5.05 | 7.86 | 8.17 |
+| 16384 | 16.82 | 21.75 | 125.08 | 130.80 |
+
+Comparing the isolated floor to the gateway-stage figures above (the `micro`
+filter uses the same PII unit as the `Anonymized` payloads, so the two filter
+costs are directly comparable): at 128 B the isolated decrypt is 4.14 µs vs the
+gateway `T_vault` of 5.58 µs (~1.4 µs of execute-stage dispatch overhead); the
+isolated PII filter (1.17 µs) sits below the gateway `T_filter (PII)` of 1.97 µs.
+At every size the isolated component is ≤ the gateway-stage figure, and at 16 KB
+the isolated filter (125 µs) is close to but below the gateway figure (152 µs) —
+the gap is the per-call stage/dispatch overhead, which is small relative to the
+filter cost itself.
+**Conclusion (Eq. 1 completeness):** gateway dispatch overhead is small and
+bounded relative to the component costs; the PII filter is the single
+content-proportional term, and its isolated and in-path costs agree — confirming
+the gateway does not materially inflate the security barrier it measures.
+
 ---
 
 ## 2. Adversarial / prompt-injection block-rate (§3.9.2)
