@@ -52,17 +52,29 @@ struct ServersShutdown {
 struct PendingApproval {
     tx: oneshot::Sender<bool>,
     otp_code: Option<String>,
-    /// Identity of the request (action + target + agent). Used to dedupe a
-    /// retry storm: an identical request supersedes the older pending one.
+    /// Identity of the request (action + target + agent + content digest).
+    /// Used to dedupe a retry storm: only an identical request supersedes the
+    /// older pending one.
     signature: String,
 }
 
 /// Stable identity for an access request so retries collapse onto one modal.
 fn request_signature(request: &sv_mcp::AccessRequest) -> String {
     format!(
-        "{:?}|{:?}|{:?}|{:?}",
-        request.action, request.container, request.file_name, request.agent_id
+        "{:?}|{:?}|{:?}|{:?}|{}",
+        request.action,
+        request.container,
+        request.file_name,
+        request.agent_id,
+        request.authorization_context
     )
+}
+
+/// Compare a pending approval identity with a request. The authorization
+/// context is part of both values, so a changed MCP argument envelope cannot
+/// collapse onto (and inherit approval from) an earlier pending request.
+fn matches_pending_approval(signature: &str, request: &sv_mcp::AccessRequest) -> bool {
+    signature == request_signature(request)
 }
 
 #[derive(Clone, Serialize)]
@@ -359,6 +371,7 @@ impl ApprovalState {
                             mode: request.mode.map(|m| m.as_str().to_string()),
                             byte_size: request.byte_size,
                             otp_code: Some(code),
+                            import_summary: request.import_summary.clone(),
                         };
                         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
                     }
@@ -437,6 +450,7 @@ impl ApprovalState {
             mode: request.mode.map(|m| m.as_str().to_string()),
             byte_size: request.byte_size,
             otp_code: Some(code),
+            import_summary: request.import_summary.clone(),
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
         Err(
@@ -464,7 +478,7 @@ impl ApprovalState {
             // call) instead of stacking a second modal.
             let stale: Vec<u64> = pending
                 .iter()
-                .filter(|(_, p)| p.signature == signature)
+                .filter(|(_, p)| matches_pending_approval(&p.signature, &request))
                 .map(|(k, _)| *k)
                 .collect();
             for old in &stale {
@@ -496,6 +510,7 @@ impl ApprovalState {
             mode: request.mode.map(|m| m.as_str().to_string()),
             byte_size: request.byte_size,
             otp_code: None,
+            import_summary: request.import_summary.clone(),
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
 
@@ -594,6 +609,8 @@ struct ApprovalPrompt {
     mode: Option<String>,
     byte_size: Option<usize>,
     otp_code: Option<String>,
+    /// Validated non-secret authority shown for agent imports.
+    import_summary: Option<sv_mcp::ImportApprovalSummary>,
 }
 
 struct DesktopAuditSink {
@@ -1748,7 +1765,41 @@ mod tests {
             agent_id: Some("ag_test".into()),
             otp: None,
             authorization_context: String::new(),
+            import_summary: None,
         }
+    }
+
+    fn container_request(mode: SecurityMode, authorization_context: &str) -> sv_mcp::AccessRequest {
+        sv_mcp::AccessRequest {
+            transport: sv_mcp::AccessTransport::McpWs,
+            action: sv_mcp::AccessAction::ReadFile,
+            container: Some("notes".into()),
+            file_name: Some("entry.txt".into()),
+            mode: Some(mode),
+            byte_size: None,
+            agent_id: Some("ag_test".into()),
+            otp: None,
+            authorization_context: authorization_context.into(),
+            import_summary: None,
+        }
+    }
+
+    fn import_request(context: &str) -> sv_mcp::AccessRequest {
+        let mut request = modeless_request(sv_mcp::AccessAction::ImportAgents);
+        request.authorization_context = context.into();
+        request.import_summary = Some(sv_mcp::ImportApprovalSummary {
+            mode: "create_only".into(),
+            agent_count: 1,
+            agents: vec![sv_mcp::ImportApprovalAgent {
+                name: "limited-agent".into(),
+                scopes: vec![sv_mcp::AgentScope {
+                    container_glob: "notes/*".into(),
+                    actions: vec!["read".into()],
+                    mode_ceiling: Some("APPROVAL".into()),
+                }],
+            }],
+        });
+        request
     }
 
     #[test]
@@ -1762,6 +1813,64 @@ mod tests {
                 Ok(ApprovalPromptKind::Click)
             ));
         }
+    }
+
+    #[test]
+    fn import_approval_rejects_a_different_authorization_context() {
+        let approved = import_request("context-for-limited-import");
+        let changed = import_request("context-for-broader-import");
+        let approved_signature = request_signature(&approved);
+
+        assert!(matches_pending_approval(&approved_signature, &approved));
+        assert!(
+            !matches_pending_approval(&approved_signature, &changed),
+            "an approval for one import envelope must not match another"
+        );
+    }
+
+    #[test]
+    fn create_or_replace_broader_scope_requires_fresh_content_bound_approval() {
+        let create_only = import_request("digest:create_only:limited-agent:notes/*:read:APPROVAL");
+        let mut replacement =
+            import_request("digest:create_or_replace:limited-agent:**:read,write:OTP");
+        replacement.import_summary.as_mut().unwrap().mode = "create_or_replace".into();
+        replacement.import_summary.as_mut().unwrap().agents[0].scopes[0].container_glob =
+            "**".into();
+        replacement.import_summary.as_mut().unwrap().agents[0].scopes[0].actions =
+            vec!["read".into(), "write".into()];
+        replacement.import_summary.as_mut().unwrap().agents[0].scopes[0].mode_ceiling =
+            Some("OTP".into());
+
+        assert_ne!(
+            request_signature(&create_only),
+            request_signature(&replacement)
+        );
+        assert!(!matches_pending_approval(
+            &request_signature(&create_only),
+            &replacement
+        ));
+    }
+
+    #[test]
+    fn direct_approval_and_otp_container_requests_keep_their_normal_paths() {
+        let direct = container_request(SecurityMode::Direct, "direct-context");
+        let approval = container_request(SecurityMode::Approval, "approval-context");
+        let otp = container_request(SecurityMode::Otp, "otp-context");
+
+        assert!(matches!(
+            approval_requirement(&direct),
+            Ok(ApprovalPromptKind::NotRequired)
+        ));
+        assert!(matches!(
+            approval_requirement(&approval),
+            Ok(ApprovalPromptKind::Click)
+        ));
+        assert!(matches!(
+            approval_requirement(&otp),
+            Ok(ApprovalPromptKind::Otp)
+        ));
+        assert_eq!(request_signature(&approval), request_signature(&approval));
+        assert_eq!(request_signature(&otp), request_signature(&otp));
     }
 
     /// Helper to create a test challenge with known state.

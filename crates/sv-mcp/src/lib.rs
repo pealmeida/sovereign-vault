@@ -276,6 +276,91 @@ fn validate_scope_glob(glob: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// Parse the import envelope once into authority that is safe to show during
+/// approval and entries that are safe to execute. Keeping this validation in
+/// front of the approval gate ensures the operator sees the same scopes the
+/// vault will later persist.
+fn validate_agent_import(args: &Value) -> std::result::Result<ValidatedAgentImport, String> {
+    let envelope = args
+        .get("envelope")
+        .ok_or_else(|| "envelope is required".to_string())?;
+    let envelope: AgentImportEnvelope = serde_json::from_value(envelope.clone())
+        .map_err(|e| format!("invalid agent import envelope: {e}"))?;
+    if envelope.version != 1 {
+        return Err(format!(
+            "unsupported envelope version: {}",
+            envelope.version
+        ));
+    }
+    let _exported_at_unix = envelope.exported_at_unix;
+    if envelope.agent_count != envelope.agents.len() {
+        return Err("envelope.agent_count does not match agents length".into());
+    }
+    let (mode, replace_existing) = match args
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("create_only")
+    {
+        "create_only" => ("create_only", false),
+        "create_or_replace" => ("create_or_replace", true),
+        other => return Err(format!("unsupported import mode: {other}")),
+    };
+
+    let mut names = std::collections::HashSet::with_capacity(envelope.agents.len());
+    let mut agents = Vec::with_capacity(envelope.agents.len());
+    let mut entries = Vec::with_capacity(envelope.agents.len());
+    for entry in envelope.agents {
+        if entry.name.is_empty() {
+            return Err("agent.name must not be empty".into());
+        }
+        if !names.insert(entry.name.clone()) {
+            return Err(format!(
+                "agent import contains duplicate name: {}",
+                entry.name
+            ));
+        }
+        if entry.revoked {
+            return Err(format!(
+                "cannot import revoked agent {}; revoke it in the destination instead",
+                entry.name
+            ));
+        }
+        if entry.expires_at.is_some() {
+            return Err(format!(
+                "cannot import expiring agent {}; expiry preservation is unsupported",
+                entry.name
+            ));
+        }
+        if entry.scopes.is_empty() {
+            return Err(format!(
+                "cannot import unscoped agent {}; at least one concrete scope is required",
+                entry.name
+            ));
+        }
+        for scope in &entry.scopes {
+            validate_agent_scope(scope)?;
+        }
+        agents.push(ImportApprovalAgent {
+            name: entry.name.clone(),
+            scopes: entry.scopes.clone(),
+        });
+        entries.push(AgentImportEntry {
+            name: entry.name,
+            scopes: entry.scopes,
+        });
+    }
+
+    Ok(ValidatedAgentImport {
+        summary: ImportApprovalSummary {
+            mode: mode.to_string(),
+            agent_count: agents.len(),
+            agents,
+        },
+        entries,
+        replace_existing,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentImportEnvelope {
@@ -292,6 +377,37 @@ struct AgentImportEnvelopeEntry {
     scopes: Vec<AgentScope>,
     expires_at: Option<String>,
     revoked: bool,
+}
+
+/// Non-secret authority shown to a human before importing agents.
+///
+/// This deliberately contains only the import mode, agent names, and scope
+/// grants. Import tokens are never part of an import envelope and are minted
+/// only after approval, so they can never reach an approval surface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportApprovalSummary {
+    /// Requested behavior when an imported name already exists.
+    pub mode: String,
+    /// Number of imported agent identities in this request.
+    pub agent_count: usize,
+    /// Every imported agent and the scope grants it would receive.
+    pub agents: Vec<ImportApprovalAgent>,
+}
+
+/// The non-secret scope authority for one imported agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportApprovalAgent {
+    /// Human-readable imported identity name.
+    pub name: String,
+    /// Validated scope grants that define this identity's authority.
+    pub scopes: Vec<AgentScope>,
+}
+
+/// Fully validated import data, shared by authorization and execution.
+struct ValidatedAgentImport {
+    summary: ImportApprovalSummary,
+    entries: Vec<AgentImportEntry>,
+    replace_existing: bool,
 }
 
 /// Agent-safe metadata for one agent identity.
@@ -640,6 +756,10 @@ pub struct AccessRequest {
     /// domain-separated canonical serialization.
     #[serde(default)]
     pub authorization_context: String,
+    /// Validated, non-secret import authority for desktop approval surfaces.
+    /// Present only for `ImportAgents` requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_summary: Option<ImportApprovalSummary>,
 }
 
 /// A scope grant resolved for an authenticated agent. Scopes can only narrow
@@ -1463,6 +1583,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     authorization_context: build_authorization_context(name, args),
+                    import_summary: None,
                 })
             }
             "vault.read" => {
@@ -1481,6 +1602,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     authorization_context: build_authorization_context(name, args),
+                    import_summary: None,
                 })
             }
             "vault.write" => {
@@ -1503,6 +1625,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     authorization_context: build_authorization_context(name, args),
+                    import_summary: None,
                 })
             }
             "vault.delete" => {
@@ -1521,6 +1644,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     authorization_context: build_authorization_context(name, args),
+                    import_summary: None,
                 })
             }
             "vault.create_container" => {
@@ -1542,6 +1666,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     authorization_context: build_authorization_context(name, args),
+                    import_summary: None,
                 })
             }
             "vault.destroy" => {
@@ -1559,6 +1684,7 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     authorization_context: build_authorization_context(name, args),
+                    import_summary: None,
                 })
             }
             "vault.info" => Ok(simple_request(
@@ -1571,11 +1697,16 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 AccessAction::ExportAgents,
                 build_authorization_context(name, args),
             )),
-            "vault.import_agents" => Ok(simple_request(
-                transport,
-                AccessAction::ImportAgents,
-                build_authorization_context(name, args),
-            )),
+            "vault.import_agents" => {
+                let import = validate_agent_import(args)?;
+                let mut request = simple_request(
+                    transport,
+                    AccessAction::ImportAgents,
+                    build_authorization_context(name, args),
+                );
+                request.import_summary = Some(import.summary);
+                Ok(request)
+            }
             "vault.create_transit_key" => {
                 let _ = required_str(args, "name")?;
                 Ok(simple_request(
@@ -1787,65 +1918,9 @@ impl<H: VaultFacade + 'static> McpServer<H> {
                 Ok(envelope)
             }
             "vault.import_agents" => {
-                let envelope = args
-                    .get("envelope")
-                    .ok_or_else(|| "envelope is required".to_string())?;
-                // Deserialize and validate the *entire* envelope before
-                // touching the registry. This keeps malformed later entries
-                // from revoking valid existing agents.
-                let envelope: AgentImportEnvelope = serde_json::from_value(envelope.clone())
-                    .map_err(|e| format!("invalid agent import envelope: {e}"))?;
-                if envelope.version != 1 {
-                    return Err(format!(
-                        "unsupported envelope version: {}",
-                        envelope.version
-                    ));
-                }
-                let _exported_at_unix = envelope.exported_at_unix;
-                if envelope.agent_count != envelope.agents.len() {
-                    return Err("envelope.agent_count does not match agents length".into());
-                }
-                let replace_existing = match args
-                    .get("mode")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("create_only")
-                {
-                    "create_only" => false,
-                    "create_or_replace" => true,
-                    other => return Err(format!("unsupported import mode: {other}")),
-                };
-                let entries = envelope
-                    .agents
-                    .into_iter()
-                    .map(|entry| {
-                        if entry.revoked {
-                            return Err(format!(
-                                "cannot import revoked agent {}; revoke it in the destination instead",
-                                entry.name
-                            ));
-                        }
-                        if entry.expires_at.is_some() {
-                            return Err(format!(
-                                "cannot import expiring agent {}; expiry preservation is unsupported",
-                                entry.name
-                            ));
-                        }
-                        if entry.scopes.is_empty() {
-                            return Err(format!(
-                                "cannot import unscoped agent {}; at least one concrete scope is required",
-                                entry.name
-                            ));
-                        }
-                        for scope in &entry.scopes {
-                            validate_agent_scope(scope)?;
-                        }
-                        Ok(AgentImportEntry {
-                            name: entry.name,
-                            scopes: entry.scopes,
-                        })
-                    })
-                    .collect::<std::result::Result<Vec<_>, String>>()?;
-                let result = handle.import_agents_atomically(entries, replace_existing)?;
+                let import = validate_agent_import(args)?;
+                let result =
+                    handle.import_agents_atomically(import.entries, import.replace_existing)?;
                 Ok(json!({
                     "imported_count": result.imported.len(),
                     "skipped_count": result.skipped.len(),
@@ -2193,6 +2268,7 @@ fn simple_request(
         agent_id: None,
         otp: None,
         authorization_context,
+        import_summary: None,
     }
 }
 
@@ -4249,6 +4325,61 @@ mod tests {
     }
 
     #[test]
+    fn changing_import_authority_changes_context_and_summary() {
+        let limited = json!({
+            "envelope": {
+                "version": 1,
+                "exported_at_unix": 0,
+                "agent_count": 1,
+                "agents": [{
+                    "name": "limited-agent",
+                    "scopes": [{
+                        "container_glob": "notes/*",
+                        "actions": ["read"],
+                        "mode_ceiling": "APPROVAL"
+                    }],
+                    "expires_at": null,
+                    "revoked": false
+                }]
+            },
+            "mode": "create_only"
+        });
+        let broader = json!({
+            "envelope": {
+                "version": 1,
+                "exported_at_unix": 0,
+                "agent_count": 1,
+                "agents": [{
+                    "name": "replacement-agent",
+                    "scopes": [{
+                        "container_glob": "**",
+                        "actions": ["read", "write"],
+                        "mode_ceiling": "OTP"
+                    }],
+                    "expires_at": null,
+                    "revoked": false
+                }]
+            },
+            "mode": "create_or_replace"
+        });
+
+        assert_ne!(
+            build_authorization_context("vault.import_agents", &limited),
+            build_authorization_context("vault.import_agents", &broader)
+        );
+        let summary = validate_agent_import(&broader).unwrap().summary;
+        assert_eq!(summary.mode, "create_or_replace");
+        assert_eq!(summary.agent_count, 1);
+        assert_eq!(summary.agents[0].name, "replacement-agent");
+        assert_eq!(summary.agents[0].scopes[0].container_glob, "**");
+        assert_eq!(summary.agents[0].scopes[0].actions, ["read", "write"]);
+        assert_eq!(
+            summary.agents[0].scopes[0].mode_ceiling.as_deref(),
+            Some("OTP")
+        );
+    }
+
+    #[test]
     fn record_audit_sanitizes_error_for_denied_and_error_decisions() {
         let audit = Arc::new(MemoryAudit(Default::default()));
         let server = server().with_audit_sink(audit.clone());
@@ -4264,6 +4395,7 @@ mod tests {
             agent_id: Some("ag_1".into()),
             otp: None,
             authorization_context: String::new(),
+            import_summary: None,
         };
 
         // Record an Error decision with a raw error containing a private path and a secret.
