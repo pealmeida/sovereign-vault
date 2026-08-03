@@ -1364,14 +1364,8 @@ fn sync_parent(parent: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn sync_parent(parent: &Path) -> Result<()> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(parent)?
-        .sync_all()?;
+    // Windows directory fsync is a no-op; durability is handled by the OS.
+    let _ = parent;
     Ok(())
 }
 
