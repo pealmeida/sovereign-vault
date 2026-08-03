@@ -377,11 +377,14 @@ async fn run_micro(out: &Path, iterations: usize) {
     }
 
     let mut md = String::new();
-    md.push_str("# Component micro-measurements — isolated (thesis §3.9.1, Eq. 1 completeness)\n\n");
+    md.push_str(
+        "# Component micro-measurements — isolated (thesis §3.9.1, Eq. 1 completeness)\n\n",
+    );
     md.push_str("Pure cost of the two content-sensitive gateway components measured *outside* the gateway: `sv_storage` decrypt+read (`T_vault` floor) and `sv_privacy::redact` (`T_filter` floor), each in a tight loop with no dispatch overhead. Compare to the gateway-stage figures in `latency.md` to isolate per-component dispatch overhead.\n\n");
     md.push_str("| Bytes | decrypt mean (us) | decrypt p95 | filter mean (us) | filter p95 |\n");
     md.push_str("|---|---|---|---|---|\n");
-    let mut csv = String::from("bytes,decrypt_mean_us,decrypt_p95_us,filter_mean_us,filter_p95_us\n");
+    let mut csv =
+        String::from("bytes,decrypt_mean_us,decrypt_p95_us,filter_mean_us,filter_p95_us\n");
     for r in &rows {
         md.push_str(&format!(
             "| {} | {:.2} | {:.2} | {:.2} | {:.2} |\n",
