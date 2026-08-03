@@ -342,6 +342,7 @@ mod tests {
             agent_id: None,
             otp: None,
             authorization_context: String::new(),
+            import_summary: None,
         }
     }
 
