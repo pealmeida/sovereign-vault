@@ -2147,6 +2147,51 @@ impl sv_mcp::VaultFacade for VaultHandle {
             method: method.to_ascii_uppercase(),
         })
     }
+
+    fn list_agents(&self) -> std::result::Result<Vec<sv_mcp::AgentInfo>, String> {
+        VaultHandle::list_agents(self)
+            .map(|v| {
+                v.into_iter()
+                    .map(|a| sv_mcp::AgentInfo {
+                        agent_id: a.agent_id,
+                        name: a.name,
+                        scopes: a
+                            .scopes
+                            .into_iter()
+                            .map(|s| sv_mcp::AgentScope {
+                                container_glob: s.container_glob,
+                                actions: s.actions,
+                                mode_ceiling: s.mode_ceiling,
+                            })
+                            .collect(),
+                        created_at: a.created_at.to_rfc3339(),
+                        expires_at: a.expires_at.map(|t| t.to_rfc3339()),
+                        revoked: a.revoked,
+                    })
+                    .collect()
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    fn create_agent(
+        &self,
+        name: &str,
+        scopes: Vec<sv_mcp::AgentScope>,
+    ) -> std::result::Result<(String, String), String> {
+        let scopes: Vec<crate::agents::AgentScope> = scopes
+            .into_iter()
+            .map(|s| crate::agents::AgentScope {
+                container_glob: s.container_glob,
+                actions: s.actions,
+                mode_ceiling: s.mode_ceiling,
+            })
+            .collect();
+        VaultHandle::create_agent(self, name, scopes).map_err(|e| e.to_string())
+    }
+
+    fn revoke_agent(&self, agent_id: &str) -> std::result::Result<(), String> {
+        VaultHandle::revoke_agent(self, agent_id).map_err(|e| e.to_string())
+    }
 }
 
 /// Generate a fresh URL-safe-base64 32-byte pairing secret using the OS RNG
