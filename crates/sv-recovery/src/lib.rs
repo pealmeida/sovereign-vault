@@ -303,15 +303,9 @@ fn sync_parent(root: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_parent(root: &Path) -> Result<()> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(root)?
-        .sync_all()?;
+fn sync_parent(_root: &Path) -> Result<()> {
+    // File contents are synced before the atomic replace; Windows cannot
+    // flush a directory handle, so there is nothing to do here.
     Ok(())
 }
 
