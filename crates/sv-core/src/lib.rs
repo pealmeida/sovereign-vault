@@ -2178,6 +2178,9 @@ impl sv_mcp::VaultFacade for VaultHandle {
         name: &str,
         scopes: Vec<sv_mcp::AgentScope>,
     ) -> std::result::Result<(String, String), String> {
+        for scope in &scopes {
+            sv_mcp::validate_agent_scope(scope)?;
+        }
         let scopes: Vec<crate::agents::AgentScope> = scopes
             .into_iter()
             .map(|s| crate::agents::AgentScope {
@@ -2198,6 +2201,17 @@ impl sv_mcp::VaultFacade for VaultHandle {
         entries: Vec<sv_mcp::AgentImportEntry>,
         replace_existing: bool,
     ) -> std::result::Result<sv_mcp::AgentImportResult, String> {
+        for entry in &entries {
+            if entry.scopes.is_empty() {
+                return Err(format!(
+                    "cannot import unscoped agent {}; at least one concrete scope is required",
+                    entry.name
+                ));
+            }
+            for scope in &entry.scopes {
+                sv_mcp::validate_agent_scope(scope)?;
+            }
+        }
         let entries = entries
             .into_iter()
             .map(|entry| crate::agents::AgentImportEntry {

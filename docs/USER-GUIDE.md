@@ -256,6 +256,30 @@ On connect, the client calls `vault.pair`:
 - **Scoped agent**: `vault.pair { agent_id, token }` with the one-time token from the
   desktop (Settings → Agents → New agent).
 
+### Headless systemd gateway
+
+`sovereign-vault serve` never creates or accepts the shared Default-agent pairing
+secret. Before installing `apps/cli/systemd/sovereign-vault.serve.service`, create a
+dedicated agent with at least one concrete scope in **Settings → Agents** and save its
+one-time token. Provision the service credentials for the user that runs the unit:
+
+```bash
+install -d -m 0700 ~/.config/sovereign-vault
+install -m 0600 /dev/null ~/.config/sovereign-vault/agent.token
+# Paste only the scoped agent's one-time token into ~/.config/sovereign-vault/agent.token.
+install -m 0600 /dev/null ~/.config/sovereign-vault/serve.env
+```
+
+Set the following two lines in `~/.config/sovereign-vault/serve.env` (with no quotes):
+
+```text
+SV_AGENT_ID=ag_...
+SV_AGENT_TOKEN_FILE=/home/your-user/.config/sovereign-vault/agent.token
+```
+
+The shipped unit loads this owner-only environment file and refuses to start without
+both values. It does not print a pairing secret to the journal.
+
 ### MCP tools (15)
 
 | Tool | Arguments | Mode gating |
