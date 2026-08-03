@@ -17,6 +17,12 @@ updates:
     groups:
       npm-minor-patch:
         update-types: [minor, patch]
+    ignore:
+      # TypeScript 7 is the native/Go-port compiler; svelte-check/svelte2tsx
+      # don't support it yet (peer range caps at ^6). Remove once they ship
+      # a release accepting typescript ^7. See closed PR #45.
+      - dependency-name: "typescript"
+        versions: ["7.x"]
 
   - package-ecosystem: github-actions
     directory: "/"
