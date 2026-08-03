@@ -325,9 +325,10 @@ fn run_migrate(m: MigrateCli) -> Result<(), String> {
             manifest_digest,
             passphrase,
         } => {
+            let custody = migration_custody(&root)?;
             sv_core::VaultHandle::migrate_manifest_authentication(
                 &root,
-                sv_core::CustodyMode::Passphrase,
+                custody,
                 passphrase.as_deref(),
                 &manifest_digest,
             )
@@ -345,12 +346,9 @@ fn run_migrate(m: MigrateCli) -> Result<(), String> {
                 sv_core::VaultHandle::unlock_with_recovery(&root, &recovery)
                     .map_err(|e| e.to_string())?
             } else {
-                sv_core::VaultHandle::unlock(
-                    &root,
-                    sv_core::CustodyMode::Passphrase,
-                    passphrase.as_deref(),
-                )
-                .map_err(|e| e.to_string())?
+                let custody = migration_custody(&root)?;
+                sv_core::VaultHandle::unlock(&root, custody, passphrase.as_deref())
+                    .map_err(|e| e.to_string())?
             };
             let log = sv_audit::AuditLog::with_hmac_key(&root, handle.audit_hmac_key())
                 .map_err(|e| e.to_string())?;
@@ -389,6 +387,14 @@ fn run_migrate(m: MigrateCli) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Select the persisted normal custody mode for migration commands.
+///
+/// `master.salt` records passphrase custody; its absence records OS-keychain
+/// custody, including legacy vaults that have not yet created a keyring.
+fn migration_custody(root: &std::path::Path) -> Result<sv_core::CustodyMode, String> {
+    sv_core::VaultHandle::detect_custody(root).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -467,6 +473,64 @@ mod tests {
             root: Some(root.clone()),
         })
         .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migration_custody_detects_passphrase_vaults() {
+        let root = temp_root("migration-custody-passphrase");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("master.salt"), [0u8; 16]).unwrap();
+
+        assert_eq!(
+            migration_custody(&root).unwrap(),
+            sv_core::CustodyMode::Passphrase
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migration_custody_detects_os_keychain_vaults_without_a_salt() {
+        let root = temp_root("migration-custody-keychain");
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert_eq!(
+            migration_custody(&root).unwrap(),
+            sv_core::CustodyMode::OsKeychain
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_auth_migrates_a_legacy_passphrase_vault() {
+        let root = temp_root("manifest-auth-passphrase");
+        std::fs::create_dir_all(&root).unwrap();
+        let passphrase = "manifest-auth-test-passphrase";
+        let salt = sv_core::sv_crypto::random_salt().unwrap();
+        std::fs::write(root.join("master.salt"), salt).unwrap();
+        let legacy_key = sv_core::sv_crypto::MasterKey::from_passphrase(passphrase, &salt).unwrap();
+        {
+            let vault = sv_core::sv_storage::Vault::open_or_init(&root, legacy_key).unwrap();
+            vault
+                .create_container("documents", sv_core::sv_storage::SecurityMode::Direct, None)
+                .unwrap();
+        }
+        let digest = sv_core::VaultHandle::manifest_migration_digest(&root).unwrap();
+
+        run_migrate(MigrateCli {
+            command: MigrateCommand::ManifestAuth {
+                manifest_digest: digest,
+                passphrase: Some(passphrase.to_string()),
+            },
+            root: Some(root.clone()),
+        })
+        .unwrap();
+
+        let unlocked =
+            sv_core::VaultHandle::unlock(&root, sv_core::CustodyMode::Passphrase, Some(passphrase))
+                .unwrap();
+        assert!(root.join("keyring.svault").exists());
+        drop(unlocked);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

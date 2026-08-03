@@ -8,7 +8,10 @@ use base64::{
 };
 use sha2::{Digest, Sha256};
 use sv_core::{
-    sv_crypto::MasterKey, sv_keychain, sv_storage::SecurityMode, CustodyMode, VaultHandle,
+    sv_crypto::MasterKey,
+    sv_keychain,
+    sv_storage::{SecurityMode, Vault},
+    CustodyMode, VaultHandle,
 };
 
 struct Cleanup {
@@ -193,4 +196,54 @@ fn passphrase_vault_can_move_to_os_keychain() {
     assert!(probe.keychain_available);
     assert!(probe.has_keychain_entry);
     assert!(!probe.has_passphrase_salt);
+}
+
+#[test]
+#[ignore = "touches the host OS keychain; run manually for local custody validation"]
+fn legacy_os_keychain_vault_migrates_manifest_authentication() {
+    // Simulate a pre-keyring OS-keychain vault: the legacy key lives in the
+    // keychain and no master.salt is written to disk.
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "sovereign-vault-os-keychain-manifest-migration-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let account = keychain_account_for_root(&root);
+    let _cleanup = Cleanup {
+        roots: vec![root.clone()],
+        accounts: vec![account.clone()],
+    };
+
+    let legacy_kek = MasterKey::generate();
+    sv_keychain::store_master_key_for_account(&account, &B64.encode(legacy_kek.as_bytes()))
+        .unwrap();
+    {
+        let vault = Vault::open_or_init(&root, legacy_kek).unwrap();
+        vault
+            .create_container("documents", SecurityMode::Direct, None)
+            .unwrap();
+        vault
+            .write_file("documents", "legacy.txt", b"keychain legacy data")
+            .unwrap();
+    }
+    assert!(!root.join("master.salt").exists());
+
+    let digest = VaultHandle::manifest_migration_digest(&root).unwrap();
+    VaultHandle::migrate_manifest_authentication(
+        &root,
+        VaultHandle::detect_custody(&root).unwrap(),
+        None,
+        &digest,
+    )
+    .unwrap();
+
+    let unlocked = VaultHandle::unlock(&root, CustodyMode::OsKeychain, None).unwrap();
+    assert_eq!(
+        unlocked.read_file("documents", "legacy.txt").unwrap(),
+        b"keychain legacy data"
+    );
 }
