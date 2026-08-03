@@ -330,11 +330,21 @@ mod tests {
 
     #[test]
     fn passphrase_derivation_is_deterministic() {
-        let salt = [7u8; SALT_LEN];
+        let salt = random_salt().unwrap();
         let a = MasterKey::from_passphrase("hunter2", &salt).unwrap();
         let b = MasterKey::from_passphrase("hunter2", &salt).unwrap();
         assert_eq!(a.as_bytes(), b.as_bytes());
         let c = MasterKey::from_passphrase("hunter3", &salt).unwrap();
         assert_ne!(a.as_bytes(), c.as_bytes());
+    }
+
+    #[test]
+    fn random_salt_returns_fresh_full_length_values() {
+        let first = random_salt().unwrap();
+        let second = random_salt().unwrap();
+
+        assert_eq!(first.len(), SALT_LEN);
+        assert_eq!(second.len(), SALT_LEN);
+        assert_ne!(first, second);
     }
 }
