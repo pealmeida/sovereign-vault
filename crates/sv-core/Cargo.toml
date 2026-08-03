@@ -26,7 +26,7 @@ subtle       = { workspace = true }
 reqwest      = { workspace = true }
 url          = "2.5"
 async-trait  = "0.1"
-base64       = "0.22"
+base64       = "0.23"
 fs4          = { workspace = true }
 atomicwrites = { workspace = true }
 libc         = "0.2"

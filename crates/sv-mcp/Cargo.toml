@@ -21,7 +21,7 @@ tokio-tungstenite = { workspace = true }
 futures-util      = { workspace = true }
 tracing           = { workspace = true }
 subtle            = { workspace = true }
-base64            = "0.22"
+base64            = "0.23"
 async-trait       = "0.1"
 getrandom         = { workspace = true }
 
