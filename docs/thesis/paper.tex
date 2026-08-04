@@ -449,7 +449,7 @@ A Figura~\ref{fig:latencia-estagios} decompõe as médias por estágio a partir 
 \fonte{Elaboração própria a partir de \codigo{target/thesis-eval/latency.csv}.}
 \end{figure}
 
-Medições isoladas dos componentes também estão disponíveis em \codigo{target/thesis-eval/micro.csv}: para 128 B, 1 KiB e 16 KiB, a leitura/decifra teve médias de 4,14\micro{}, 4,97\micro{} e 16,82\micro{}, e o filtro teve 1,17\micro{}, 7,86\micro{} e 125,08\micro{}, respectivamente. São medições fora do gateway e não devem ser somadas à Tabela~\ref{tab:microbenchmark-latencia} como se fossem uma nova latência fim a fim.
+Medições isoladas dos componentes também estão disponíveis em \codigo{target/thesis-eval/micro.csv}, na mesma execução preliminar de uma sessão e sem intervalo de confiança: para 128 B, 1 KiB e 16 KiB, a leitura/decifra teve médias de 4,14\micro{}, 4,97\micro{} e 16,82\micro{}, e o filtro teve 1,17\micro{}, 7,86\micro{} e 125,08\micro{}, respectivamente. São medições fora do gateway e não devem ser somadas à Tabela~\ref{tab:microbenchmark-latencia} como se fossem uma nova latência fim a fim.
 
 \section{Bateria Adversarial Pré-especificada}
 Na execução preliminar única da bateria pré-especificada, o gateway bloqueou 10/10 chamadas maliciosas e aceitou 2/2 controles legítimos, conforme \codigo{target/thesis-eval/adversarial.csv} e Tabela~\ref{tab:sondas-adversariais}. O resultado valida somente transporte WebSocket, escopo, validação de caminho e aplicação de política HITL simulada; ele não exercita o controlador real de consentimento desktop, nem atribui cada bloqueio individual à sua causa. Não estima robustez geral contra adversário adaptativo, fluxo de exfiltração por operações permitidas ou população de ataques.
