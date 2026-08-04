@@ -1,0 +1,4 @@
+# Known test-only literals in the historical default-agent authentication test.
+# The values are fixed strings (`secret` and `secret-launch-*`), not credentials.
+200d600b6fd6b7337b57276236afa67a1a631a01:crates/sv-core/src/agents.rs:generic-api-key:333
+200d600b6fd6b7337b57276236afa67a1a631a01:crates/sv-core/src/agents.rs:generic-api-key:336
