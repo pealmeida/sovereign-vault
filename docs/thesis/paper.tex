@@ -36,9 +36,77 @@
 \begin{document}
 \pretextual
 \imprimircapa
-\imprimirfolhaderosto
+% A variante com estrela termina em \newpage (não \cleardoublepage), de modo
+% que o conteúdo seguinte cai no *verso* da folha de rosto — que é onde a NBR
+% 14724 exige a ficha catalográfica. Ver abntex2.cls, seção "Folha de rosto".
+\imprimirfolhaderosto*
 % A linha em branco acima é obrigatória: \imprimirfolhaderosto tem argumento
 % opcional e, sem ela, o LaTeX consome o \begin{resumo} seguinte como argumento.
+
+% ---------------------------------------------------------------------------
+% Ficha catalográfica — NBR 14724 (elemento obrigatório), no verso da folha de
+% rosto. O texto DEVE ser gerado pelo sistema da Biblioteca Achille Bassi
+% (ICMC/USP) e colado aqui sem reformatar:
+%   https://www.icmc.usp.br/institucional/estrutura-administrativa/biblioteca/servicos/ficha
+% Trocar o bloco marcado pelo retorno do sistema. O aviso é intencionalmente
+% visível no PDF para não passar despercebido na revisão final.
+% ---------------------------------------------------------------------------
+\begin{fichacatalografica}
+\vspace*{\fill}
+\begin{center}
+\fbox{\begin{minipage}{12.5cm}
+\vspace{0.3cm}
+\textbf{[FICHA CATALOGRÁFICA A GERAR]}\\[0.2cm]
+Elemento obrigatório (NBR 14724). Gerar no sistema da Biblioteca Achille Bassi
+(ICMC/USP) e substituir este bloco pelo texto retornado, sem reformatação.
+\vspace{0.3cm}
+\end{minipage}}
+\end{center}
+\end{fichacatalografica}
+
+% ---------------------------------------------------------------------------
+% Folha de aprovação — NBR 14724 (elemento obrigatório). Só é preenchível após
+% a defesa: nome dos membros da banca e data de aprovação. A prática usual é
+% submeter com a folha em branco e depositar a versão final com as assinaturas.
+% Confirmar com a coordenação qual variante o ICMC exige na submissão.
+% ---------------------------------------------------------------------------
+\begin{folhadeaprovacao}
+\begin{center}
+{\ABNTEXchapterfont\large\imprimirautor}
+
+\vspace*{\fill}\vspace*{1.2cm}
+\begin{minipage}[t]{\textwidth}
+\centering
+\ABNTEXchapterfont\bfseries\large\imprimirtitulo
+\end{minipage}
+\vspace*{1.2cm}
+
+\hspace{.45\textwidth}
+\begin{minipage}{.5\textwidth}
+\imprimirpreambulo
+\end{minipage}
+\vspace*{1.2cm}
+
+\end{center}
+
+Trabalho aprovado. São Carlos, \rule[-0.2cm]{2.5cm}{0.15mm} de
+\rule[-0.2cm]{4cm}{0.15mm} de \rule[-0.2cm]{1.5cm}{0.15mm}.
+
+\vspace{1.0cm}
+\begin{center}
+\rule{9cm}{0.15mm}\par
+\imprimirorientador\ (Orientador(a))
+
+\vspace{1.0cm}
+\rule{9cm}{0.15mm}\par
+{}[MEMBRO DA BANCA 1]
+
+\vspace{1.0cm}
+\rule{9cm}{0.15mm}\par
+{}[MEMBRO DA BANCA 2]
+\end{center}
+\vspace*{\fill}
+\end{folhadeaprovacao}
 
 \begin{resumo}
 Esta pesquisa propõe uma arquitetura Local-First para mediar acessos de agentes de IA a segredos e credenciais locais. A instância avaliada, denominada Sovereign Vault, combina cofre cifrado, gateway MCP, escopos de capacidade, modos de consentimento e auditoria com evidência de adulteração. A avaliação atual é deliberadamente limitada a um \textit{microbenchmark} local sintético e a uma bateria finita de chamadas de ferramenta; não mede inferência em nuvem, utilidade de tarefa ou tempo de decisão humana. No modo ANONYMIZED, nomes completos, endereços, RG, CEP e telefones sem formatação passam sem máscara: mesmo com CPF ou CNPJ mascarados, um documento com nome e endereço pode permanecer identificável sob o Art.~5º da LGPD. Assim, o artefato não é adequado a documentos em que a vinculação de identidade por campos não mascarados seja risco realista.\par

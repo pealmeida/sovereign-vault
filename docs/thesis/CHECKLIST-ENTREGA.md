@@ -43,7 +43,17 @@ Gerar em:
 `https://www.icmc.usp.br/institucional/estrutura-administrativa/biblioteca/servicos/ficha`
 
 Ela é inserida no verso da folha de rosto e garante a indexação do trabalho nos
-sistemas da USP. **Não existe no `paper.tex` atual.**
+sistemas da USP.
+
+**Estado (04/08/2026): o lugar existe, o conteúdo não.** O `paper.tex` passou a
+usar `\imprimirfolhaderosto*` (variante com estrela, que termina em `\newpage`
+em vez de `\cleardoublepage`) seguido do ambiente `fichacatalografica`, de modo
+que o bloco cai no **verso da folha de rosto** — página 4 do PDF, imediatamente
+após a folha de rosto na página 3, como a NBR 14724 exige. O bloco atual traz um
+aviso visível `[FICHA CATALOGRÁFICA A GERAR]`.
+
+**Ação restante:** gerar no sistema da Biblioteca e colar o texto retornado no
+lugar do bloco marcado, sem reformatar. Nenhuma mudança estrutural é necessária.
 
 ### 0.2 Pacote USPSC 3.2 — OBRIGATÓRIO, não utilizado
 
@@ -95,8 +105,8 @@ caro o retrabalho. Confirmar com a orientadora antes de executar.
 |---|---|---|---|
 | Capa | obrigatório | ✅ presente | — |
 | Folha de rosto | obrigatório | ✅ presente | — |
-| **Nome do orientador na folha de rosto** | obrigatório | ❌ **`[ORIENTADOR(A) A CONFIRMAR]`** | **Bloqueante.** Preencher |
-| **Folha de aprovação** | obrigatório | ❌ **ausente** | Ver §1.1 abaixo |
+| **Nome do orientador na folha de rosto** | obrigatório | ❌ **`[ORIENTADOR(A) A CONFIRMAR]`** | **Bloqueante.** Preencher — o nome não consta de nenhuma fonte do repositório e não deve ser inferido |
+| **Folha de aprovação** | obrigatório | ✅ **estrutura presente** | Renderiza com autor, título, preâmbulo e linhas de assinatura; nomes da banca e data só após a defesa. Ver §1.1 |
 | Errata | opcional | ausente | — |
 | Dedicatória | opcional | ausente | decisão do autor |
 | Agradecimentos | opcional | ausente | decisão do autor |
@@ -122,7 +132,15 @@ a versão final depositada traz a folha assinada. **[CONFIRMAR]** qual o
 procedimento do ICMC: alguns programas exigem a folha já na submissão, outros
 apenas no depósito final.
 
-Se for exigida, o `abntex2` fornece `\imprimirfolhadeaprovacao`.
+**Estado (04/08/2026): implementada em branco.** O `paper.tex` usa o ambiente
+`folhadeaprovacao` do `abntex2`, na posição correta (após a ficha, antes do
+resumo). A página renderiza autor, título, preâmbulo, linha de data em branco e
+três linhas de assinatura: orientador(a) — que herda `\imprimirorientador`, hoje
+o mesmo *placeholder* da folha de rosto — e dois membros da banca marcados
+`[MEMBRO DA BANCA 1|2]`.
+
+Esta é a variante submetível: os nomes da banca e a data de aprovação só existem
+**após** a defesa. Nada a fazer até lá, exceto confirmar o procedimento do ICMC.
 
 ---
 
@@ -319,11 +337,19 @@ Exigência recorrente nas três disciplinas de Metodologia:
 
 **Bloqueantes (impedem entrega):**
 
-1. **Ficha catalográfica** — obrigatória, gerada pela Biblioteca Achille Bassi. **Ausente.** Ver §0.1.
+1. **Ficha catalográfica** — estrutura no lugar certo (verso da folha de rosto,
+   p. 4); falta **gerar o conteúdo** na Biblioteca Achille Bassi e colar. Ver §0.1.
 2. **Pacote USPSC 3.2** — declarado obrigatório; o documento usa `abntex2` puro. Ver §0.2 e §0.4.
-3. **Nome do orientador** na folha de rosto — hoje sai `[ORIENTADOR(A) A CONFIRMAR]` visível no PDF.
-4. **Execução definitiva** — k ≥ 3 sessões com IC 95%. Instrumento pronto; falta rodar.
-5. **Folha de aprovação** — [CONFIRMAR] se exigida já na submissão.
+3. **Nome do orientador** na folha de rosto — hoje sai `[ORIENTADOR(A) A CONFIRMAR]`
+   visível no PDF. O nome não consta de nenhuma fonte deste repositório: só o
+   autor pode preenchê-lo.
+4. **Execução definitiva** — k ≥ 3 sessões com IC 95%. Instrumento pronto e
+   ensaiado de ponta a ponta; falta rodar sob as pré-condições do §1 do
+   protocolo (`main` publicada + *host* controlado). Ver §9.
+
+> **Deixou de ser bloqueante:** a folha de aprovação, agora implementada em
+> branco na posição correta (§1.1) — variante submetível, já que os nomes da
+> banca só existem após a defesa. Resta apenas confirmar o procedimento do ICMC.
 
 > Os itens 1 e 2 vieram da consulta às fontes institucionais e **não estavam
 > neste checklist na primeira versão**. São os de maior risco: descumprem
