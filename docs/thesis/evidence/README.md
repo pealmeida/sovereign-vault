@@ -38,9 +38,21 @@ confiança. A execução definitiva exige k ≥ 3 sessões independentes, IC de 
 *bootstrap* e regra explícita de *warmup*/descarte, conforme já declarado no
 próprio texto da tese.
 
-> **Pendência de proveniência.** O apêndice declara o commit
-> `dfb0a49f7360aedf37ee89152b99e2d970b6cfd6`. Ele existe, mas **não é ancestral
-> da `main`** — está apenas na branch `feat/headless-serve-migrate-ratelimit`. Se
-> essa branch for apagada, a âncora de proveniência desaparece. Antes da entrega,
-> criar uma tag anotada apontando para o commit da execução definitiva, e citar
-> essa tag no apêndice.
+## Proveniência
+
+Estes CSVs foram produzidos a partir do commit
+`dfb0a49f7360aedf37ee89152b99e2d970b6cfd6`, alcançável pela etiqueta anotada
+**`thesis-evidence-preliminary`**.
+
+**Esse commit não é ancestral da `main`.** O código instrumentado mudou depois
+dele — em particular `a0b51da`, que somou cerca de 925 linhas ao gateway
+`sv-mcp` (o componente medido) e 116 ao harness `thesis-eval`. Portanto os
+números aqui **não correspondem ao código da versão entregue**.
+
+Isso é consistente com a classificação declarada na tese: execução preliminar de
+desenvolvimento, uma sessão, sem intervalo de confiança. A etiqueta existe para
+que o commit permaneça alcançável e os resumos publicados sigam verificáveis,
+mesmo que a branch de origem seja apagada.
+
+A execução definitiva substituirá tanto estes dados quanto esta âncora, e deverá
+ser produzida a partir de um estado publicado da `main`, com etiqueta própria.

@@ -478,35 +478,74 @@ C2 & controle & listagem de arquivos públicos no escopo & aceita \\
 \fonte{\codigo{target/thesis-eval/adversarial.csv}.}
 \end{table}
 
-\section{Limitações e Trabalho Futuro}
-As próximas iterações devem: (i) vincular autorização criptográfica a referência de chave, hash de payload, semântica da operação, destinatário/domínio e identidade do agente; (ii) introduzir hierarquia de chaves por contêiner ou documentar segmentação apenas lógica e avaliar controles de SO em múltiplas plataformas; (iii) ampliar e medir precisão/recall dos detectores de PII em dados brasileiros, incluindo RG, CEP, nomes e endereços; (iv) adicionar âncora externa ao cabeçalho de auditoria; e (v) executar o protocolo de dois braços e estudo de consentimento humano antes de responder a comparação com nuvem ou latência humana. A correção \textit{fail-closed} do \hyperref[nota:headless]{modo headless} foi aplicada durante o ciclo de rigor DSR.
-
 \chapter{DISCUSSÃO E CONSIDERAÇÕES FINAIS}
 \section{Síntese dos Resultados}
-% TODO Fase 4: sintetizar os resultados reportados no Capítulo 4 e suas fronteiras de evidência.
+O artefato concretiza, no domínio de segredos e credenciais, os quatro módulos da arquitetura de referência apresentados na Figura~\ref{fig:arquitetura-referencia}: cofre local cifrado, servidor MCP local, mediação com filtro de privacidade, modos de consentimento e auditoria implementados. A sequência da Figura~\ref{fig:fluxo-requisicao} explicita que autenticação, validação e escopo antecedem a operação no cofre, enquanto consentimento e filtragem dependem do modo configurado. Essa separação é lógica e não constitui isolamento de processo ou de sistema operacional.
+
+A síntese empírica permanece subordinada à Tabela~\ref{tab:fronteira-evidencia}. O \textit{microbenchmark} da Tabela~\ref{tab:microbenchmark-latencia} mede uma sessão preliminar de leituras locais sintéticas, com N=1.000 por célula e sem IC, e a Figura~\ref{fig:latencia-estagios} mostra que o filtro de PII domina a condição ANONYMIZED de maior carga. A bateria da Tabela~\ref{tab:sondas-adversariais}, também em uma execução preliminar, bloqueia 10/10 chamadas maliciosas e aceita 2/2 controles, mas valida somente as negativas enumeradas no transporte WebSocket, com escopo, caminho e política HITL simulada.
+
+Em conjunto, os resultados mostram que a instância permite observar mediação de leituras nomeadas, decompor a latência interna do \textit{gateway} e exercitar uma bateria finita de acessos laterais. Não se obtém desses dados evidência sobre experiência fim a fim, comportamento de um adversário adaptativo, comparação com nuvem, retenção no provedor ou identificabilidade de documentos. Tampouco se avaliam RAG, índice vetorial ou isolamento de memória no sistema operacional.
 
 \section{Respostas às Questões de Pesquisa}
-% TODO Fase 4: responder às questões de pesquisa exclusivamente com base na evidência consolidada.
 \subsection{QP1}
-% TODO Fase 4: registrar a resposta à QP1 com base na evidência consolidada.
+A mediação de leituras nomeadas ocorre pela combinação de identidade autenticada, escopos de capacidade, validação de caminhos, modos de contêiner e registro de auditoria. No caminho desktop, APPROVAL e OTP submetem a liberação ao consentimento configurado, enquanto ANONYMIZED aplica mascaramento heurístico à saída textual. A auditoria encadeada por HMAC-SHA256 fornece evidência de adulteração, remoção e truncamento em relação ao ponto de verificação local presente, sem impedir a restauração de uma cópia completa e internamente consistente. A evidência experimental de escopo e consentimento refere-se ao \textit{gateway} desktop WebSocket; o modo \textit{headless} fica excluído dessa avaliação e, embora preserve escopos e recuse operações secretas sem modelo de consentimento, não oferece consentimento humano.
 
+A redução de exposição sustentada pela evidência é, portanto, operacional e delimitada: escopos restringem as chamadas alcançáveis e o modo ANONYMIZED mascara as categorias detectadas antes da saída. Contêineres DIRECT liberam leituras sem consentimento por projeto e ficam fora da garantia de mediação humana, embora permaneçam sujeitos aos demais controles aplicáveis. O filtro cobre exatamente sete categorias heurísticas, mas as cargas sintéticas ANONYMIZED exercitam somente e-mail, CPF e IPv4; não há medição de precisão ou recall.
+
+Essa resposta não equivale a garantia de anonimização ou de não identificabilidade. RG, CEP, nomes completos, endereços, datas de nascimento e telefones sem formatação não são detectados, e a presença desses campos pode manter um documento identificável mesmo quando CPF ou CNPJ são mascarados. O resultado também não estabelece conformidade à LGPD.
 \subsection{QP2}
-% TODO Fase 4: registrar a resposta à QP2 com base na evidência consolidada.
+A decomposição por estágio da Figura~\ref{fig:latencia-estagios} responde à QP2 no limite do caminho local instrumentado. Nessa execução, a barreira medida permanece abaixo de um milissegundo e o custo de despacho é pequeno e limitado em relação à recuperação local. A exceção relevante é o filtro de PII, cujo custo cresce com o conteúdo sintético e domina a leitura ANONYMIZED de 16 KiB; as medições isoladas e internas ao \textit{gateway} não devem ser somadas como uma nova latência fim a fim.
+
+A Tabela~\ref{tab:metodologia-microbenchmark} delimita o estimando: o transporte stdio mede validação de parâmetros e caminho, despacho, leitura/decifra e filtragem quando aplicável, mas não mede resolução de agente nem \codigo{enforce_scopes}. A Tabela~\ref{tab:microbenchmark-latencia} corresponde a uma sessão preliminar, sem IC, e seus valores dependem da máquina hospedeira. Não se mede a chamada MCP fim a fim, WAN, inferência, utilidade de tarefa ou tempo de decisão humana; APPROVAL e OTP usam \codigo{AutoAllow} e representam somente o piso mecânico do \textit{gateway}.
 
 \subsection{QP3}
-% TODO Fase 4: registrar a resposta à QP3 com base na evidência consolidada.
+No modelo de ameaça de usuário único e máquina única, a bateria pré-especificada da Tabela~\ref{tab:sondas-adversariais} fornece evidência de que, sobre transporte WebSocket autenticado, o protocolo composto por escopos, validação de caminho e política HITL simulada bloqueia as chamadas maliciosas enumeradas e preserva os dois controles legítimos. A execução não isola a contribuição causal de cada controle nem avalia isoladamente a autenticação. O resultado de 10/10 sondas maliciosas bloqueadas e 2/2 controles aceitos é uma cobertura da bateria executada, não uma taxa populacional de ataques ou uma prova de robustez geral.
+
+A execução ocorre uma única vez sobre WebSocket autenticado e usa \codigo{HitlPolicy} simulada; o controlador desktop real \codigo{ApprovalState} não é exercitado. Também não se atribui cada bloqueio individual a uma causa observada, não se testa adversário adaptativo e não se avalia exfiltração por operações permitidas. Assim, a resposta à QP3 restringe-se ao protocolo e às negativas enumeradas.
 
 \section{Confronto com os Trabalhos Correlatos}
-% TODO Fase 4: confrontar a discussão com os trabalhos correlatos delimitados pela fundamentação teórica.
+O Aprendizado Federado preserva a descentralização de dados brutos durante o treinamento cooperativo de modelos \cite{imteaj2021}, enquanto o problema aqui tratado é o acesso, em tempo de execução, a segredos e credenciais locais voláteis. O Sovereign Vault não substitui essa abordagem: atua em outra etapa do ciclo, mediando chamadas de ferramenta e limitando a saída de dados nomeados. A avaliação realizada não compara desempenho, privacidade ou utilidade entre as duas abordagens.
 
+Solid descentraliza o armazenamento pessoal em \textit{pods} e organiza dados segundo semântica voltada à Web \cite{sambra2016}. A contribuição desta instanciação concentra-se, em contraste, no \textit{gateway} MCP local que combina escopo, consentimento, transformação de saída e auditoria para leituras nomeadas. O contraste delimita funções arquiteturais, mas não demonstra superioridade sobre Solid, pois não há experimento comparativo.
+
+Desse modo, a contribuição situa-se na mediação operacional entre agentes e dados locais, de forma complementar à descentralização de treinamento e de armazenamento. Essa posição permanece restrita ao domínio avaliado de segredos e credenciais. A generalização para documentos e recuperação semântica ainda não é demonstrada.
 \section{Contribuições}
-% TODO Fase 4: organizar as contribuições como modelo, método e instanciação, conforme a taxonomia de March e Smith usada no Capítulo 3.
+As contribuições organizam-se segundo a taxonomia de March e Smith \cite{march1995}, já adotada no percurso metodológico. A organização distingue o desenho abstrato, o procedimento de mediação e sua concretização executável, evitando atribuir à instanciação capacidades previstas apenas na visão arquitetural.
+
+\begin{itemize}
+\item \textbf{Modelo}: arquitetura de referência \textit{Local-First} em quatro módulos, com uma fronteira lógica entre o agente externo e os quatro módulos locais: cofre, \textit{gateway}, mediação e auditoria. O modelo é concretizado no domínio de segredos e credenciais e não inclui isolamento de memória no SO, RAG ou índice vetorial na instância avaliada.
+\item \textbf{Método}: protocolo que autentica, valida, aplica escopos e o consentimento configurado, executa localmente, filtra a saída ANONYMIZED quando aplicável e registra a operação. Sua avaliação é artificial e somativa, limitada aos caminhos e às condições instrumentadas.
+\item \textbf{Instanciação}: protótipo Sovereign Vault e \textit{harness} que produzem evidência rastreável de latência interna e das sondas pré-especificadas. A instanciação integra armazenamento cifrado, \textit{gateway} MCP, modos de consentimento, filtro heurístico e auditoria com evidência de adulteração, com as qualificações da Tabela~\ref{tab:fronteira-evidencia}.
+\end{itemize}
+
+Há ainda uma contribuição metodológica na documentação do ciclo construir--avaliar por ADRs. A observação de que o modo reservado NATIVE podia degradar para acesso sem solicitação de consentimento conduz à correção do mecanismo de consentimento e à inclusão das sondas A9 e A10 na bateria. Esse encadeamento registra achado, decisão, correção e ampliação da avaliação sem converter a bateria finita em prova geral de segurança.
 
 \section{Limitações}
-% TODO Fase 4: consolidar as limitações. A seção ``Limitações e Trabalho Futuro'' do Capítulo 4 provavelmente deve migrar para este capítulo para evitar duplicação; não mover nesta fase.
+A validade externa é limitada pelo enquadramento artificial e somativo. A evidência de desempenho provém de uma sessão preliminar, sem IC, em cargas sintéticas e dependentes da máquina hospedeira; não inclui latência fim a fim, WAN, inferência, carga de produção, utilidade de tarefa ou decisão humana. O caminho stdio também não cronometra resolução de agente nem aplicação de escopos.
 
+A bateria adversarial é finita, pré-especificada e executada uma vez. Ela exercita chamadas de ferramenta, e não um LLM submetido a \textit{prompt injection}; usa política HITL simulada, não o controlador desktop real; e não cobre adversário adaptativo, \textit{fuzzing} da superfície JSON-RPC ou exfiltração por caminhos permitidos. O resultado não permite estimar taxa populacional nem atribuir causalmente cada bloqueio a um controle específico.
+
+O artefato restringe-se a um usuário, uma máquina e segredos ou credenciais acessados por nome. Processos sob a mesma conta, comprometimento do sistema operacional, inspeção de memória, dependências nativas e roubo de token ficam fora do limite avaliado; a separação entre contêineres é lógica, com uma única DEK ativa e sem isolamento por chave. Contêineres DIRECT dispensam consentimento por projeto, e a correção \textit{fail-closed} do \hyperref[nota:headless]{modo \textit{headless}} não transforma o modo \textit{headless} em caminho de consentimento humano.
+
+O uso sem retorno de bytes de chave não elimina o risco de o \textit{gateway} atuar como oráculo criptográfico, pois a autorização não está vinculada à referência de chave, ao hash do \textit{payload}, à semântica da operação, ao destinatário ou domínio e à identidade do agente. A auditoria detecta alteração em relação ao ponto de verificação local presente, mas não uma restauração completa e coerente do diretório. Nomes lógicos, modos, tamanhos e outros metadados também podem permanecer visíveis.
+
+O filtro ANONYMIZED opera somente sobre texto e cobre sete categorias heurísticas; as cargas medidas não representam documentos reais e não estabelecem precisão ou recall. Campos brasileiros relevantes, como RG, CEP, nomes e endereços, permanecem fora da detecção, assim como datas de nascimento e telefones sem formatação. Por isso, mascaramento parcial não implica anonimização, não identificabilidade ou conformidade à LGPD.
+
+Por fim, não há braço de comparação em nuvem, verificação de retenção ou descarte pelo provedor, contêineres de contexto, busca semântica ou embeddings locais. Essas ausências impedem responder por superioridade perante uma arquitetura em nuvem e por generalização da instanciação para documentos. Elas definem a agenda de continuidade, e não capacidades implícitas do protótipo atual.
 \section{Trabalhos Futuros}
-% TODO Fase 4: delimitar os trabalhos futuros a partir das limitações e do escopo então consolidado.
+A primeira prioridade empírica é executar a avaliação definitiva em perfil \codigo{release}, com $k\geq3$ sessões independentes, IC de 95\% por \textit{bootstrap} e regra explícita de \textit{warmup}/descarte. Cada sessão deve registrar SO/kernel, CPU, RAM, armazenamento, \codigo{rustc}, perfil, comando, modo de energia e data. Essa execução substitui a evidência preliminar somente depois da conferência dos CSVs e de seus resumos criptográficos.
+
+O protocolo de dois braços deve comparar o mesmo modelo e versão com acesso ao material sintético pelo gateway local e por um caminho de contexto em nuvem, com telemetria, \textit{baseline}, governança e plano estatístico definidos antes da execução. Em complemento, um estudo com participantes deve medir mediana, p95, \textit{timeouts} e negações do tempo de decisão humana para APPROVAL e OTP. Esses estudos permitem avaliar comparação e experiência, mas a retenção ou o descarte no provedor exige verificação própria e não decorre automaticamente do protocolo.
+
+A bateria de segurança deve incorporar o controlador desktop real, registro causal por sonda, adversário adaptativo, casos de exfiltração por operações permitidas e testes de entradas JSON-RPC malformadas ou superdimensionadas. \textit{Fuzzing} e execuções independentes ampliam a cobertura observada, sem converter resultados finitos em garantia universal. O tratamento do token também deve migrar para arquivo com permissão 0600 ou chaveiro do sistema operacional.
+
+O classificador determinístico de sensibilidade e consentimento adaptativo descrito no ADR-0013 permanece proposto e não implementado. Antes de qualquer alegação de eficácia, requer implementação com elevação apenas, falha fechada e limites de complexidade, além de conjunto rotulado, pré-registro dos pisos de precisão e recall, separação entre calibração e teste e sondas sobre WebSocket autenticado. Resultado abaixo dos pisos deve ser reportado como negativo, pois o mecanismo constitui uma rede de segurança de usabilidade para exposição acidental, e não um controle de segurança contra agente com escrita.
+
+Os detectores de PII devem ser ampliados e avaliados para dados brasileiros, incluindo RG, CEP, nomes e endereços, com precisão e recall por categoria em conjunto rotulado. Detectores ambíguos devem permanecer fora da elevação adaptativa até satisfazerem critério pré-especificado, e desempenho sintético deve conservar a ressalva de validade externa. Essa linha de trabalho reduz lacunas conhecidas do mascaramento, mas não estabelece conformidade à LGPD.
+
+Na camada criptográfica, a autorização deve ser vinculada à chave e ao uso pretendido, incluindo hash do \textit{payload}, semântica da operação, destinatário ou domínio e identidade do agente. Também cabe introduzir hierarquia de chaves por contêiner ou manter explicitamente a segmentação apenas lógica e avaliar controles de SO em múltiplas plataformas. Para a auditoria, uma âncora externa confiável, como registro de transparência remoto ou contador monotônico protegido, deve permitir distinguir restauração integral de continuidade legítima.
+
+Os contêineres de contexto descritos no ADR-0012 também permanecem propostos e não implementados. Sua avaliação futura abrange documentos textuais, índice vetorial e \textit{embeddings} no dispositivo, busca aproximada e filtragem de trechos recuperados antes da saída pelo \textit{gateway}. Essa extensão exige protocolo próprio de latência, cobertura adversarial da nova superfície e tratamento explícito do ciclo de vida do índice; somente depois desses resultados é possível discutir RAG como capacidade do artefato.
 
 \appendix
 \chapter{REPRODUTIBILIDADE DA EVIDÊNCIA ATUAL}
@@ -514,9 +553,12 @@ Os artefatos analisados estão versionados em \codigo{docs/thesis/evidence/}, no
 {\footnotesize\begin{verbatim}
 cargo run --release -p thesis-eval -- all --out target/thesis-eval --iterations 1000
 \end{verbatim}}
-O commit do repositório em que a execução preliminar foi produzida é \codigo{dfb0a49f7360aedf37ee89152b99e2d970b6cfd6}; o perfil é \codigo{release}; a plataforma registrada na documentação de avaliação é Linux 7.0, CPU 11th Gen Intel Core i7-11600H (12 threads) a 2,90 GHz, 30 GiB RAM e \codigo{rustc 1.96.1}, capturada em 31 jul. 2026. Os campos de armazenamento e modo de energia estão a finalizar na execução definitiva. Para ligar essa descrição definitivamente aos arquivos, registrar também SO/kernel, CPU, RAM, armazenamento, \codigo{rustc}, perfil, comando, modo de energia e data em cada execução final.
+A execução preliminar foi produzida a partir do commit \codigo{dfb0a49f7360}, alcançável pela etiqueta anotada \codigo{thesis-evidence-preliminary}. Esse commit não é ancestral do ramo principal: o código instrumentado evoluiu depois dele, de modo que os números aqui reportados correspondem a um estado anterior ao da versão entregue --- coerentemente com sua classificação como execução preliminar. A execução definitiva será produzida a partir de um estado publicado do ramo principal e receberá etiqueta própria. O perfil é \codigo{release}; a plataforma registrada na documentação de avaliação é Linux 7.0, CPU 11th Gen Intel Core i7-11600H (12 threads) a 2,90 GHz, 30 GiB RAM e \codigo{rustc 1.96.1}, capturada em 31 jul. 2026. Os campos de armazenamento e modo de energia estão a finalizar na execução definitiva. Para ligar essa descrição definitivamente aos arquivos, registrar também SO/kernel, CPU, RAM, armazenamento, \codigo{rustc}, perfil, comando, modo de energia e data em cada execução final.
 
 {\footnotesize\begin{verbatim}
+commit:          dfb0a49f7360aedf37ee89152b99e2d970b6cfd6
+tag:             thesis-evidence-preliminary
+
 latency.csv:     2e914c1bbd7b290c9aa4c5e143227f08b6f581884d436ccbbd965df7d2649adc
 adversarial.csv: 845a1d042ba68d52123d726c415dc2b21e50f39e3f708ccfc3a18788d2e81d5f
 micro.csv:       d526ed70ebf659e72247a53ddd4de27dbf2a3ffc789c421b1d4e95fc056bf4c6
