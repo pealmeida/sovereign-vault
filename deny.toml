@@ -55,5 +55,8 @@ allow = [
   "CC0-1.0",
   "BSL-1.0",
   "OpenSSL",
+  # webpki-roots (transitive: reqwest -> hyper-rustls). Permissive data-sharing
+  # licence for the Mozilla CA root bundle; compatible with Apache-2.0.
+  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
