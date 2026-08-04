@@ -32,29 +32,26 @@ definitiva os substitui no texto e no apêndice, e recebe etiqueta própria.
 
 ---
 
-## Bloqueante: o harness ainda não suporta este protocolo
+## Harness: suporte ao protocolo (atualizado em 04/08/2026)
 
-Verificado em `apps/thesis-eval/src/main.rs`: o binário aceita **apenas** `--out`
-e `--iterations` (linhas 61–62). Não existe `--warmup`, não existe `--seed`, e
-não há descarte de iterações em lugar nenhum do código.
+Na versão original deste protocolo, esta seção declarava **bloqueante** o fato
+de o binário aceitar apenas `--out` e `--iterations`, sem `--warmup`, sem
+`--seed` e sem descarte de iterações. Essa lacuna foi fechada no artefato
+(commit `e75ad60`, PR #70): os itens (1) e (2) abaixo estão implementados com
+testes de unidade, e o item (3) segue o caminho de script externo já previsto.
+**Não há mais bloqueante de instrumento** — resta executar o protocolo (§4) no
+*host* estabilizado.
 
-Isso é uma lacuna real entre o que a tese promete e o que o artefato faz: o
-próprio texto declara que a execução definitiva exige "regra explícita de
-\textit{warmup}/descarte". Hoje o harness não sabe executá-la.
-
-| # | Falta | Onde | Necessário para |
+| # | Falta original | Estado | Onde |
 |---|---|---|---|
-| 1 | `--warmup N` com descarte das N primeiras iterações por célula | `run_latency`, `run_micro` | §2.4 |
-| 2 | `--seed` e randomização da ordem das condições | `run_latency` | §2.2 |
-| 3 | Emissão de `run-metadata.json` | ambos | §3.6 |
+| 1 | `--warmup N` com descarte das N primeiras iterações por célula | ✅ implementado | `run_latency` executa o *warmup* em um servidor sem `TimingSink`, de modo que as chamadas descartadas jamais entram no buffer de medição; `run_micro` descarta via `micro_warmup_iterations`. O descarte efetivo é auditável em `latency-metadata.csv`/`micro-metadata.csv` (`apps/thesis-eval/src/main.rs`) |
+| 2 | `--seed` e randomização da ordem das condições | ✅ implementado | `latency_cells(seed)` permuta as 12 células com um gerador xorshift64 local e auditável, sem nova dependência; `seed` e `execution_order` são gravados em `latency-metadata.csv`; ordem fixa preservada quando `--seed` é omitido, com testes de unidade |
+| 3 | Emissão de `run-metadata.json` | ✅ coberta por script | `docs/thesis/evidence/collect-metadata.sh` (§3) — o caminho mínimo previsto, sem mudança de código nem nova dependência |
 
-**Ordem correta de trabalho:** implementar (1) e (2) — (3) tem alternativa via
-script externo — e só então executar o protocolo. Executá-lo antes produziria
-dados que não cumprem a régua declarada, o que é pior do que não executar.
-
-Enquanto (1) e (2) não existirem, a alternativa de pós-processamento descrita no
-§2.6 é o caminho degradado: ela é possível, mas exige declarar no texto que o
-descarte foi feito fora do instrumento, e não pelo instrumento.
+A agregação de §5 também já tem instrumento: `docs/thesis/evidence/aggregate.py`
+(somente biblioteca padrão) aplica o *bootstrap* sobre as médias de sessão, o IC
+de Wilson do adversarial e reporta o critério de aceitação de §6 sem descartar
+nada (§5.4).
 
 ---
 
@@ -158,9 +155,9 @@ descarte foi feito fora do instrumento, e não pelo instrumento.
 
 - A ordem das 12 células **dentro de cada sessão** deve ser **randomizada** por
   sessão, usando uma *seed* declarada no `run-metadata.json`.
-- O harness atual executa as células em **ordem fixa** (modo × tamanho, na
-  ordem do código em `run_latency`). **Isso requer alteração em
-  `apps/thesis-eval`** — ver §2.6.
+- O binário suporta essa randomização via `--seed` (ver §2.6); sem a bandeira,
+  a ordem permanece fixa (modo × tamanho, na ordem do código), o que preserva
+  a comparabilidade com a execução preliminar.
 
   > *Justificativa:* ordem fixa confunde efeito de aquecimento/deriva com efeito
   de condição; randomização distribui os efeitos residuais de tempo entre as
@@ -195,11 +192,12 @@ descarte foi feito fora do instrumento, e não pelo instrumento.
 
 - Para cada célula, as **primeiras 200 iterações** são executadas mas **não**
   entram no resumo estatístico gravado no CSV.
-- O harness atual **não separa** *warmup* do corpus medido: ele faz uma única
-  leitura não cronometrada (`let _ = handle.read_file(...)`) na célula de
-  *micro*, mas na célula de *latency* **não há descarte** — todas as
-  `iterations` leituras vão para o `TimingSink`. **Isso requer alteração em
-  `apps/thesis-eval`** — ver §2.6.
+- O binário implementa o descarte via `--warmup N` (ver §2.6): em `run_latency`
+  as N chamadas de aquecimento passam por um servidor sem `TimingSink` e não
+  entram no `Vec` que alimenta o resumo; em `run_micro` as N chamadas iniciais
+  são descartadas antes do laço medido. Sem a bandeira, preserva-se o
+  comportamento legado (1 leitura isolada de aquecimento em *micro* e nenhum
+  descarte em *latency*), compatível com a execução preliminar.
 
   > *Justificativa:* sem descarte explícito, as primeiras iterações (cache frio,
   *page faults*, *turbo* subindo) ficam misturadas e inflacionam média e p95.
@@ -218,33 +216,46 @@ descarte foi feito fora do instrumento, e não pelo instrumento.
   > *Justificativa:* a bateria é pequena (n=12 por sessão); o IC de Wilson é o
   recomendado para proporções com n pequeno e não recorre à normalidade.
 
-### 2.6 Alterações necessárias no harness
+### 2.6 Alterações no harness — estado: implementadas
 
-As mudanças a seguir **requerem alteração em `apps/thesis-eval`** e devem ser
-feitas e testadas **antes** de iniciar a sessão s01. Sem elas, o protocolo não
-é cumprível com o binário atual:
+As mudanças abaixo, originalmente listadas como pré-requisito de código, estão
+**implementadas e testadas** no binário atual (`apps/thesis-eval/src/main.rs`,
+commit `e75ad60`, PR #70):
 
-1. **Aceitar `--warmup N`** em `run_latency` e `run_micro`: executar `N`
-   iterações adicionais por célula, registrando-as no `TimingSink` mas
-   descartando-as do `Vec` que alimenta `summarize`. Concretamente: chamar
-   `drive_reads_stdio` uma primeira vez com `warmup` iterações e descartar os
-   `StageTimings` resultantes, depois chamar com `iterations` e guardar.
+1. **`--warmup N`** em `run_latency` e `run_micro`: executa `N`
+   iterações adicionais por célula antes do laço medido. Em `run_latency`, o
+   aquecimento roda em um servidor dedicado **sem** `TimingSink` — as mesmas
+   chamadas de gateway e cargas são exercitadas, mas as medições descartadas
+   jamais entram no buffer que alimenta `summarize`. Em `run_micro`, as `N`
+   primeiras chamadas de cada célula são descartadas antes do laço
+   (`micro_warmup_iterations`). O valor efetivo de *warmup* é gravado em
+   `latency-metadata.csv`/`micro-metadata.csv`.
 
-2. **Aceitar `--seed S`** e usar `S` (via `rand` ou um *shuffle*
-   determinístico) para permutar a ordem do loop `for (name, _mode) in modes`
-   em `run_latency`. Registrar `S` na saída.
+2. **`--seed S`** em `run_latency`: permuta a ordem das 12 células via
+   `latency_cells(seed)`, usando um gerador xorshift64 local e auditável — sem
+   adicionar a dependência `rand` ao manifesto. `S` e a posição de cada célula
+   na sequência (`execution_order`) são gravados em `latency-metadata.csv`.
+   Sem `--seed`, a ordem original é preservada. Testes de unidade cobrem:
+   ausência de *seed* preserva a ordem original; mesma *seed* reproduz a mesma
+   ordem; *seed* distinta muda a ordem; `--warmup 0` mantém a contagem medida.
 
-3. **Escrever `run-metadata.json`** (§3) — idealmente o próprio binário coleta
-   `rustc`, data, etc.; o script em §3 é o caminho mínimo caso o binário não o
-   faça.
+3. **`run-metadata.json`** (§3): coberto pelo script
+   `docs/thesis/evidence/collect-metadata.sh`, o caminho mínimo previsto —
+   decisão deliberada para não ampliar a superfície de dependências do
+   artefato (`deny.toml`, `AGENTS.md` §6) com crates de inventário de *host*.
 
-> **Recomendação operacional:** implementar (1) e (2) no harness é mais
-> robusto do que embarcar a lógica em *shell*. O script de §3 pode suprir (3)
-> sem mudança de código. Se o autor preferir não alterar o harness, **o
-> protocolo não pode ser cumprido como escrito** — registrar a limitação na
-> seção de riscos (§7) e recuar para ordem fixa + *warmup* externo (descartar
-   as primeiras 200 linhas por célula em pós-processamento), declarando isso
-> explicitamente no texto.
+   > **O harness não emite `run-metadata.json`.** Não há chamada ao script em
+   > `apps/thesis-eval/src/main.rs`; o acoplamento é operacional, não
+   > automático. Rodar `collect-metadata.sh` **antes** de cada sessão, no
+   > diretório da sessão correspondente, é etapa **obrigatória** do protocolo
+   > (§3.2), e não uma conveniência. Sem ela, `aggregate.py` aborta em §6.5 com
+   > `run-metadata.json ausente (§3)` e a sessão é perdida.
+
+> **Variante degradada (obsoleta):** a alternativa de pós-processamento
+> (ordem fixa + descarte externo das primeiras 200 linhas por célula, com
+> declaração explícita no texto) deixa de ser necessária, pois o descarte e a
+> randomização são feitos pelo próprio instrumento. Permanece registrada aqui
+> apenas como referência histórica da decisão.
 
 ---
 
@@ -331,8 +342,7 @@ bash docs/thesis/evidence/collect-metadata.sh \
     target/thesis-eval "$SESSION" "$EVAL_TAG" "$CMD"
 ```
 
-> O `--warmup` e `--seed` **pressupõem a alteração do harness de §2.6**. Sem
-> ela, remover essas bandeiras e aplicar o descarte em pós-processamento (§4).
+> As bandeiras `--warmup` e `--seed` são suportadas pelo binário atual (§2.6).
 
 ---
 
@@ -548,7 +558,7 @@ um agente editar o texto.
 | Energia em modo econômico em alguma sessão | Campo `power_mode` divergente entre `run-metadata.json` | Descartar a sessão, refazer com modo fixo. |
 | Build concorrente / IDE indexando | Picos no p95 de uma sessão; CV alto no §6.1 | Refazer a sessão após fechar o processo intruso. |
 | `rustc` diferente entre sessões | Campo `toolchain.rustc` divergente | Descartar as divergentes; todas as sessões devem usar o mesmo compilador. |
-| Harness não implementa `--warmup`/`--seed` (§2.6 não feito) | Falha de parse do argumento | **Não prosseguir** com o protocolo como escrito; recuar para a variante de pós-processamento e declarar. |
+| ~~Harness não implementa `--warmup`/`--seed`~~ (resolvido em `e75ad60`, PR #70) | — | Risco aposentado: o binário suporta ambas as bandeiras com testes de unidade (§2.6). |
 | Uma sonda adversarial dá veredito diferente entre sessões | Linha com `pass` variando em `adversarial.csv` entre sessões | Investigar não-determinismo antes de reportar; não mascarar com média. |
 | Alteração de código entre a etiqueta e a execução | `git status` não-vazio no início da sessão | Abortar; a execução precisa vir de um estado publicado e imutável. |
 | `numpy`/`scipy` indisponíveis no agregador | `ImportError` no §5 | Reescrever o agregador com `random` da biblioteca padrão; **não** trocar *bootstrap* por normal sem justificar. |

@@ -163,10 +163,10 @@ Fonte: "Dicas para a Escrita Científica" da disciplina.
 |---|---|---|
 | Linguagem impessoal — nunca "eu"/"nós" | ✅ | auditado, sem ocorrências |
 | Tempo verbal presente (futuro só em metodologia) | ✅ | auditado |
-| Sigla definida na primeira ocorrência | ⚠️ **parcial** | 2 de 21 (RFC, WAN) só ocorrem em tabela e bibliografia; a lista de siglas cobre |
-| Estrangeirismos em itálico | ⚠️ verificar | auditoria A4 apontou ~12 inconsistências; **não corrigidas** |
-| Evitar parágrafos de uma frase | ⚠️ verificar | A4 apontou 5 ocorrências; **não corrigidas** |
-| Não usar inglês havendo tradução | ⚠️ verificar | A4 apontou anglicismos evitáveis |
+| Sigla definida na primeira ocorrência | ✅ | auditado por varredura em 04/08: todas as siglas do corpo têm expansão na primeira ocorrência textual (exceto rótulos de figura, onde a expansão vem na prosa adjacente) |
+| Estrangeirismos em itálico | ✅ | A4 corrigida; critério auditado (sem tradução corrente → itálico; jargão incorporado, como *gateway*, → redondo) |
+| Evitar parágrafos de uma frase | ✅ | §Considerações Iniciais enriquecida (R10-M4); varredura de 04/08 encontra 1 remanescente em prosa (l. 189, ressalva deliberada de fronteira de alegação) — os demais são chamadas de lista, equações e opções de figura |
+| Não usar inglês havendo tradução | ✅ | *trade-off* → relação de compromisso; siglas expandidas em português |
 | Toda figura/tabela/equação referenciada **e explicada** | ✅ | 0 órfãos: 4 figuras, 5 tabelas, 2 equações |
 | Sem plágio | ⚠️ **[CONFIRMAR]** | ver §7 |
 
@@ -184,7 +184,7 @@ São de baixo risco individual, mas somam.
 | Sobrenome em versalete/maiúscula | ✅ | conferido nas 23 entradas |
 | Título em itálico | ✅ | conferido |
 | "et al." acima de 3 autores | ✅ | corrigido em `hevner2004` |
-| DOI quando disponível | ⚠️ | A4 apontou 7 entradas sem DOI |
+| DOI quando disponível | ✅ | 9 entradas com DOI. As restantes são atas de congresso (NeurIPS), normas RFC, livros e fontes sem identificador persistente atribuído — nenhum DOI foi inventado. Resolver cada DOI contra `doi.org` antes do depósito (R9-7) |
 | Data de acesso em fonte eletrônica | ✅ | presente nas entradas com URL |
 | Toda citação no texto tem entrada na lista | ✅ | 0 citações indefinidas na compilação |
 
@@ -267,10 +267,12 @@ Agora é viável: existe uma tag no repositório.
 | Dados brutos versionados | ✅ | `docs/thesis/evidence/` |
 | Resumos criptográficos publicados | ✅ | 3/3 conferem |
 | Comando de reprodução registrado | ✅ | no apêndice |
-| Ambiente registrado | ⚠️ parcial | falta armazenamento e modo de energia |
-| **k ≥ 3 sessões independentes** | ❌ **1 sessão** | **Bloqueante para a versão final** |
-| **IC de 95% por *bootstrap*** | ❌ ausente | **Bloqueante para a versão final** |
-| Regra de *warmup*/descarte | ✅ instrumento pronto | `--warmup` implementado; falta executar |
+| Ambiente registrado | ✅ instrumento pronto | `collect-metadata.sh` exige `power_mode` como argumento obrigatório e falha se qualquer campo de *host* vier vazio ou `n/a`; `aggregate.py` veta `n/a`/*placeholder* em §6.5 |
+| **k ≥ 3 sessões independentes** | ❌ **1 sessão** | **Bloqueante para a versão final** — instrumento pronto; falta executar |
+| **IC de 95% por *bootstrap*** | ❌ ausente | **Bloqueante para a versão final** — `aggregate.py` pronto (bootstrap sobre médias de sessão, B=10.000, semente declarada); emite ressalva de IC indicativo quando k<5 |
+| Regra de *warmup*/descarte | ✅ instrumento pronto | `--warmup` implementado; documentado como *override* acima de um piso de 1 chamada de *priming* (R9-12) |
+| Separação política × falha de transporte | ✅ | sondas com `transport_error` excluídas do numerador **e** do denominador de ambas as taxas e reportadas à parte (R9-5) |
+| Deriva térmica (§6.2) | ✅ instrumento pronto | Spearman aplicado só com k≥4; em k=3 emite ressalva de "deriva não verificada" em vez de falso positivo (R9-4) |
 | Proveniência do código medido | ⚠️ | o commit da execução preliminar **não é ancestral da `main`**; declarado no apêndice |
 
 **Estado:** a evidência atual está corretamente rotulada como preliminar em todo
@@ -315,10 +317,15 @@ Exigência recorrente nas três disciplinas de Metodologia:
 **Recomendados (fortalecem, não bloqueiam):**
 
 8. DOI via Zenodo.
-9. Migração para `abntex2cite`.
-10. Correções de forma pendentes da auditoria A4 (itálico, parágrafos de uma frase, anglicismos).
-11. Licença do texto acadêmico.
-12. DOIs faltantes em 7 referências.
+9. Migração para `abntex2cite` — decidir §0.4 primeiro.
+10. Licença do texto acadêmico.
+11. Resolver cada DOI contra `doi.org` antes do depósito e anexar o `title` retornado (R9-7).
+
+**Fechados na rodada R9–R12 (04/08/2026):** correções de forma da auditoria A4
+(itálico, parágrafos de uma frase, anglicismos, expansão de siglas), DOIs
+faltantes onde há identificador atribuído, e todos os achados acionáveis dos
+cinco pareceres — ver
+[response-to-reviewers-r9-r12.md](review/response-to-reviewers-r9-r12.md).
 
 ---
 

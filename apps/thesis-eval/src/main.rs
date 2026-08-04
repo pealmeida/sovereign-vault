@@ -26,6 +26,13 @@
 //! cargo run -p thesis-eval -- all           [--out DIR] [--iterations N] [--warmup N] [--seed N]
 //! ```
 //!
+//! `--warmup N` is an override above a floor of one discarded call, not an
+//! absolute count: the microbenchmark always performs one legacy priming read
+//! per size, so `--warmup 0` (and the absent flag) still discards that single
+//! call. Any `N >= 1` discards exactly `N`. The latency arm discards its warmup
+//! on a server built without a `TimingSink`, so discarded calls never reach the
+//! measurement buffer.
+//!
 //! The vault is created in a throwaway temp directory with passphrase custody
 //! and removed on exit; nothing touches the user's real vault.
 
@@ -929,21 +936,30 @@ async fn run_adversarial(out: &Path) {
             Creds::Scoped => (Some(agent_id.as_str()), token.as_str()),
             Creds::Default => (None, PAIRING_SECRET),
         };
-        let blocked = match run_probe(&url, id, tok, probe.tool, &probe.arguments).await {
-            Ok(is_error) => is_error,
-            Err(e) => {
-                // A transport/pairing rejection is also a block.
-                eprintln!("   {} transport note: {e}", probe.id);
+        let outcome = run_probe(&url, id, tok, probe.tool, &probe.arguments).await;
+        // A transport failure is infrastructure noise, not a policy decision: it
+        // is recorded separately so the aggregator can exclude it from both the
+        // block rate and the availability rate instead of silently inflating
+        // either one (see docs/thesis/evidence/aggregate.py).
+        let transport_error = match &outcome {
+            ProbeOutcome::TransportError(e) => {
+                eprintln!("   {} transport error: {e}", probe.id);
                 true
             }
+            _ => false,
         };
+        let blocked = matches!(
+            outcome,
+            ProbeOutcome::Blocked | ProbeOutcome::TransportError(_)
+        );
         let expected_block = probe.class == Class::Attack;
         results.push(ProbeResult {
             id: probe.id,
             class: probe.class,
             description: probe.description,
             blocked,
-            pass: blocked == expected_block,
+            transport_error,
+            pass: !transport_error && blocked == expected_block,
         });
     }
 
@@ -958,18 +974,39 @@ async fn run_adversarial(out: &Path) {
     );
 }
 
-/// Open one WS connection, pair, issue one tool call, return whether the tool
-/// result was an error (i.e. the request was blocked).
+/// Outcome of one probe, separating policy decisions from infrastructure noise.
+///
+/// `Blocked` and `Allowed` are verdicts the server produced; `TransportError`
+/// means the exchange never reached a verdict (connect, send or stream
+/// failure). Conflating the third case with `Blocked` — as the harness did
+/// before — makes a flaky socket look like a working control.
+enum ProbeOutcome {
+    Blocked,
+    Allowed,
+    TransportError(String),
+}
+
+/// Open one WS connection, pair, issue one tool call, and classify the result.
+///
+/// A pairing rejection is a policy decision (the server refused the
+/// credentials), so it maps to `Blocked`, not to `TransportError`.
 async fn run_probe(
     url: &str,
     agent_id: Option<&str>,
     token: &str,
     tool: &str,
     arguments: &Value,
-) -> Result<bool, String> {
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
+) -> ProbeOutcome {
+    macro_rules! transport {
+        ($e:expr, $ctx:literal) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) => return ProbeOutcome::TransportError(format!("{}: {e}", $ctx)),
+            }
+        };
+    }
+
+    let (mut ws, _resp) = transport!(tokio_tungstenite::connect_async(url).await, "connect");
 
     // Pair.
     let pair = match agent_id {
@@ -978,12 +1015,14 @@ async fn run_probe(
         }
         None => json!({"jsonrpc":"2.0","id":0,"method":"vault.pair","params":{"secret":token}}),
     };
-    ws.send(Message::Text(pair.to_string().into()))
-        .await
-        .map_err(|e| format!("send pair: {e}"))?;
-    let pair_resp = next_json(&mut ws).await?;
+    transport!(
+        ws.send(Message::Text(pair.to_string().into())).await,
+        "send pair"
+    );
+    let pair_resp = transport!(next_json(&mut ws).await, "pair response");
     if pair_resp.get("error").is_some() || pair_resp["result"]["paired"] != json!(true) {
-        return Err("pairing rejected".into());
+        // The server answered and refused: a policy block, not a transport fault.
+        return ProbeOutcome::Blocked;
     }
 
     // Tool call.
@@ -991,17 +1030,18 @@ async fn run_probe(
         "jsonrpc":"2.0","id":1,"method":"tools/call",
         "params": {"name": tool, "arguments": arguments}
     });
-    ws.send(Message::Text(call.to_string().into()))
-        .await
-        .map_err(|e| format!("send call: {e}"))?;
-    let resp = next_json(&mut ws).await?;
+    transport!(
+        ws.send(Message::Text(call.to_string().into())).await,
+        "send call"
+    );
+    let resp = transport!(next_json(&mut ws).await, "call response");
     let _ = ws.send(Message::Close(None)).await;
 
     // A JSON-RPC error or a tool result flagged isError both mean "blocked".
-    if resp.get("error").is_some() {
-        return Ok(true);
+    if resp.get("error").is_some() || resp["result"]["isError"] == json!(true) {
+        return ProbeOutcome::Blocked;
     }
-    Ok(resp["result"]["isError"] == json!(true))
+    ProbeOutcome::Allowed
 }
 
 async fn next_json<S>(ws: &mut S) -> Result<Value, String>
@@ -1026,27 +1066,54 @@ struct ProbeResult {
     class: Class,
     description: &'static str,
     blocked: bool,
+    /// The exchange never reached a server verdict. Excluded from both rates.
+    transport_error: bool,
     pass: bool,
 }
 
-fn write_adversarial_outputs(out: &Path, results: &[ProbeResult], audited: usize) {
+/// Counts behind the two reported rates, with transport failures set aside.
+struct AdversarialTally {
+    blocked_attacks: usize,
+    attack_trials: usize,
+    allowed_controls: usize,
+    control_trials: usize,
+    transport_errors: usize,
+}
+
+/// Probes that failed in transport carry no policy information, so they are
+/// dropped from the numerator *and* the denominator of both rates and reported
+/// separately as infrastructure failures.
+fn tally_adversarial(results: &[ProbeResult]) -> AdversarialTally {
     let attacks: Vec<&ProbeResult> = results
         .iter()
-        .filter(|r| r.class == Class::Attack)
+        .filter(|r| r.class == Class::Attack && !r.transport_error)
         .collect();
     let controls: Vec<&ProbeResult> = results
         .iter()
-        .filter(|r| r.class == Class::Control)
+        .filter(|r| r.class == Class::Control && !r.transport_error)
         .collect();
-    let blocked_attacks = attacks.iter().filter(|r| r.blocked).count();
-    let allowed_controls = controls.iter().filter(|r| !r.blocked).count();
-    let block_rate = pct(blocked_attacks, attacks.len());
-    let availability = pct(allowed_controls, controls.len());
+    AdversarialTally {
+        blocked_attacks: attacks.iter().filter(|r| r.blocked).count(),
+        attack_trials: attacks.len(),
+        allowed_controls: controls.iter().filter(|r| !r.blocked).count(),
+        control_trials: controls.len(),
+        transport_errors: results.iter().filter(|r| r.transport_error).count(),
+    }
+}
 
-    let mut csv = String::from("id,class,blocked,expected_block,pass,description\n");
+fn write_adversarial_outputs(out: &Path, results: &[ProbeResult], audited: usize) {
+    let tally = tally_adversarial(results);
+    let transport_errors = tally.transport_errors;
+    let blocked_attacks = tally.blocked_attacks;
+    let allowed_controls = tally.allowed_controls;
+    let block_rate = pct(blocked_attacks, tally.attack_trials);
+    let availability = pct(allowed_controls, tally.control_trials);
+
+    let mut csv =
+        String::from("id,class,blocked,transport_error,expected_block,pass,description\n");
     for r in results {
         csv.push_str(&format!(
-            "{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{}\n",
             r.id,
             if r.class == Class::Attack {
                 "attack"
@@ -1054,6 +1121,7 @@ fn write_adversarial_outputs(out: &Path, results: &[ProbeResult], audited: usize
                 "control"
             },
             r.blocked,
+            r.transport_error,
             r.class == Class::Attack,
             r.pass,
             r.description,
@@ -1066,9 +1134,9 @@ fn write_adversarial_outputs(out: &Path, results: &[ProbeResult], audited: usize
     md.push_str(&format!(
         "**Block rate:** {blocked_attacks}/{} attacks blocked ({block_rate:.1}%). \
          **Availability:** {allowed_controls}/{} legitimate requests allowed ({availability:.1}%). \
+         **Transport errors (excluded from both rates):** {transport_errors}. \
          {audited} events written to the tamper-evident audit log.\n\n",
-        attacks.len(),
-        controls.len(),
+        tally.attack_trials, tally.control_trials,
     ));
     md.push_str("| Probe | Class | Description | Blocked | Expected | Verdict |\n");
     md.push_str("|---|---|---|---|---|---|\n");
@@ -1082,21 +1150,33 @@ fn write_adversarial_outputs(out: &Path, results: &[ProbeResult], audited: usize
                 "control"
             },
             r.description,
-            if r.blocked { "yes" } else { "no" },
+            if r.transport_error {
+                "n/a (transport)"
+            } else if r.blocked {
+                "yes"
+            } else {
+                "no"
+            },
             if r.class == Class::Attack {
                 "block"
             } else {
                 "allow"
             },
-            if r.pass { "PASS" } else { "FAIL" },
+            if r.transport_error {
+                "TRANSPORT ERROR"
+            } else if r.pass {
+                "PASS"
+            } else {
+                "FAIL"
+            },
         ));
     }
     let _ = fs::write(out.join("adversarial.md"), &md);
 
     println!(
-        "   block rate {blocked_attacks}/{} ({block_rate:.1}%), availability {allowed_controls}/{} ({availability:.1}%)",
-        attacks.len(),
-        controls.len()
+        "   block rate {blocked_attacks}/{} ({block_rate:.1}%), availability {allowed_controls}/{} ({availability:.1}%), transport errors {transport_errors}",
+        tally.attack_trials,
+        tally.control_trials
     );
     for r in results {
         println!(
@@ -1108,7 +1188,13 @@ fn write_adversarial_outputs(out: &Path, results: &[ProbeResult], audited: usize
                 "control"
             },
             r.blocked,
-            if r.pass { "PASS" } else { "FAIL" }
+            if r.transport_error {
+                "TRANSPORT ERROR"
+            } else if r.pass {
+                "PASS"
+            } else {
+                "FAIL"
+            }
         );
     }
 }
@@ -1167,5 +1253,67 @@ mod tests {
         assert_eq!(measured.len(), iterations);
         assert_eq!(calls, iterations);
         assert_eq!(micro_warmup_iterations(0), 1);
+    }
+
+    #[test]
+    fn warmup_is_an_override_above_a_floor_of_one_discarded_call() {
+        // `--warmup 0` and an absent flag share the legacy one-shot priming
+        // read; any explicit N >= 1 discards exactly N.
+        assert_eq!(micro_warmup_iterations(0), 1);
+        assert_eq!(micro_warmup_iterations(1), 1);
+        assert_eq!(micro_warmup_iterations(200), 200);
+    }
+
+    fn probe_result(
+        id: &'static str,
+        class: Class,
+        blocked: bool,
+        transport_error: bool,
+    ) -> ProbeResult {
+        ProbeResult {
+            id,
+            class,
+            description: "fixture",
+            blocked,
+            transport_error,
+            pass: !transport_error,
+        }
+    }
+
+    #[test]
+    fn transport_errors_leave_both_rates_untouched() {
+        let clean = vec![
+            probe_result("A1", Class::Attack, true, false),
+            probe_result("A2", Class::Attack, true, false),
+            probe_result("C1", Class::Control, false, false),
+        ];
+        // Same battery plus one attack and one control that never reached a
+        // server verdict.
+        let noisy = vec![
+            probe_result("A1", Class::Attack, true, false),
+            probe_result("A2", Class::Attack, true, false),
+            probe_result("C1", Class::Control, false, false),
+            probe_result("A3", Class::Attack, true, true),
+            probe_result("C2", Class::Control, true, true),
+        ];
+
+        let base = tally_adversarial(&clean);
+        let with_noise = tally_adversarial(&noisy);
+
+        assert_eq!(base.transport_errors, 0);
+        assert_eq!(with_noise.transport_errors, 2);
+        // Excluded from numerator *and* denominator of both rates.
+        assert_eq!(with_noise.attack_trials, base.attack_trials);
+        assert_eq!(with_noise.blocked_attacks, base.blocked_attacks);
+        assert_eq!(with_noise.control_trials, base.control_trials);
+        assert_eq!(with_noise.allowed_controls, base.allowed_controls);
+        assert_eq!(
+            pct(with_noise.blocked_attacks, with_noise.attack_trials),
+            100.0
+        );
+        assert_eq!(
+            pct(with_noise.allowed_controls, with_noise.control_trials),
+            100.0
+        );
     }
 }
