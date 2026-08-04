@@ -16,6 +16,15 @@ decisão do autor. Nenhum bloqueante permanece aberto no artefato ou no texto.
 | [R10](R10-full-metodologia-glm52.md) | Metodologia / DSR (texto integral) | `zai/glm-5.2` | aprovado, sem bloqueantes |
 | [R11](R11-full-seguranca-glm51.md) | Segurança / ameaças | `zai/glm-5.1` | nenhum invariante quebrado |
 | [R12](R12-full-privacidade-glm47.md) | Privacidade / LGPD | `zai/glm-4.7` | aprovado com refinamentos menores |
+| R13 (nesta resposta) | Agregador de evidência | `zai/glm-4.7` | 2 de 3 achados aceitos |
+| R14 (nesta resposta) | Texto, ângulo de banca hostil | `zai/glm-4.7` | aprovado, zero achados |
+
+> **Nota de execução.** R13 e R14 foram executados pelo runtime AnyModel no
+> motor `direct` (`--engine direct`, provedor `zai`). O motor `codex` está
+> indisponível nesta máquina: o ciclo de vida do `codex app-server` é suportado
+> apenas em Unix e a estação do autor é Windows, de modo que toda invocação
+> falha com `codex app-server client is closed`. O caminho `direct` não depende
+> desse daemon.
 
 R9 levantou a única lacuna de processo da rodada: o diff literal não chegou ao
 parecerista, de modo que a pergunta de integridade científica (Q1) ficou
@@ -173,6 +182,32 @@ própria correção. Três achados:
    mudança. Teste `test_percentile_matches_numpy_default_convention` fixa a
    equivalência (pula se numpy não estiver instalado, em vez de aprovar em
    silêncio).
+
+### R14 — revisão adversarial do texto (`zai/glm-4.7`). **[APROVADO — zero achados]**
+
+Rodada de confirmação sobre `paper.tex` já corrigido, com instrução explícita de
+declarar ausência de achado em vez de inventar. Veredito: **aprovado**, nenhum
+achado material. O parecer confirma qualificação consistente dos resultados
+preliminares em Resumo, Abstract, Cap. 4 e Cap. 5; siglas definidas na primeira
+ocorrência; figuras e tabelas referenciadas e explicadas; a seção Considerações
+Iniciais descrevendo com precisão o que o capítulo entrega; e a leitura da
+Figura 3.1 correspondendo ao conteúdo visual.
+
+Verificação mecânica independente, feita em paralelo e convergente:
+
+| Verificação | Resultado |
+|---|---|
+| Cobertura de qualificação em toda menção a 10/10, 2/2, p95 e *microbenchmark* | qualificada em todas as ocorrências de prosa |
+| Valores da prosa × `micro.csv` versionado | 6/6 conferem exatamente (4,14 / 4,97 / 16,82 / 1,17 / 7,86 / 125,08) |
+| `\ref` × `\label` | 12 × 12, nenhuma pendente, nenhum órfão |
+| `\cite` × `\bibitem` | nenhuma citação órfã, nenhuma entrada não citada |
+| Expansão de siglas no corpo | todas expandidas na primeira ocorrência textual |
+
+**Correção própria decorrente:** a frase que reporta as medições isoladas por
+componente carregava a ressalva de escopo ("fora do *gateway*, não somar à
+tabela") mas não o estado preliminar — que só constava da legenda da figura
+vizinha. Um examinador poderia citar a frase isolada como se os números fossem
+definitivos. O estado preliminar passou a acompanhar os próprios números.
 
 ---
 
