@@ -1,0 +1,50 @@
+cff-version: 1.2.0
+title: "Sovereign Vault"
+message: >-
+  If you use this software or refer to it in academic work, please cite it
+  using the metadata below.
+type: software
+authors:
+  - given-names: Pedro Henrique Almeida Prado
+    family-names: de Oliveira
+    affiliation: >-
+      Universidade de São Paulo, Instituto de Ciências Matemáticas e de
+      Computação (ICMC)
+repository-code: "https://github.com/pealmeida/sovereign-vault"
+abstract: >-
+  A Local-First architecture that mediates AI-agent access to local secrets and
+  credentials. Combines an encrypted vault, an MCP (Model Context Protocol)
+  gateway, capability scopes, consent modes, and tamper-evident auditing. The
+  repository is the Design Science Research instantiation artifact of an MBA
+  thesis on data sovereignty for personal AI agents.
+keywords:
+  - data sovereignty
+  - local-first
+  - model context protocol
+  - privacy
+  - rust
+  - design science research
+license: Apache-2.0
+version: 0.1.0
+# TODO: adicionar `date-released` ao criar a primeira tag de release.
+# TODO: adicionar `doi` após arquivar um release no Zenodo (ver A3, item 4).
+# O DOI é o que permite à tese citar o artefato de forma estável e permanente.
+
+references:
+  - type: thesis
+    title: >-
+      Arquitetura de Soberania de Dados para Agentes de IA Pessoais: Um Modelo
+      Local-First Baseado em Protocolos Descentralizados
+    authors:
+      - given-names: Pedro Henrique Almeida Prado
+        family-names: de Oliveira
+    thesis-type: "Trabalho de Conclusão de Curso (MBA em Inteligência Artificial e Big Data)"
+    institution:
+      name: >-
+        Universidade de São Paulo, Instituto de Ciências Matemáticas e de
+        Computação
+    location:
+      name: "São Carlos, SP, Brasil"
+    year: 2026
+    languages:
+      - por
