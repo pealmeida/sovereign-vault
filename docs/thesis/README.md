@@ -11,6 +11,13 @@ and are written to be lifted into the LaTeX paper.
 
 **Paper:** [`oliveira-2026-soberania-de-dados-agentes-ia.pdf`](oliveira-2026-soberania-de-dados-agentes-ia.pdf) — the research project. It is the author's academic work and is *not* covered by the repository's Apache-2.0 code license.
 
+> **TODO — licença do texto acadêmico.** Dizer apenas o que a licença *não* é
+> deixa a situação ambígua para quem queira reproduzir, traduzir ou citar. Falta
+> declarar sob qual licença o texto está (`paper.tex`, o PDF e derivados).
+> Escolha do autor, e possivelmente condicionada às regras de depósito da USP —
+> uma opção comum para monografia é CC BY-NC-ND 4.0. Ver
+> [A3, item 2](review/A3-auditoria-opensource-qwen35.md).
+
 | Document | Purpose | Thesis tie |
 |---|---|---|
 | [TRACEABILITY.md](TRACEABILITY.md) | Maps every module, objective, research question, and theoretical anchor to a verifiable code location | §1.3, §1.4, §3.6, §2 |
