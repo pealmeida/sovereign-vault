@@ -21,7 +21,8 @@ evaluation chapter are closed:
 Two Phase 1 evaluation-hardening items are now complete:
 
 - **Release-mode benchmark runs + cross-platform table** — reproduced on a
-  second host (Linux 7.0, i7-11600H, 30 GiB, rustc 1.96.1); the central §3.9.1
+  second host (Linux; kernel version not preserved in the preliminary capture,
+  i7-11600H, 30 GiB, rustc 1.96.1); the central §3.9.1
   finding is host-invariant (see [EVALUATION.md §1](EVALUATION.md)).
 - **Component micro-measurements (isolated decrypt vs. filter)** — the
   `thesis-eval micro` subcommand times `sv_storage` decrypt+read and

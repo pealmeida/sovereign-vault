@@ -1,0 +1,146 @@
+% ---------------------------------------------------------------------------
+% Variante USPSC 3.2 da monografia — exigência institucional (CHECKLIST §0.2).
+%
+% A classe USPSC é derivada de abntex2.cls v1.9.5 e é mantida pela Biblioteca
+% do Campus USP de São Carlos. O corpo do texto NÃO é duplicado aqui: este
+% arquivo carrega `uspsc/_body.tex`, extraído de `paper.tex` sem alteração, de
+% modo que só existe uma fonte canônica de conteúdo.
+%
+% Compilar de dentro de docs/thesis (duas passagens):
+%   pdflatex -interaction=nonstopmode paper-uspsc.tex
+%   pdflatex -interaction=nonstopmode paper-uspsc.tex
+%
+% Regenerar o corpo após editar paper.tex:
+%   python scripts/sync-uspsc-body.py
+% ---------------------------------------------------------------------------
+\documentclass[
+12pt,
+openright,
+twoside,
+a4paper,
+chapter=TITLE,
+english,
+brazil
+]{uspsc/USPSC-classe/USPSC}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{graphicx}
+% A folha de rosto da classe USPSC usa \nohyphens; sem hyphenat a compilação
+% acusa "Undefined control sequence" ao montar os pré-textuais.
+\usepackage{hyphenat}
+\usepackage{pdfpages}   % \includepdf, usado pela ficha catalográfica oficial
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+% NOTA — `USPSC-classe/ABNT6023-10520.sty` NÃO é carregado aqui.
+% Esse arquivo pressupõe `abntex2cite` (sistema BibTeX) já carregado: ele chama
+% \addtociteoptionlist, definido por aquele pacote. Este documento usa
+% `thebibliography` manual, então carregá-lo aborta a compilação com
+% "Undefined control sequence". A migração para .bib + abntex2cite é o passo
+% seguinte da conformidade (CHECKLIST §5); enquanto ela não ocorre, as entradas
+% seguem formatadas manualmente conforme a NBR 6023.
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=black,urlcolor=black}
+\DeclareUrlCommand\codigo{\urlstyle{tt}}
+\newcommand{\micro}{\,$\mu$s}
+\newcommand{\svnota}[1]{\begin{center}\fbox{\begin{minipage}{0.90\textwidth}\textbf{#1}\end{minipage}}\end{center}}
+
+% ---------------------------------------------------------------------------
+% Identificação institucional. `MBAIAp` é a sigla oficial do programa para o
+% MBA em Inteligência Artificial e Big Data em português; ela define
+% \tipotrabalho, \area e o \preambulo padronizados pela Unidade, definidos em
+% uspsc/USPSC-pre-textual-ICMC.tex — por isso esses campos NÃO são
+% redefinidos aqui.
+% ---------------------------------------------------------------------------
+% `ICMC` (não `ICMC-TCC`) é a sigla que a classe roteia para
+% USPSC-pre-textual-ICMC.tex, único arquivo do pacote que define o programa
+% MBAIAp — a monografia de MBA usa o modelo de teses/dissertações da Unidade,
+% não o de TCC de graduação (que só conhece BCCp/BSIp).
+\siglaunidade{ICMC}
+\programa{MBAIAp}
+
+\titulo{Arquitetura de Soberania de Dados para Agentes de IA Pessoais: Um Modelo Local-First Baseado em Protocolos Descentralizados}
+\autor{Pedro Henrique Almeida Prado de Oliveira}
+\local{São Carlos}
+\data{2026}
+\orientador{Profa. Dra. Kalinka Regina Lucas Jaquie Castelo Branco}
+
+\begin{document}
+\pretextual
+\imprimircapa
+
+% A variante com estrela termina em \newpage, deixando o conteúdo seguinte no
+% verso da folha de rosto — onde a NBR 14724 exige a ficha catalográfica.
+\imprimirfolhaderosto*
+
+% ---------------------------------------------------------------------------
+% Ficha catalográfica — gerar na Biblioteca Achille Bassi (ICMC/USP) e salvar
+% o PDF devolvido como uspsc/fichacatalografica.pdf. Com o arquivo presente,
+% trocar o bloco de aviso abaixo por:
+%   \includepdf{uspsc/fichacatalografica.pdf}
+% ---------------------------------------------------------------------------
+\begin{fichacatalografica}
+\vspace*{\fill}
+\begin{center}
+\fbox{\begin{minipage}{12.5cm}
+\vspace{0.3cm}
+\textbf{[FICHA CATALOGRÁFICA A GERAR]}\par
+Elemento obrigatório (NBR 14724). Gerar no sistema da Biblioteca Achille Bassi
+(ICMC/USP) e substituir este bloco pelo PDF devolvido, sem reformatação.
+\vspace{0.3cm}
+\end{minipage}}
+\end{center}
+\end{fichacatalografica}
+
+\begin{folhadeaprovacao}
+\begin{center}
+{\ABNTEXchapterfont\large\imprimirautor}
+
+\vspace*{\fill}\vspace*{1.2cm}
+\begin{minipage}[t]{\textwidth}
+\centering
+\ABNTEXchapterfont\bfseries\large\imprimirtitulo
+\end{minipage}
+\vspace*{1.2cm}
+
+\hspace{.45\textwidth}
+\begin{minipage}{.5\textwidth}
+\imprimirpreambulo
+\end{minipage}
+\vspace*{1.2cm}
+
+\end{center}
+
+Trabalho aprovado. São Carlos, \rule[-0.2cm]{2.5cm}{0.15mm} de
+\rule[-0.2cm]{4cm}{0.15mm} de \rule[-0.2cm]{1.5cm}{0.15mm}.
+
+\vspace{1.0cm}
+\begin{center}
+\rule{9cm}{0.15mm}\par
+\imprimirorientador\ (Orientador(a))
+
+\vspace{1.0cm}
+\rule{9cm}{0.15mm}\par
+{}[MEMBRO DA BANCA 1]
+
+\vspace{1.0cm}
+\rule{9cm}{0.15mm}\par
+{}[MEMBRO DA BANCA 2]
+\end{center}
+\vspace*{\fill}
+\end{folhadeaprovacao}
+
+\input{uspsc/_pretextual-conteudo}
+
+\input{uspsc/_body}
+
+\end{document}

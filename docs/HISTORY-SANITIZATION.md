@@ -5,11 +5,21 @@ On 2026-08-04, the public Git history was rewritten once with
 configuration file, personal commit e-mail addresses and absolute user-home
 paths. No source capability, experimental result or research claim was removed.
 
-The rewrite preserved all 243 commits by disabling empty-commit and degenerate
-merge pruning. Branch and tag names, commit chronology, parent topology and
-messages were retained, except for the explicit replacement of private strings.
-The complete old-to-new commit map and the original verified Git bundle are held
-in a private archive and are not part of this public repository.
+The isolated rewrite processed and preserved all 243 commits reachable from the
+archived branch, tag and pull-request heads by disabling empty-commit and
+degenerate-merge pruning. Of those, 161 commits are reachable from the 15
+published branch heads and the annotated evidence tag. Branch and tag names,
+commit chronology, parent topology and messages were retained, except for the
+explicit replacement of private strings. The complete old-to-new commit map,
+the rewritten pull-request-only commits and the original verified Git bundle
+are held in a private archive and are not part of the published heads or tags.
+
+GitHub's `refs/pull/*` namespace is server-managed and cannot be force-updated
+by a repository administrator. The 71 pull requests that predate the rewrite
+therefore retain obsolete cached refs until GitHub Support purges them. The
+three active pull requests were recreated from sanitized heads as #72--#74; the
+cache purge is an operational follow-up and does not change the rewritten
+branch/tag history described here.
 
 ## Research provenance
 

@@ -152,6 +152,55 @@ jobs:
         with:
           command: check bans sources licenses
 
+  thesis-evidence:
+    name: Thesis evidence tooling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      # The aggregator turns session CSVs into the numbers printed in the
+      # thesis. A counting error here raises no exception and produces
+      # plausible output — it just publishes a wrong result.
+      - name: Aggregator regression tests
+        run: python docs/thesis/evidence/test_aggregate.py
+
+      - name: Thesis citation ranges resolve
+        run: python scripts/check-thesis-citations.py
+
+      - name: collect-metadata.sh parses
+        run: bash -n docs/thesis/evidence/collect-metadata.sh
+
+      - name: Install TeX Live (abntex2 + PGF/TikZ)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            texlive-latex-recommended texlive-latex-extra \
+            texlive-lang-portuguese texlive-fonts-recommended lmodern \
+            texlive-pictures texlive-publishers
+
+      # Two passes: `thebibliography` and \ref resolve only on the second.
+      - name: Compile paper.tex
+        working-directory: docs/thesis
+        run: |
+          pdflatex -interaction=nonstopmode -halt-on-error paper.tex
+          pdflatex -interaction=nonstopmode -halt-on-error paper.tex
+
+      # A LaTeX warning is not an error, so an undefined \cite or \ref ships a
+      # PDF full of "[?]" markers while the build stays green. Fail on them.
+      - name: No undefined citations or references
+        working-directory: docs/thesis
+        run: |
+          if grep -E "Citation .* undefined|Reference .* undefined" paper.log; then
+            echo "::error::paper.tex has undefined citations or references"
+            exit 1
+          fi
+          echo "no undefined citations or references"
+
   ui:
     name: UI typecheck
     runs-on: ubuntu-latest
