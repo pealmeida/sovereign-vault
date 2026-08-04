@@ -41,8 +41,13 @@ próprio texto da tese.
 ## Proveniência
 
 Estes CSVs foram produzidos a partir do commit
-`dfb0a49f7360aedf37ee89152b99e2d970b6cfd6`, alcançável pela etiqueta anotada
+`8cea41adae5e33a3e2cb883133043aa0438c5361`, alcançável pela etiqueta anotada
 **`thesis-evidence-preliminary`**.
+
+Esse identificador é o equivalente sanitizado do commit originalmente citado
+nos pareceres anteriores. A reescrita de histórico não alterou os subdiretórios
+de código exercitados pelo harness nem os blobs CSV; a migração de proveniência
+está documentada em [`docs/HISTORY-SANITIZATION.md`](../../HISTORY-SANITIZATION.md).
 
 **Esse commit não é ancestral da `main`.** O código instrumentado mudou depois
 dele — em particular `a0b51da`, que somou cerca de 925 linhas ao gateway
