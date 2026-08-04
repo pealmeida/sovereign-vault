@@ -78,3 +78,8 @@ docs/thesis/*.bbl
 docs/thesis/*.blg
 docs/thesis/*.brf
 docs/thesis/*.synctex.gz
+
+# Private thesis working notes — maintained outside the public repository
+docs/thesis/orientacao/FICHA-CATALOGRAFICA-DADOS.md
+docs/thesis/orientacao/PERFIL-ORIENTADORA.md
+docs/thesis/orientacao/PUBLICACOES-KALINKA-LINKS.md
