@@ -4,9 +4,13 @@ Data: 2026-08-04
 
 O histórico público foi reescrito uma única vez para remover notas privadas,
 configuração local de agente, endereços pessoais de commit e caminhos absolutos
-de usuário. A transformação preservou os 243 commits existentes, sua topologia,
-cronologia e mensagens, exceto pelas substituições explícitas de identificadores
-privados.
+de usuário. O espelho isolado processou e preservou os 243 commits alcançáveis
+pelas referências arquivadas de branches, tag e PRs, sua topologia, cronologia e
+mensagens, exceto pelas substituições explícitas de identificadores privados.
+Desses, 161 são alcançáveis pelas 15 branches e pela tag publicadas. Os commits
+exclusivos dos antigos heads de PR permanecem no arquivo privado, pois
+`refs/pull/*` é um namespace administrado pelo GitHub e depende de expurgo pelo
+GitHub Support.
 
 Os pareceres anteriores registram o identificador de proveniência vigente no
 momento em que foram produzidos. Eles não foram editados retroativamente. O
