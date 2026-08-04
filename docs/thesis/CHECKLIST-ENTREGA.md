@@ -65,9 +65,25 @@ O documento atual usa `\documentclass{abntex2}` diretamente. O USPSC é uma
 camada sobre o `abntex2` com a estrutura de arquivos pré-textual do ICMC
 (`USPSC-pre-textual-ICMC.tex`) e a identificação do programa.
 
-**Impacto:** migrar exige reorganizar o documento na estrutura de pastas do
-pacote. Não é trivial, mas é mecânico, e o conteúdo escrito se preserva.
-**Decisão do autor**, ver §0.4.
+**Estado (04/08/2026): FEITO.** O pacote foi baixado da Biblioteca do Campus
+(`USPSC-3.2.zip`), a classe e os arquivos de Unidade foram versionados em
+`docs/thesis/uspsc/`, e a variante `docs/thesis/paper-uspsc.tex` **compila
+limpa em 50 páginas, com 0 erros e 0 citações/referências indefinidas**.
+
+Identificação institucional aplicada: `\siglaunidade{ICMC}` +
+`\programa{MBAIAp}`. Isso faz a classe emitir o preâmbulo oficial do programa
+("Monografia apresentada ao Departamento de Ciências de Computação... título de
+Especialista em Inteligência Artificial e Big Data"), a área de concentração e
+a capa institucional USP/ICMC — nenhum desses textos é escrito à mão.
+
+> **Detalhe não óbvio:** a sigla correta é `ICMC`, **não** `ICMC-TCC`. Só
+> `USPSC-pre-textual-ICMC.tex` define `MBAIAp`; o arquivo de TCC conhece apenas
+> os programas de graduação (BCCp/BSIp). Monografia de MBA usa o modelo de
+> teses/dissertações da Unidade.
+
+**Fonte única de conteúdo.** O corpo do texto não é duplicado: `paper.tex`
+continua canônico e `scripts/sync-uspsc-body.py` extrai os fragmentos que a
+variante USPSC carrega. Rodar o script após qualquer edição em `paper.tex`.
 
 ### 0.3 Normas ABNT completas
 
@@ -338,14 +354,18 @@ Exigência recorrente nas três disciplinas de Metodologia:
 **Bloqueantes (impedem entrega):**
 
 1. **Ficha catalográfica** — estrutura no lugar certo (verso da folha de rosto,
-   p. 4); falta **gerar o conteúdo** na Biblioteca Achille Bassi e colar. Ver §0.1.
-2. **Pacote USPSC 3.2** — declarado obrigatório; o documento usa `abntex2` puro. Ver §0.2 e §0.4.
-3. **Nome do orientador** na folha de rosto — hoje sai `[ORIENTADOR(A) A CONFIRMAR]`
-   visível no PDF. O nome não consta de nenhuma fonte deste repositório: só o
-   autor pode preenchê-lo.
-4. **Execução definitiva** — k ≥ 3 sessões com IC 95%. Instrumento pronto e
+   p. 4) nas duas variantes; falta **gerar o conteúdo** na Biblioteca Achille
+   Bassi e colar. Ver §0.1.
+2. **Execução definitiva** — k ≥ 3 sessões com IC 95%. Instrumento pronto e
    ensaiado de ponta a ponta; falta rodar sob as pré-condições do §1 do
    protocolo (`main` publicada + *host* controlado). Ver §9.
+
+> **Fechados em 04/08/2026:**
+> **Pacote USPSC 3.2** (§0.2) — variante `paper-uspsc.tex` compila limpa com a
+> identificação oficial `MBAIAp`.
+> **Nome da orientadora** — Profa. Dra. Kalinka Regina Lucas Jaquie Castelo
+> Branco, confirmada pelo autor; perfil e pontos de apoio à pesquisa em
+> [`orientacao/`](orientacao/PERFIL-ORIENTADORA.md).
 
 > **Deixou de ser bloqueante:** a folha de aprovação, agora implementada em
 > branco na posição correta (§1.1) — variante submetível, já que os nomes da

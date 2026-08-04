@@ -78,3 +78,15 @@ docs/thesis/*.bbl
 docs/thesis/*.blg
 docs/thesis/*.brf
 docs/thesis/*.synctex.gz
+
+# USPSC variant build artifacts
+docs/thesis/paper-uspsc.pdf
+docs/thesis/paper-uspsc.aux
+docs/thesis/paper-uspsc.toc
+docs/thesis/paper-uspsc.lof
+docs/thesis/paper-uspsc.lot
+docs/thesis/paper-uspsc.out
+
+# Derived from paper.tex by scripts/sync-uspsc-body.py — never edit or commit
+docs/thesis/uspsc/_body.tex
+docs/thesis/uspsc/_pretextual-conteudo.tex
