@@ -180,7 +180,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             texlive-latex-recommended texlive-latex-extra \
-            texlive-lang-portuguese texlive-fonts-recommended \
+            texlive-lang-portuguese texlive-fonts-recommended lmodern \
             texlive-pictures texlive-publishers
 
       # Two passes: `thebibliography` and \ref resolve only on the second.
