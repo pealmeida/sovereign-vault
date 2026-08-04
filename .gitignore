@@ -63,3 +63,23 @@ CLAUDE.md
 # Python
 __pycache__/
 *.pyc
+
+# LaTeX build artifacts (docs/thesis/). The thesis source is paper.tex; the
+# compiled PDF and auxiliary files are reproducible and must not be versioned.
+# Exception: docs/thesis/oliveira-2026-*.pdf is the submitted paper, kept on
+# purpose and already tracked.
+docs/thesis/paper.pdf
+docs/thesis/*.aux
+docs/thesis/*.out
+docs/thesis/*.toc
+docs/thesis/*.lof
+docs/thesis/*.lot
+docs/thesis/*.bbl
+docs/thesis/*.blg
+docs/thesis/*.brf
+docs/thesis/*.synctex.gz
+
+# Private thesis working notes — maintained outside the public repository
+docs/thesis/orientacao/FICHA-CATALOGRAFICA-DADOS.md
+docs/thesis/orientacao/PERFIL-ORIENTADORA.md
+docs/thesis/orientacao/PUBLICACOES-KALINKA-LINKS.md
