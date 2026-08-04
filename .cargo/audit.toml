@@ -14,4 +14,12 @@ ignore = [
     # on quick-xml >= 0.41.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # glib VariantStrIter Iterator/DoubleEndedIterator unsoundness (informational:
+    # unsound, non-fatal). Transitive ONLY via tauri 2.11.5 -> gtk 0.18.2 (final
+    # GTK3 release), which hard-pins glib ^0.18; the patched glib 0.20 is GTK4-era
+    # and rejected by the resolver, so no fix exists until Tauri drops GTK3.
+    # Confined to the Linux desktop GUI — glib::VariantStrIter is not used by app
+    # code, and the CLI/server/crypto paths pull no GTK. Dependabot alert #2 is
+    # left open as a live tracker. Remove once Tauri moves off GTK3.
+    "RUSTSEC-2024-0429",
 ]

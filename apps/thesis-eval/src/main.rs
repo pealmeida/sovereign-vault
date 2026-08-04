@@ -20,9 +20,10 @@
 //! Usage:
 //!
 //! ```text
-//! cargo run -p thesis-eval -- latency       [--out DIR] [--iterations N]
+//! cargo run -p thesis-eval -- latency       [--out DIR] [--iterations N] [--warmup N] [--seed N]
+//! cargo run -p thesis-eval -- micro         [--out DIR] [--iterations N] [--warmup N]
 //! cargo run -p thesis-eval -- adversarial   [--out DIR]
-//! cargo run -p thesis-eval -- all           [--out DIR] [--iterations N]
+//! cargo run -p thesis-eval -- all           [--out DIR] [--iterations N] [--warmup N] [--seed N]
 //! ```
 //!
 //! The vault is created in a throwaway temp directory with passphrase custody
@@ -62,6 +63,10 @@ async fn main() {
     let iterations: usize = flag(&args, "--iterations")
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
+    let warmup: usize = flag(&args, "--warmup")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let seed: Option<u64> = flag(&args, "--seed").and_then(|s| s.parse().ok());
     let out = PathBuf::from(&out_dir);
     if let Err(e) = fs::create_dir_all(&out) {
         eprintln!("cannot create {}: {e}", out.display());
@@ -69,12 +74,12 @@ async fn main() {
     }
 
     match cmd {
-        "latency" => run_latency(&out, iterations).await,
-        "micro" => run_micro(&out, iterations).await,
+        "latency" => run_latency(&out, iterations, warmup, seed).await,
+        "micro" => run_micro(&out, iterations, warmup).await,
         "adversarial" => run_adversarial(&out).await,
         "all" => {
-            run_latency(&out, iterations).await;
-            run_micro(&out, iterations).await;
+            run_latency(&out, iterations, warmup, seed).await;
+            run_micro(&out, iterations, warmup).await;
             run_adversarial(&out).await;
         }
         other => {
@@ -322,7 +327,7 @@ fn pii_payload(size: usize) -> String {
     s
 }
 
-async fn run_micro(out: &Path, iterations: usize) {
+async fn run_micro(out: &Path, iterations: usize, warmup: usize) {
     println!("== Component micro-measurements, isolated (thesis §3.9.1) ==");
     let (handle, root) = bootstrap("micro");
 
@@ -342,24 +347,28 @@ async fn run_micro(out: &Path, iterations: usize) {
     for size in sizes {
         let name = format!("f{size}");
 
-        // Warm once, then time isolated decrypt+read (no gateway).
-        let _ = handle.read_file("bench", &name).expect("warm read");
-        let mut decrypt_us: Vec<f64> = Vec::with_capacity(iterations);
-        for _ in 0..iterations {
+        // Preserve the legacy one-shot priming read for the default (`--warmup`
+        // absent or zero) path. When requested, `warmup` instead controls the
+        // exact number of discarded calls before the measured loop.
+        for _ in 0..micro_warmup_iterations(warmup) {
+            let _ = handle.read_file("bench", &name).expect("warm read");
+        }
+        let decrypt_us = measure_iterations(iterations, || {
             let t0 = std::time::Instant::now();
             let _ = handle.read_file("bench", &name).expect("read");
-            decrypt_us.push(us(t0.elapsed()));
-        }
+            us(t0.elapsed())
+        });
 
         // Isolated PII filter (no vault): redact on PII-bearing text.
         let text = pii_payload(size);
-        let _ = sv_privacy::redact(&text, &policy);
-        let mut filter_us: Vec<f64> = Vec::with_capacity(iterations);
-        for _ in 0..iterations {
+        for _ in 0..micro_warmup_iterations(warmup) {
+            let _ = sv_privacy::redact(&text, &policy);
+        }
+        let filter_us = measure_iterations(iterations, || {
             let t0 = std::time::Instant::now();
             let _ = sv_privacy::redact(&text, &policy);
-            filter_us.push(us(t0.elapsed()));
-        }
+            us(t0.elapsed())
+        });
 
         let d = summarize(decrypt_us);
         let f = summarize(filter_us);
@@ -397,17 +406,44 @@ async fn run_micro(out: &Path, iterations: usize) {
     }
     fs::write(out.join("micro.md"), md).expect("write micro.md");
     fs::write(out.join("micro.csv"), csv).expect("write micro.csv");
+    write_micro_metadata(out, &rows, warmup);
     println!("   wrote {}/micro.csv and micro.md", out.display());
 
     drop(handle);
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Emits a companion CSV only when `--warmup` changes the microbenchmark.
+/// Keeping metadata separate preserves the legacy `micro.csv` schema for the
+/// default invocation while making the effective discarded count auditable.
+fn write_micro_metadata(out: &Path, rows: &[MicroRow], warmup: usize) {
+    if warmup == 0 {
+        return;
+    }
+    let mut csv = String::from("bytes,warmup\n");
+    for row in rows {
+        csv.push_str(&format!("{},{}\n", row.bytes, warmup));
+    }
+    fs::write(out.join("micro-metadata.csv"), csv).expect("write micro-metadata.csv");
+}
+
+fn micro_warmup_iterations(warmup: usize) -> usize {
+    if warmup == 0 {
+        1
+    } else {
+        warmup
+    }
+}
+
+fn measure_iterations<T>(iterations: usize, mut operation: impl FnMut() -> T) -> Vec<T> {
+    (0..iterations).map(|_| operation()).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Latency evaluation (§3.9.1, Equation 1)
 // ---------------------------------------------------------------------------
 
-async fn run_latency(out: &Path, iterations: usize) {
+async fn run_latency(out: &Path, iterations: usize, warmup: usize, seed: Option<u64>) {
     println!("== Latency evaluation (thesis §3.9.1) ==");
     let (handle, root) = bootstrap("latency");
 
@@ -434,31 +470,105 @@ async fn run_latency(out: &Path, iterations: usize) {
     let shared: SharedVault<VaultHandle> = Arc::new(Mutex::new(Some(handle)));
 
     let mut rows: Vec<LatencyRow> = Vec::new();
-    for (name, _mode) in modes {
-        for size in sizes {
-            let timing = Arc::new(CaptureTiming::default());
-            let server = McpServer::new(shared.clone(), PAIRING_SECRET)
-                .with_access_controller(Arc::new(AutoAllow))
-                .with_timing_sink(timing.clone());
-            drive_reads_stdio(&server, name, &format!("f{size}"), iterations).await;
-
-            let records = timing.0.lock().unwrap();
-            let row = LatencyRow {
-                mode: name.to_string(),
-                bytes: size,
-                total: summarize(records.iter().map(|t| us(t.total)).collect()),
-                validate: summarize(records.iter().map(|t| us(t.validate)).collect()),
-                authorize: summarize(records.iter().map(|t| us(t.authorize)).collect()),
-                execute: summarize(records.iter().map(|t| us(t.execute)).collect()),
-                filter: summarize(records.iter().map(|t| us(t.filter)).collect()),
-            };
-            rows.push(row);
+    for (execution_order, cell) in latency_cells(seed).into_iter().enumerate() {
+        let timing = Arc::new(CaptureTiming::default());
+        if warmup > 0 {
+            // This server intentionally has no TimingSink: the exact same
+            // gateway call and payload are exercised, but discarded calls
+            // cannot enter the measurements' capture buffer.
+            let warmup_server = McpServer::new(shared.clone(), PAIRING_SECRET)
+                .with_access_controller(Arc::new(AutoAllow));
+            drive_reads_stdio(
+                &warmup_server,
+                cell.name,
+                &format!("f{}", cell.bytes),
+                warmup,
+            )
+            .await;
         }
+        let server = McpServer::new(shared.clone(), PAIRING_SECRET)
+            .with_access_controller(Arc::new(AutoAllow))
+            .with_timing_sink(timing.clone());
+        drive_reads_stdio(&server, cell.name, &format!("f{}", cell.bytes), iterations).await;
+
+        let records = timing.0.lock().unwrap();
+        let row = LatencyRow {
+            mode: cell.name.to_string(),
+            bytes: cell.bytes,
+            warmup,
+            seed,
+            execution_order,
+            total: summarize(records.iter().map(|t| us(t.total)).collect()),
+            validate: summarize(records.iter().map(|t| us(t.validate)).collect()),
+            authorize: summarize(records.iter().map(|t| us(t.authorize)).collect()),
+            execute: summarize(records.iter().map(|t| us(t.execute)).collect()),
+            filter: summarize(records.iter().map(|t| us(t.filter)).collect()),
+        };
+        rows.push(row);
     }
 
     write_latency_outputs(out, &rows);
     let _ = fs::remove_dir_all(&root);
     println!("   wrote {}/latency.csv and latency.md\n", out.display());
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LatencyCell {
+    name: &'static str,
+    bytes: usize,
+}
+
+fn latency_cells(seed: Option<u64>) -> Vec<LatencyCell> {
+    let modes = ["direct", "approval", "otp", "anon"];
+    let sizes = [128usize, 1024, 16384];
+    let mut cells = Vec::with_capacity(modes.len() * sizes.len());
+    for name in modes {
+        for bytes in sizes {
+            cells.push(LatencyCell { name, bytes });
+        }
+    }
+    if let Some(seed) = seed {
+        shuffle_cells(&mut cells, seed);
+    }
+    cells
+}
+
+/// A compact non-cryptographic xorshift64 generator for the optional execution
+/// order shuffle. `cargo tree` exposes `rand` only transitively (and at several
+/// versions), so declaring it directly would add a manifest dependency solely
+/// for this small deterministic operation. This implementation is deliberately
+/// local and auditable; it never affects payloads, measured calls, or data.
+struct XorShift64 {
+    state: u64,
+}
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        // xorshift's all-zero state is absorbing; preserve a distinct,
+        // deterministic shuffle for the valid CLI seed zero.
+        Self {
+            state: if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            },
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        self.state
+    }
+}
+
+fn shuffle_cells(cells: &mut [LatencyCell], seed: u64) {
+    let mut rng = XorShift64::new(seed);
+    for i in (1..cells.len()).rev() {
+        let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+        cells.swap(i, j);
+    }
 }
 
 /// Build a payload of `size` bytes. ANONYMIZED payloads embed PII so the filter
@@ -506,6 +616,9 @@ async fn drive_reads_stdio(server: &McpServer<VaultHandle>, container: &str, fil
 struct LatencyRow {
     mode: String,
     bytes: usize,
+    warmup: usize,
+    seed: Option<u64>,
+    execution_order: usize,
     total: Stats,
     validate: Stats,
     authorize: Stats,
@@ -513,6 +626,9 @@ struct LatencyRow {
     filter: Stats,
 }
 
+/// Writes the legacy long-form latency CSV and, when either optional flag is
+/// active, a companion metadata CSV. Separating metadata preserves the default
+/// `latency.csv` schema while retaining warmup, seed, and execution order.
 fn write_latency_outputs(out: &Path, rows: &[LatencyRow]) {
     // Long-form CSV — one row per (cell, stage), tidy for plotting.
     let mut csv = String::from("mode,bytes,iterations,stage,mean_us,p50_us,p95_us\n");
@@ -531,6 +647,8 @@ fn write_latency_outputs(out: &Path, rows: &[LatencyRow]) {
         }
     }
     let _ = fs::write(out.join("latency.csv"), &csv);
+
+    write_latency_metadata(out, rows);
 
     // Markdown summary mapped onto the thesis Equation 1 terms.
     let mut md = String::new();
@@ -578,6 +696,28 @@ fn write_latency_outputs(out: &Path, rows: &[LatencyRow]) {
             r.validate.mean_us
         );
     }
+}
+
+fn write_latency_metadata(out: &Path, rows: &[LatencyRow]) {
+    let Some(first) = rows.first() else {
+        return;
+    };
+    if first.warmup == 0 && first.seed.is_none() {
+        return;
+    }
+    let mut csv = String::from("mode,bytes,warmup,seed,execution_order\n");
+    for row in rows {
+        csv.push_str(&format!(
+            "{},{},{},{},{}\n",
+            row.mode,
+            row.bytes,
+            row.warmup,
+            row.seed
+                .map_or_else(|| "none".to_string(), |seed| seed.to_string()),
+            row.execution_order,
+        ));
+    }
+    let _ = fs::write(out.join("latency-metadata.csv"), csv);
 }
 
 // ---------------------------------------------------------------------------
@@ -978,5 +1118,54 @@ fn pct(num: usize, den: usize) -> f64 {
         100.0
     } else {
         num as f64 * 100.0 / den as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_seed_preserves_the_original_cell_order() {
+        let order: Vec<(&str, usize)> = latency_cells(None)
+            .into_iter()
+            .map(|cell| (cell.name, cell.bytes))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("direct", 128),
+                ("direct", 1024),
+                ("direct", 16384),
+                ("approval", 128),
+                ("approval", 1024),
+                ("approval", 16384),
+                ("otp", 128),
+                ("otp", 1024),
+                ("otp", 16384),
+                ("anon", 128),
+                ("anon", 1024),
+                ("anon", 16384),
+            ]
+        );
+    }
+
+    #[test]
+    fn same_seed_has_the_same_order_and_different_seed_changes_it() {
+        let first = latency_cells(Some(42));
+        assert_eq!(first, latency_cells(Some(42)));
+        assert_ne!(first, latency_cells(Some(43)));
+    }
+
+    #[test]
+    fn zero_warmup_keeps_the_measured_iteration_count() {
+        let iterations = 20;
+        let mut calls = 0;
+        let measured = measure_iterations(iterations, || {
+            calls += 1;
+        });
+        assert_eq!(measured.len(), iterations);
+        assert_eq!(calls, iterations);
+        assert_eq!(micro_warmup_iterations(0), 1);
     }
 }
