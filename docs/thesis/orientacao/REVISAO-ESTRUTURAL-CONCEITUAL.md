@@ -4,7 +4,7 @@
 **Insumos:** leitura integral de três obras da Profa. Kalinka (PDFs fornecidos
 pelo autor) confrontada com o `paper.tex` completo.
 **Complementa:** [`PONTOS-DE-APOIO-TESE.md`](PONTOS-DE-APOIO-TESE.md) (plano
-P1–P5) e [`PUBLICACOES-KALINKA-LINKS.md`](PUBLICACOES-KALINKA-LINKS.md).
+P1–P5).
 **Status:** inserções P1, P2, P4 e P5 e tabela de posicionamento funcional
 **aplicadas** ao `paper.tex`; paginação de HAMSTER conferida na fonte primária;
 variante USPSC sincronizada; ambas as variantes recompiladas e inspecionadas.

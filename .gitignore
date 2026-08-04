@@ -90,3 +90,8 @@ docs/thesis/paper-uspsc.out
 # Derived from paper.tex by scripts/sync-uspsc-body.py — never edit or commit
 docs/thesis/uspsc/_body.tex
 docs/thesis/uspsc/_pretextual-conteudo.tex
+
+# Private thesis working notes — maintained outside the public repository
+docs/thesis/orientacao/FICHA-CATALOGRAFICA-DADOS.md
+docs/thesis/orientacao/PERFIL-ORIENTADORA.md
+docs/thesis/orientacao/PUBLICACOES-KALINKA-LINKS.md

@@ -41,8 +41,8 @@ num lugar resolve os dois.
 bibliotecário):
 <https://www.icmc.usp.br/institucional/estrutura-administrativa/biblioteca/servicos/ficha>
 
-**Todos os valores campo a campo já estão derivados do `paper.tex` em
-[`orientacao/FICHA-CATALOGRAFICA-DADOS.md`](orientacao/FICHA-CATALOGRAFICA-DADOS.md).**
+**Todos os valores campo a campo já estão derivados do `paper.tex` no arquivo
+local privado da ficha catalográfica, mantido fora do repositório público.**
 É digitação mecânica; nada precisa ser decidido.
 
 > **Por que não foi submetido automaticamente:** o envio publica seus dados
