@@ -8,7 +8,13 @@ ambiente que não pode ser verificada por automação.
 
 ---
 
-## 1. Nome do orientador (2 minutos)
+> **Atualização de 04/08/2026.** Dois itens saíram desta lista:
+> o **nome da orientadora** (Profa. Dra. Kalinka Regina Lucas Jaquie Castelo
+> Branco, informado pelo autor e já aplicado nas duas variantes) e a
+> **decisão sobre o USPSC** (adotado; `paper-uspsc.tex` compila limpo com a
+> identificação oficial `MBAIAp`). Restam os itens 2 e 4 abaixo.
+
+## 1. Nome do orientador — ✅ FEITO (04/08/2026)
 
 **Onde:** `docs/thesis/paper.tex`, linha do `\orientador{}`.
 
@@ -29,17 +35,25 @@ num lugar resolve os dois.
 
 ---
 
-## 2. Ficha catalográfica (10 minutos)
+## 2. Ficha catalográfica (≈3 minutos)
 
-**Gerar em:**
+**Formulário automatizado de autoatendimento** (gera na hora, sem espera por
+bibliotecário):
 <https://www.icmc.usp.br/institucional/estrutura-administrativa/biblioteca/servicos/ficha>
 
-**Colar em:** `docs/thesis/paper.tex`, dentro de `\begin{fichacatalografica}`,
-substituindo o bloco `[FICHA CATALOGRÁFICA A GERAR]` — **sem reformatar** o
-texto devolvido pelo sistema.
+**Todos os valores campo a campo já estão derivados do `paper.tex` em
+[`orientacao/FICHA-CATALOGRAFICA-DADOS.md`](orientacao/FICHA-CATALOGRAFICA-DADOS.md).**
+É digitação mecânica; nada precisa ser decidido.
 
-A estrutura já está correta: a ficha cai no verso da folha de rosto (página 4 do
-PDF), como exige a NBR 14724. Nada além do texto precisa mudar.
+> **Por que não foi submetido automaticamente:** o envio publica seus dados
+> pessoais num sistema institucional da USP, em seu nome. Ação externa que exige
+> sua autorização.
+
+Gerar **por último**, depois que os números definitivos do Capítulo 4 entrarem —
+o total de páginas impresso na ficha precisa bater com o trabalho depositado.
+
+A estrutura já está no lugar certo nas duas variantes: a ficha cai no verso da
+folha de rosto (p. 4), como exige a NBR 14724.
 
 ---
 
@@ -72,11 +86,27 @@ sob as pré-condições que o próprio protocolo exige.
 2. **Host controlado:** plano de energia fixo em Alto Desempenho, na tomada,
    navegador/IDE/Docker/sync de nuvem fechados, sem *build* concorrente.
 
-> **Por que isso não foi disparado automaticamente:** o ensaio de validação, com
-> sessões curtas nesta máquina em uso, produziu CV de até 65% em algumas células
-> — ruído de ambiente muito acima do sinal de dezenas de microssegundos que se
-> quer medir. É exatamente o que a §1.5 existe para evitar. Rodar assim geraria
-> números que o próprio protocolo classifica como inválidos.
+> **Por que isso não foi disparado automaticamente — verificado, não suposto.**
+> O ensaio de validação, com sessões curtas nesta máquina em uso, produziu CV de
+> até 65% em algumas células — ruído de ambiente muito acima do sinal de dezenas
+> de microssegundos que se quer medir.
+>
+> Estado do *host* medido em 04/08/2026, durante esta sessão:
+>
+> | Condição do §1.5 | Estado medido |
+> |---|---|
+> | Carga de CPU baixa | ✅ 7% |
+> | Navegador fechado | ❌ Chrome em execução |
+> | IDE/ferramentas fechadas | ❌ três processos `claude` (o maior consumidor de CPU da máquina) |
+> | Plano de energia fixo em Alto Desempenho | ⚠️ não confirmado pela consulta WMI |
+>
+> O agente que rodaria a medição é ele próprio o processo mais pesado da
+> máquina: seria confundidor da própria medida. Fechar navegador e ferramentas
+> é ação local que só o autor executa.
+>
+> Quanto à `main`: o ramo está **10 commits à frente e permite fast-forward**,
+> então a integração é trivial — mas fazer *merge* e *push* é ação externa não
+> autorizada, e a convenção do repositório é integrar via PR (cf. #69, #70).
 
 ### Sequência
 

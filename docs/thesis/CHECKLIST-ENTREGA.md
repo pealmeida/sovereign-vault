@@ -354,8 +354,12 @@ Exigência recorrente nas três disciplinas de Metodologia:
 **Bloqueantes (impedem entrega):**
 
 1. **Ficha catalográfica** — estrutura no lugar certo (verso da folha de rosto,
-   p. 4) nas duas variantes; falta **gerar o conteúdo** na Biblioteca Achille
-   Bassi e colar. Ver §0.1.
+   p. 4) nas duas variantes. É **formulário automatizado de autoatendimento**,
+   não pedido a bibliotecário: gera na hora. Todos os valores campo a campo
+   já estão prontos em
+   [`orientacao/FICHA-CATALOGRAFICA-DADOS.md`](orientacao/FICHA-CATALOGRAFICA-DADOS.md)
+   — restam ≈3 minutos de digitação pelo autor, pois o envio publica dados
+   pessoais em sistema da USP em seu nome. Ver §0.1.
 2. **Execução definitiva** — k ≥ 3 sessões com IC 95%. Instrumento pronto e
    ensaiado de ponta a ponta; falta rodar sob as pré-condições do §1 do
    protocolo (`main` publicada + *host* controlado). Ver §9.
