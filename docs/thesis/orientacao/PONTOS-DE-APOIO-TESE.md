@@ -38,7 +38,7 @@ que o texto ofereça filiação.
 **Onde:** trabalhos correlatos e discussão da contribuição (March e Smith:
 Modelo, Método, Instanciação).
 
-**Citar:** HAMSTER (Pigatto et al., ICUAS 2014).
+**Citar:** versão de periódico de HAMSTER (Pigatto et al., 2016).
 
 **Argumento:** arquitetura de comunicação nomeada, com camadas de segurança
 explícitas, proposta **e** avaliada — mesma forma desta monografia. Sustenta que
@@ -134,12 +134,13 @@ Perguntas prováveis, dada a especialidade dela:
 
 ## 4. Ação imediata sobre o `paper.tex`
 
-- [ ] Conferir cada referência acima contra o Lattes/DOI antes de inserir
-- [ ] P1: inserir a citação JNCA 2016 na justificativa do §3.9
-- [ ] P5: inserir o enquadramento de governança de dados na introdução
-- [ ] P2, P3, P4: avaliar caso a caso — inserir apenas onde o argumento já
-      existe no texto e a citação o reforça
-- [ ] Acrescentar os `\bibitem` correspondentes, seguindo o padrão ABNT do
-      arquivo (sobrenome em versalete, título do periódico em itálico, DOI ao
-      final)
-- [ ] Recompilar e confirmar zero citações indefinidas
+- [x] Conferir as referências inseridas contra DOI/editor/PDF
+- [x] P1: inserir a citação JNCA 2016 na justificativa do §3.9
+- [x] P5: inserir o enquadramento de governança de dados na introdução
+- [x] P2 e P4: inserir somente onde o argumento existente é reforçado
+- [x] P3: avaliar e rejeitar a inserção — o artigo ICUAS avalia classificadores
+      IDS contra ataques e conjuntos de dados, não uma bateria pré-especificada
+      de chamadas MCP; a analogia metodológica seria excessiva
+- [x] Acrescentar os `\bibitem` correspondentes, seguindo o padrão ABNT do
+      arquivo
+- [x] Recompilar e confirmar zero citações indefinidas

@@ -21,7 +21,7 @@
 | # | Trabalho | Ano | Sinergia | Onde citar |
 |---|---|---|---|---|
 | 1 | Crypto performance evaluation (JNCA) | 2016 | **Muito alta** — método | §3.9, Cap. 5 |
-| 2 | HAMSTER (JINT) | 2017 | **Alta** — forma da contribuição | §2, §5.4 |
+| 2 | HAMSTER (JINT) | 2016 | **Alta** — forma da contribuição | §2, §5.4 |
 | 3 | Air taxis: security & safety (Sensors) | 2022 | **Alta** — fronteira de ameaça | §3.7, §5.5 |
 | 4 | IDS por anomalia em enxame (ICUAS) | 2023 | Média — postura adversarial | §3.9.2 |
 | 5 | ECC/El-Gamal MIRACL vs. RELIC (JACR) | 2011 | Média — precedente do método | §3.9 (reforço) |

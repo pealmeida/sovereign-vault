@@ -41,18 +41,18 @@ Defined at [`sv-storage/src/lib.rs:100`](../../crates/sv-storage/src/lib.rs#L100
 
 | # | Objective | Evidence | Status |
 |---|---|---|---|
-| 1 | Investigate MCP as a decoupling interface | Rust-native MCP server, stdio + WS, 15 tools, pairing ([ADR-0002](../adr/0002-rust-native-mcp-server.md), [ADR-0006](../adr/0006-mcp-integration.md)) | ✅ |
-| 2 | Local context vault in a memory-safe language | `forbid(unsafe_code)` workspace-wide ([`Cargo.toml:26`](../../Cargo.toml#L26)); whole vault in Rust | ✅ |
+| 1 | Investigate MCP as a decoupling interface | Rust-native MCP server, stdio + WS, 17 base tools plus 3 broker-conditional tools, pairing ([ADR-0002](../adr/0002-rust-native-mcp-server.md), [ADR-0006](../adr/0006-mcp-integration.md)) | ✅ |
+| 2 | Local vault prototype in a memory-safe language, instantiated for named secrets and credentials | `forbid(unsafe_code)` workspace-wide ([`Cargo.toml:26`](../../Cargo.toml#L26)); own vault code in Rust | ✅ |
 | 3 | Human-in-the-loop layer for runtime auditing/approval | `apps/desktop` approval/OTP modals + hash-chained `sv-audit` | ✅ |
-| 4 | Evaluate latency + exfiltration-blocking vs. cloud | `apps/thesis-eval` (`latency`, `adversarial`) — see [EVALUATION.md](EVALUATION.md) | ✅ **(new)** |
+| 4 | Evaluate, under controlled conditions, internal gateway latency and coverage of a pre-specified unauthorized-access battery | `apps/thesis-eval` (`latency`, `adversarial`) — preliminary one-session evidence; see [EVALUATION.md](EVALUATION.md) | ✅ **preliminary** |
 
 ## 3. Research questions (§1.3) → where answered
 
 | RQ | Question (paraphrased) | Answered by |
 |---|---|---|
-| RQ1 | Securely **mediate and filter** contextual queries to local data | Scope + approval gating (`sv-mcp`); crypto-intermediation (`sv-core::transit`); **PII filter** (`sv-privacy`, [ADR-0010](../adr/0010-privacy-mediation-layer.md)) |
+| RQ1 | Mediate and reduce exposure of named reads of local secrets and credentials | Scope + configured consent (`sv-mcp`); crypto-intermediation (`sv-core::transit`); **PII filter** (`sv-privacy`, [ADR-0010](../adr/0010-privacy-mediation-layer.md)) |
 | RQ2 | **Latency** impact of a local interception/audit layer | Latency decomposition harness, Equation 1 mapping — [EVALUATION.md §1](EVALUATION.md) |
-| RQ3 | OS-level **isolation** mitigating lateral exfiltration | Memory-safe Rust (`forbid(unsafe_code)`); loopback-only binding + per-launch pairing; scope enforcement; adversarial block-rate — [EVALUATION.md §2](EVALUATION.md) |
+| RQ3 | Local authentication, capability scopes, configured consent and tamper-evident audit reduce the enumerated lateral accesses within the single-user, single-machine threat model | Authenticated WebSocket path, pairing, scope enforcement, consent policy and adversarial battery — [EVALUATION.md §2](EVALUATION.md). **No OS/process isolation is implemented or evaluated.** |
 
 ## 4. Methodology (§3.3, §3.5) → repo
 
@@ -60,15 +60,15 @@ Defined at [`sv-storage/src/lib.rs:100`](../../crates/sv-storage/src/lib.rs#L100
 |---|---|
 | March & Smith **instantiation** | the whole repository (a runnable artifact) |
 | March & Smith **model** (§3.6) | the 4-module reference architecture, §1 of this doc |
-| March & Smith **method** (§3.7) | the runtime mediation/isolation protocol: pairing → scope → consent → execute → **filter** → audit (`sv-mcp::call_tool`) |
-| Architecture Decision Records (§3.3 rigor cycle) | [`docs/adr/`](../adr/) — 11 ADRs, incl. [ADR-0010](../adr/0010-privacy-mediation-layer.md) (privacy) and [ADR-0011](../adr/0011-dsr-evaluation-harness.md) (evaluation) added for this work |
+| March & Smith **method** (§3.7) | the runtime mediation protocol: pairing → scope → configured consent → execute → **filter** → audit (`sv-mcp::call_tool`); this is logical mediation, not OS/process isolation |
+| Architecture Decision Records (§3.3 rigor cycle) | [`docs/adr/`](../adr/) — 13 ADRs, including [ADR-0010](../adr/0010-privacy-mediation-layer.md) (privacy), [ADR-0011](../adr/0011-dsr-evaluation-harness.md) (evaluation), and proposed ADR-0012/0013 evolution paths that are not capabilities of the evaluated artifact |
 
 ## 5. Theoretical anchors (§2) → realisation
 
 | Reference | In the artifact |
 |---|---|
-| MCP (Anthropic, 2024) | `sv-mcp` server, JSON-RPC 2024-11-05, 15 tools |
-| Local-First (Kleppmann, 2019) | single-machine, no server; data + processing on the device |
+| MCP (Anthropic, 2024) | `sv-mcp` server, JSON-RPC 2024-11-05, 17 base tools plus 3 tools exposed only when the broker is enabled |
+| Local-First (Kleppmann, 2019) | authoritative vault data and gateway mediation remain on the device; the external model remains outside the local trust boundary |
 | Memory safety (NSA, 2022) | Rust + `forbid(unsafe_code)` (RQ3 evidence) |
 | Privacy by Design (Cavoukian, 2011) | privacy controls native to the code: `ANONYMIZED` masking, no-key-return transit |
 | Surveillance capitalism / LGPD (Zuboff 2019; Lorenzon 2021) | CPF/CNPJ-aware PII detectors in `sv-privacy` |
@@ -81,5 +81,5 @@ cargo test --workspace          # 86+ tests across the crates cited above
 cargo run -p thesis-eval -- all # regenerates the §3.9 evaluation evidence
 ```
 
-Line numbers were checked against the working tree on 2026-06-06. If a symbol
+Line numbers and counts were checked against the working tree on 2026-08-04. If a symbol
 moves, search by name (e.g. `rg "fn apply_privacy_filter"`).
