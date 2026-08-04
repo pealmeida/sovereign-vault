@@ -279,6 +279,30 @@ Agora é viável: existe uma tag no repositório.
 o texto, o que é honesto — mas a versão final deve trazer a execução definitiva.
 Protocolo pronto em [`EXECUCAO-DEFINITIVA.md`](EXECUCAO-DEFINITIVA.md).
 
+**Ensaio de ponta a ponta (04/08/2026).** O encadeamento
+harness → `collect-metadata.sh` → `aggregate.py` foi exercitado com k=3 sessões
+curtas (40 iterações, `--warmup 5`, *seeds* distintas) em diretório descartável,
+apenas para validar o instrumento — **não é evidência** e foi descartado. O que
+o ensaio estabelece:
+
+- o harness emite os três CSVs mais os metadados companheiros por sessão;
+- `collect-metadata.sh` coleta CPU, núcleos, RAM, armazenamento e *build* do
+  Windows sem nenhum campo `n/a` (o caminho WMI/PowerShell funciona);
+- `aggregate.py` consome saída real do harness, apura 30/30 bloqueios com IC de
+  Wilson [88,6; 100,0], aplica as ressalvas de k<5 e k<4 e sai com código 2.
+
+> O caso 30/30 é exatamente o que o defeito de leitura booleana teria reportado
+> como 0/30. O ensaio confirma a correção contra dados reais, não sintéticos.
+
+**Por que a execução definitiva não foi disparada aqui:** o §1 do protocolo
+exige árvore limpa em `main` publicada, etiqueta anotada sobre esse commit e
+*host* controlado (energia fixa, sem *build* concorrente, aplicações fechadas).
+Este ramo não está integrado à `main`, e o controle do *host* não é verificável
+de forma automatizada. Rodar assim produziria números não-ancestrais e com
+variância de ambiente — reproduzindo o defeito de proveniência que o apêndice já
+documenta, e queimando o nome de etiqueta `thesis-eval-v1`. É decisão do autor,
+com a máquina em estado controlado.
+
 ---
 
 ## 10. Processo da disciplina
@@ -335,9 +359,25 @@ cinco pareceres — ver
 # citações arquivo:linha
 python3 scripts/check-thesis-citations.py
 
-# compilação limpa
-cd docs/thesis && pdflatex -interaction=nonstopmode paper.tex
+# testes do agregador de evidência
+python3 docs/thesis/evidence/test_aggregate.py
 
 # resumos da evidência
 sha256sum docs/thesis/evidence/*.csv
 ```
+
+Compilação limpa — **duas passagens**, pois `thebibliography` e `\ref` só
+resolvem na segunda:
+
+```bash
+cd docs/thesis && pdflatex -interaction=nonstopmode -halt-on-error paper.tex && pdflatex -interaction=nonstopmode -halt-on-error paper.tex
+```
+
+> **Estado verificado em 04/08/2026:** compila em 48 páginas, 0 erros, 0
+> citações indefinidas, 0 referências indefinidas, 0 *overfull boxes*
+> (MiKTeX-pdfTeX 4.23). Um `\cite` ou `\ref` órfão gera apenas *warning* — o PDF
+> sai com marcadores `[?]` e a compilação continua "bem-sucedida". Por isso a
+> CI falha explicitamente diante de qualquer um deles (job `thesis-evidence`).
+>
+> No Windows, o binário pode não estar no `PATH`; o instalador por usuário fica
+> em `%LOCALAPPDATA%\Programs\MiKTeX\miktex\bin\x64`.

@@ -163,6 +163,32 @@ jobs:
       - name: collect-metadata.sh parses
         run: bash -n docs/thesis/evidence/collect-metadata.sh
 
+      - name: Install TeX Live (abntex2 + PGF/TikZ)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            texlive-latex-recommended texlive-latex-extra \
+            texlive-lang-portuguese texlive-fonts-recommended \
+            texlive-pictures texlive-publishers
+
+      # Two passes: `thebibliography` and \ref resolve only on the second.
+      - name: Compile paper.tex
+        working-directory: docs/thesis
+        run: |
+          pdflatex -interaction=nonstopmode -halt-on-error paper.tex
+          pdflatex -interaction=nonstopmode -halt-on-error paper.tex
+
+      # A LaTeX warning is not an error, so an undefined \cite or \ref ships a
+      # PDF full of "[?]" markers while the build stays green. Fail on them.
+      - name: No undefined citations or references
+        working-directory: docs/thesis
+        run: |
+          if grep -E "Citation .* undefined|Reference .* undefined" paper.log; then
+            echo "::error::paper.tex has undefined citations or references"
+            exit 1
+          fi
+          echo "no undefined citations or references"
+
   ui:
     name: UI typecheck
     runs-on: ubuntu-latest
