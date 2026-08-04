@@ -356,10 +356,9 @@ Exigência recorrente nas três disciplinas de Metodologia:
 1. **Ficha catalográfica** — estrutura no lugar certo (verso da folha de rosto,
    p. 4) nas duas variantes. É **formulário automatizado de autoatendimento**,
    não pedido a bibliotecário: gera na hora. Todos os valores campo a campo
-   já estão prontos em
-   [`orientacao/FICHA-CATALOGRAFICA-DADOS.md`](orientacao/FICHA-CATALOGRAFICA-DADOS.md)
-   — restam ≈3 minutos de digitação pelo autor, pois o envio publica dados
-   pessoais em sistema da USP em seu nome. Ver §0.1.
+   já estão prontos no arquivo local privado da ficha catalográfica, mantido
+   fora do repositório público — restam ≈3 minutos de digitação pelo autor,
+   pois o envio publica dados pessoais em sistema da USP em seu nome. Ver §0.1.
 2. **Execução definitiva** — k ≥ 3 sessões com IC 95%. Instrumento pronto e
    ensaiado de ponta a ponta; falta rodar sob as pré-condições do §1 do
    protocolo (`main` publicada + *host* controlado). Ver §9.
@@ -368,8 +367,8 @@ Exigência recorrente nas três disciplinas de Metodologia:
 > **Pacote USPSC 3.2** (§0.2) — variante `paper-uspsc.tex` compila limpa com a
 > identificação oficial `MBAIAp`.
 > **Nome da orientadora** — Profa. Dra. Kalinka Regina Lucas Jaquie Castelo
-> Branco, confirmada pelo autor; perfil e pontos de apoio à pesquisa em
-> [`orientacao/`](orientacao/PERFIL-ORIENTADORA.md).
+> Branco, confirmada pelo autor; o perfil de trabalho permanece em arquivo
+> local privado, fora do repositório público.
 
 > **Deixou de ser bloqueante:** a folha de aprovação, agora implementada em
 > branco na posição correta (§1.1) — variante submetível, já que os nomes da

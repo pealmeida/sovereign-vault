@@ -1,6 +1,6 @@
 # Pontos de apoio — onde ancorar a tese na produção da orientadora
 
-**Complementa:** [`PERFIL-ORIENTADORA.md`](PERFIL-ORIENTADORA.md)
+**Complementa:** o perfil de trabalho local mantido fora do repositório público.
 **Objetivo:** transformar o levantamento em ações concretas sobre o `paper.tex`.
 
 > **Regra de integridade.** Nenhuma citação abaixo deve entrar no texto sem
