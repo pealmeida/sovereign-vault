@@ -110,6 +110,70 @@ ausente compartilham esse piso. Teste
 Coberto pela mesma documentação de R9-12: o descarte da chamada de *priming* no
 caminho padrão passa a ser explícito, e não uma nota de comentário interno.
 
+### Achado próprio — leitura de booleano sensível ao caso. **[CORRIGIDO]**
+
+Encontrado por verificação independente após a implementação de R9-5, não por
+parecerista. É o achado mais grave da rodada.
+
+O harness em Rust serializa booleanos como `true`/`false` (minúsculas, via
+`Display` de `bool`). `aggregate_adversarial` comparava contra `"True"`
+(maiúscula, convenção do Python). Efeito sobre o `adversarial.csv` preliminar já
+versionado:
+
+| Grandeza | Antes da correção | Real |
+|---|---|---|
+| Taxa de bloqueio | 0/30 (0,0%) | 30/30 (100,0%) |
+| IC de Wilson | [0,0; 11,4] | [88,6; 100,0] |
+
+O modo de falha é o pior possível para uma dissertação: **não** levanta exceção,
+**não** produz saída implausível e inverte o resultado principal do braço
+adversarial. A mesma comparação afetava a coluna `transport_error`, de modo que
+erros de transporte reais nunca teriam sido excluídos — anulando na prática a
+correção de R9-5.
+
+Correção: `csv_bool()` normaliza o caso, aceita `true/false/1/0` e **aborta** com
+mensagem nomeando arquivo e coluna diante de qualquer valor não reconhecido, em
+vez de silenciosamente devolver `False`. Nenhum outro ponto do agregador lê
+booleano; latency e micro leem numéricos, que já falham alto.
+
+Regressão fixada em `docs/thesis/evidence/test_aggregate.py` (12 testes), que
+cobre também a compatibilidade com o CSV legado sem a coluna `transport_error`,
+os intervalos de Wilson contra valor de referência publicado, o comportamento do
+bootstrap em entrada constante, o gate de Spearman e as regras de integridade.
+
+> **Consequência para o texto:** nenhuma. Os números do Capítulo 4 foram
+> produzidos pelo harness, não pelo agregador — que ainda não havia sido usado
+> para gerar resultado publicado. O defeito teria corrompido a execução
+> definitiva, que é exatamente o que ainda está por rodar.
+
+### R13 — revisão adversarial do agregador (`zai/glm-4.7`). **[2 de 3 ACEITOS]**
+
+Rodada adicional, disparada sobre `aggregate.py` já corrigido, para verificar a
+própria correção. Três achados:
+
+1. **`{"host": null}` derrubava o agregador. [ACEITO — confirmado]**
+   `meta.get("host", {})` devolve `None` quando a chave existe com valor nulo: o
+   padrão só cobre a chave *ausente*. Reproduzido — `AttributeError` abortava a
+   execução inteira. O mesmo valia para `toolchain`. Corrigido com
+   `meta.get("host") or {}` mais verificação de tipo; a sessão passa a ser
+   **rejeitada com diagnóstico** em vez de derrubar o processo.
+
+2. **Denominador zero indistinguível de falha real. [ACEITO]**
+   Se todas as observações de uma classe forem excluídas por erro de transporte,
+   `wilson_ci(0, 0)` devolve 0% com IC [0,0] — visualmente idêntico a "nada foi
+   bloqueado". Mantido o retorno numérico (NaN contaminaria os CSVs), mas
+   `main()` passa a emitir ressalva explícita nomeando a classe e declarando que
+   a taxa é artefato de amostra vazia, não resultado.
+
+3. **Interpolação de percentil divergiria do numpy. [REJEITADO — falso positivo]**
+   Verificado por comparação direta contra `numpy.percentile` em 300 amostras
+   aleatórias (n ∈ {3, 5, 10, 15, 100, 10.000}, q ∈ {0,025; 0,5; 0,975}): a
+   divergência máxima é 1,4·10⁻¹⁴, ou seja, ruído de ponto flutuante. A
+   implementação **é** a convenção linear declarada na docstring. Nenhuma
+   mudança. Teste `test_percentile_matches_numpy_default_convention` fixa a
+   equivalência (pula se numpy não estiver instalado, em vez de aprovar em
+   silêncio).
+
 ---
 
 ## Achados implementados — texto

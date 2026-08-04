@@ -182,7 +182,7 @@ def check_integrity(sessions):
             path = s / name
             if not path.exists():
                 problems.append(f"{s.name}: {name} ausente")
-            elif sum(1 for _ in path.open(encoding="utf-8")) < 2:
+            elif count_lines(path) < 2:
                 problems.append(f"{s.name}: {name} truncado (só cabeçalho)")
         meta_path = s / "run-metadata.json"
         if not meta_path.exists():
@@ -193,7 +193,13 @@ def check_integrity(sessions):
         except (json.JSONDecodeError, OSError) as exc:
             problems.append(f"{s.name}: run-metadata.json ilegível ({exc})")
             continue
-        host = meta.get("host", {})
+        # `meta.get("host", {})` devolveria `None` para `{"host": null}`: o
+        # padrão só se aplica à chave ausente, não ao valor nulo. Um JSON assim
+        # derrubaria o agregador com AttributeError em vez de ser rejeitado.
+        host = meta.get("host") or {}
+        if not isinstance(host, dict):
+            problems.append(f"{s.name}: 'host' não é um objeto JSON (§3)")
+            host = {}
         for field in REQUIRED_HOST_FIELDS:
             value = str(host.get(field, "")).strip()
             if value in UNUSABLE_VALUES:
@@ -206,7 +212,10 @@ def check_integrity(sessions):
                     f"{s.name}: host.{field} contém placeholder '{value}' — "
                     "proveniência falsa (§3)"
                 )
-        rustc = str(meta.get("toolchain", {}).get("rustc", "")).strip()
+        toolchain = meta.get("toolchain") or {}
+        if not isinstance(toolchain, dict):
+            toolchain = {}
+        rustc = str(toolchain.get("rustc", "")).strip()
         if rustc in UNUSABLE_VALUES:
             problems.append(f"{s.name}: toolchain.rustc ausente ou 'n/a' (§3)")
     return problems
@@ -263,23 +272,50 @@ def aggregate_micro(sessions, rng):
     return rows, acceptance
 
 
+def count_lines(path):
+    """Conta linhas fechando o arquivo (o gerador solto vazava o descritor)."""
+    with path.open(encoding="utf-8") as f:
+        return sum(1 for _ in f)
+
+
+def csv_bool(value, field, session):
+    """Booleano de CSV, tolerante ao caso e intolerante ao resto.
+
+    O harness em Rust serializa ``true``/``false`` (minúsculas); um CSV
+    produzido por ferramenta Python traria ``True``/``False``. Comparar contra
+    uma única grafia faz todo bloqueio legítimo ser lido como "não bloqueado" —
+    silenciosamente, sem exceção e com saída plausível. Qualquer valor não
+    reconhecido aborta em vez de virar ``False`` por omissão.
+    """
+    normalized = str(value).strip().lower()
+    if normalized in ("true", "1"):
+        return True
+    if normalized in ("false", "0", ""):
+        return False
+    sys.exit(
+        f"erro: {session}: coluna '{field}' com valor não booleano "
+        f"{value!r} em adversarial.csv (§5.3)"
+    )
+
+
 def aggregate_adversarial(sessions):
     """§5.3: proporção sobre k × n_sondas com IC de Wilson; §6.3 concordância.
 
-    Observações com ``transport_error=True`` não carregam decisão de política e
-    são excluídas de ambas as taxas, contadas à parte. CSVs anteriores à coluna
-    ``transport_error`` são lidos como se não houvesse nenhuma.
+    Observações com ``transport_error`` verdadeiro não carregam decisão de
+    política e são excluídas de ambas as taxas, contadas à parte. CSVs
+    anteriores à coluna ``transport_error`` são lidos como se não houvesse
+    nenhuma.
     """
     per_probe = {}
     transport_errors = 0
     for s in sessions:
         with (s / "adversarial.csv").open(encoding="utf-8", newline="") as f:
             for row in csv.DictReader(f):
-                if row.get("transport_error", "False") == "True":
+                if csv_bool(row.get("transport_error", ""), "transport_error", s.name):
                     transport_errors += 1
                     continue
                 per_probe.setdefault(row["id"], []).append(
-                    (row["class"], row["blocked"] == "True")
+                    (row["class"], csv_bool(row["blocked"], "blocked", s.name))
                 )
 
     divergent = []
@@ -376,6 +412,15 @@ def main():
             "transporte, excluídas de ambas as taxas: investigar a infraestrutura "
             "antes de reportar as taxas como estáveis"
         )
+    # Denominador vazio sai de wilson_ci como 0/0 = 0% com IC [0,0], forma
+    # indistinguível de uma falha real e total. Só é legível como ressalva.
+    for klass, _k, trials, _successes, _rate, _lo, _hi in adv_rows:
+        if trials == 0:
+            reservations.append(
+                f"§5.3 classe '{klass}' ficou sem nenhuma observação válida "
+                "(denominador zero após exclusão de erros de transporte): a taxa "
+                "de 0% e o IC [0,0] são artefato de amostra vazia, não resultado"
+            )
     for mode, size, stage, cell_cv, cell_drift in lat_acc + mic_acc:
         cell = f"({mode},{size},{stage})"
         if cell_cv > CV_MAX:
