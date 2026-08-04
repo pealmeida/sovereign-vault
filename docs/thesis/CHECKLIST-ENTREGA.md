@@ -351,6 +351,13 @@ Exigência recorrente nas três disciplinas de Metodologia:
 > branco na posição correta (§1.1) — variante submetível, já que os nomes da
 > banca só existem após a defesa. Resta apenas confirmar o procedimento do ICMC.
 
+> **Passo a passo dos itens restantes:**
+> [`ENTREGA-FINAL-PASSOS.md`](ENTREGA-FINAL-PASSOS.md) traz, para cada
+> bloqueante, o comando ou a ação exata, e registra por que cada um exige o
+> autor: informação que não existe no repositório (nome do orientador, ficha),
+> decisão a alinhar com a orientadora (USPSC) ou condição de ambiente que não é
+> verificável por automação (execução definitiva).
+
 > Os itens 1 e 2 vieram da consulta às fontes institucionais e **não estavam
 > neste checklist na primeira versão**. São os de maior risco: descumprem
 > exigência explícita e ficam mais caros quanto mais tarde forem tratados.
