@@ -79,8 +79,9 @@ out to measure.
 ### Cross-platform reproduction (Linux)
 
 Re-running the release harness (1000 reads/cell, `--release`) on a second host —
-Linux 7.0, 11th Gen Intel Core i7-11600H (12 threads) @ 2.90 GHz, 30 GiB RAM,
-rustc 1.96.1, captured 2026-07-31 — reproduces the §3.9.1 findings with different
+Linux (kernel version not preserved in the preliminary capture), 11th Gen Intel
+Core i7-11600H (12 threads) @ 2.90 GHz, 30 GiB RAM, rustc 1.96.1, captured
+2026-07-31 — reproduces the §3.9.1 findings with different
 absolute magnitudes:
 
 | Mode | Bytes | T_filter (validate) | T_filter (PII) | T_hitl (authorize) | T_vault (execute) | **T_total** |
