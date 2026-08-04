@@ -15,13 +15,77 @@
 >    `abntex2`;
 > 3. **Verificação direta** do estado atual do documento e do repositório.
 >
-> **O que este checklist NÃO é:** o regulamento oficial de depósito do ICMC/USP.
-> Não tive acesso a ele. Os itens marcados **[CONFIRMAR]** dependem de norma
-> institucional que só a secretaria do programa ou a orientadora podem informar
-> — e alguns deles podem invalidar uma entrega se descumpridos.
+> **Atualização de 04/08/2026 — fontes institucionais consultadas.** As 23 fontes
+> das disciplinas de Metodologia foram consultadas no NotebookLM
+> ("Framework for Academic Thesis Composition"), incluindo os materiais que eu
+> não tinha: `Aula 4 — Outras normas, template Word e ficha`,
+> `Aula 5 — template LaTeX`, `esqueleto para TCC`, `Aula 2 — Plágio e Citações`
+> e `Aula 3 — Referências`. Isso resolveu vários `[CONFIRMAR]` e **revelou dois
+> requisitos obrigatórios que este checklist não continha** (§0).
 >
-> **Ação recomendada:** confirmar os itens [CONFIRMAR] com a coordenação antes de
-> novembro, para haver tempo de corrigir.
+> **O que ainda NÃO é:** o regulamento formal de depósito. Os `[CONFIRMAR]`
+> remanescentes seguem dependendo da coordenação.
+
+---
+
+## 0. Requisitos institucionais descobertos — AÇÃO NECESSÁRIA
+
+Fonte: relatórios "Guia Consolidado e Context Dump para Estruturação de TCC" e
+"Methodology and Project Guidelines for AI and Big Data II", ambos derivados das
+23 fontes das disciplinas.
+
+### 0.1 Ficha catalográfica — OBRIGATÓRIA, ausente
+
+> "A ficha catalográfica é elemento obrigatório. Ela deve ser gerada
+> eletronicamente através do sistema da **Biblioteca Achille Bassi (ICMC)**."
+
+Gerar em:
+`https://www.icmc.usp.br/institucional/estrutura-administrativa/biblioteca/servicos/ficha`
+
+Ela é inserida no verso da folha de rosto e garante a indexação do trabalho nos
+sistemas da USP. **Não existe no `paper.tex` atual.**
+
+### 0.2 Pacote USPSC 3.2 — OBRIGATÓRIO, não utilizado
+
+> "É **obrigatório** o uso do pacote customizado para o ICMC, baseado na classe
+> `abntex2`. Para o MBA, as siglas de identificação são: **MBAIAp** para
+> trabalhos em Português e **MBAIAe** para Inglês."
+
+O documento atual usa `\documentclass{abntex2}` diretamente. O USPSC é uma
+camada sobre o `abntex2` com a estrutura de arquivos pré-textual do ICMC
+(`USPSC-pre-textual-ICMC.tex`) e a identificação do programa.
+
+**Impacto:** migrar exige reorganizar o documento na estrutura de pastas do
+pacote. Não é trivial, mas é mecânico, e o conteúdo escrito se preserva.
+**Decisão do autor**, ver §0.4.
+
+### 0.3 Normas ABNT completas
+
+O mapeamento oficial das disciplinas inclui normas que este checklist não
+listava:
+
+| Norma | Função | Coberto? |
+|---|---|---|
+| NBR 14724:2011 | Apresentação de trabalhos acadêmicos | ✅ |
+| NBR 6023:2018 | Referências | ✅ |
+| **NBR 10520:2023** | **Citações em documentos (atualizada)** | ⚠️ verificar |
+| **NBR 6024:2012** | **Numeração progressiva das seções** | ✅ (abntex2) |
+| **NBR 6027:2012** | **Sumário** | ✅ (abntex2) |
+| NBR 6028:2003 | Resumos | ✅ |
+
+A NBR 10520 foi **atualizada em 2023** e mudou regras de citação. O documento usa
+`thebibliography` manual — mais um argumento para migrar ao sistema automatizado.
+
+### 0.4 Decisão necessária: migrar para USPSC?
+
+| Opção | Prós | Contras |
+|---|---|---|
+| **Migrar para USPSC 3.2** | Cumpre a exigência declarada; ficha e pré-textuais do ICMC vêm prontos; conformidade normativa automática | Reorganização do documento; risco de retrabalho a ~4 meses do prazo |
+| **Manter `abntex2` puro** | Zero retrabalho; compila limpo hoje | **Descumpre exigência explícita**; risco na banca |
+
+**Recomendação:** migrar. A exigência é explícita ("é obrigatório"), o USPSC é
+baseado na mesma classe que já está em uso, e quanto mais tarde a migração, mais
+caro o retrabalho. Confirmar com a orientadora antes de executar.
 
 ---
 
@@ -124,9 +188,14 @@ São de baixo risco individual, mas somam.
 | Data de acesso em fonte eletrônica | ✅ | presente nas entradas com URL |
 | Toda citação no texto tem entrada na lista | ✅ | 0 citações indefinidas na compilação |
 
-**Recomendação:** migrar para `abntex2cite` (o pacote **está instalado**
-localmente). É a última tarefa mecânica pendente, de baixo risco, e elimina toda
-essa classe de inconsistência de formatação.
+**Recomendação revista (04/08).** A migração para `abntex2cite` deixa de ser
+tarefa isolada: se o USPSC 3.2 for adotado (§0.2), ele já traz o sistema de
+citação configurado conforme ABNT, incluindo a **NBR 10520:2023**. As fontes
+também indicam gestão bibliográfica via **arquivo `.bib` com BibTeX**, não
+`thebibliography` manual.
+
+**Não migrar para `abntex2cite` isoladamente** — fazer isso e depois migrar para
+o USPSC seria retrabalho duplicado. Decidir §0.4 primeiro.
 
 ---
 
@@ -224,16 +293,24 @@ Exigência recorrente nas três disciplinas de Metodologia:
 
 **Bloqueantes (impedem entrega):**
 
-1. **Nome do orientador** na folha de rosto — hoje sai `[ORIENTADOR(A) A CONFIRMAR]` visível no PDF.
-2. **Execução definitiva** — k ≥ 3 sessões com IC 95%. Instrumento pronto; falta rodar.
-3. **Folha de aprovação** — [CONFIRMAR] se exigida já na submissão.
+1. **Ficha catalográfica** — obrigatória, gerada pela Biblioteca Achille Bassi. **Ausente.** Ver §0.1.
+2. **Pacote USPSC 3.2** — declarado obrigatório; o documento usa `abntex2` puro. Ver §0.2 e §0.4.
+3. **Nome do orientador** na folha de rosto — hoje sai `[ORIENTADOR(A) A CONFIRMAR]` visível no PDF.
+4. **Execução definitiva** — k ≥ 3 sessões com IC 95%. Instrumento pronto; falta rodar.
+5. **Folha de aprovação** — [CONFIRMAR] se exigida já na submissão.
+
+> Os itens 1 e 2 vieram da consulta às fontes institucionais e **não estavam
+> neste checklist na primeira versão**. São os de maior risco: descumprem
+> exigência explícita e ficam mais caros quanto mais tarde forem tratados.
 
 **A confirmar com a coordenação (podem virar bloqueantes):**
 
-4. Relatório antiplágio.
-5. Declaração de uso de IA.
-6. `oneside` vs `twoside`.
-7. Lista de símbolos.
+6. Relatório antiplágio — as fontes tratam plágio com severidade (anulação do
+   projeto, revogação do título), mas não indicam se há verificação formal.
+7. Declaração de uso de IA.
+8. `oneside` vs `twoside` — provavelmente resolvido pelo USPSC.
+9. Lista de símbolos.
+10. Conformidade com a **NBR 10520:2023** (citações), atualizada.
 
 **Recomendados (fortalecem, não bloqueiam):**
 
