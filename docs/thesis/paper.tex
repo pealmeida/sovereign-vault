@@ -366,6 +366,7 @@ No caminho desktop WebSocket autenticado, o fluxo de solicitações passa por au
 O protótipo é codificado em Rust. A proibição de \codigo{unsafe} nos crates próprios reduz classes de erros de corrupção de memória no código de aplicação auditado (por exemplo, \codigo{crates/sv-mcp/src/lib.rs:18}). Não se infere daí ausência de vulnerabilidades críticas, isolamento de memória no SO ou redução mensurada de latência. Tauri foi escolhido para a interface com CSP e capacidades explícitas, sem alegação comparativa perante Electron.
 
 \section{Dados da Avaliação}
+\label{sec:dados-avaliacao}
 Os dados da avaliação são gerados sinteticamente pelo \textit{harness} \codigo{apps/thesis-eval}: ele cria um cofre temporário, semeia arquivos e dirige o gateway real. Portanto, os dados não provêm de repositório externo. O uso de dados pessoais reais para medir o filtro de PII criaria o próprio risco que o artefato busca mitigar; por não haver necessidade para a medição, não se trata dado pessoal real, em consonância com a minimização esperada pela LGPD.
 
 Em \codigo{payload_for}, nas linhas 466--478 de \codigo{apps/thesis-eval/src/main.rs}, as condições não ANONYMIZED usam um preenchimento sem PII, e a condição ANONYMIZED usa, para que o filtro execute trabalho sobre conteúdo marcado, uma unidade portadora de PII. As duas unidades são, respectivamente:
@@ -380,7 +381,9 @@ As unidades são repetidas e truncadas exatamente em 128 B, 1 KiB (1.024 B) e 16
 
 As cargas ANONYMIZED contêm exatamente três das sete categorias detectadas pelo filtro: e-mail, CPF e IPv4. Assim, o custo observado para o filtro é específico dessa composição e não corresponde a uma média sobre documentos reais. O subcomando \codigo{micro} usa a mesma unidade de PII em \codigo{pii_payload}, linhas 315--323, o que torna o custo isolado comparável ao estágio $T_{filter}$ do gateway.
 
-A bateria adversarial contém 12 sondas pré-especificadas no código: A1--A10 são ataques e C1--C2 são controles. O \textit{harness} materializa \codigo{target/thesis-eval/adversarial.csv} com os campos \codigo{id}, \codigo{class}, \codigo{blocked}, \codigo{expected_block}, \codigo{pass} e \codigo{description}; o veredito esperado é declarado antes da execução, o que evita seleção \textit{post-hoc} de resultados.
+A bateria adversarial contém 12 sondas pré-especificadas no código: A1--A10 são ataques e C1--C2 são controles. O \textit{harness} materializa \codigo{target/thesis-eval/adversarial.csv} com os campos \codigo{id}, \codigo{class}, \codigo{blocked}, \codigo{transport_error}, \codigo{expected_block}, \codigo{pass} e \codigo{description}; o veredito esperado é declarado antes da execução, o que evita seleção \textit{post-hoc} de resultados.
+
+O campo \codigo{transport_error} separa decisão de política de ruído de infraestrutura. Uma sonda cuja troca não alcança veredito do servidor --- falha de conexão, de envio ou de leitura do fluxo --- não informa nada sobre o controle avaliado; contá-la como bloqueio faria um soquete instável parecer defesa em funcionamento. Essas observações são, portanto, excluídas do numerador \textbf{e} do denominador da taxa de bloqueio e da taxa de disponibilidade, e reportadas à parte pelo agregador (\codigo{docs/thesis/evidence/aggregate.py}). A rejeição de pareamento não é falha de transporte: o servidor respondeu e recusou as credenciais, de modo que permanece classificada como bloqueio. O CSV da execução preliminar reproduzido no Apêndice~\ref{cap:reprodutibilidade} antecede a introdução dessa coluna e é lido como se nenhuma sonda tivesse falhado em transporte, o que corresponde ao ocorrido naquela execução.
 
 A Tabela~\ref{tab:dados-avaliacao} resume a composição do conjunto sintético descrito nesta seção. As medições por chamada do gateway são coletadas por \codigo{TimingSink} nos estágios \codigo{validate}, \codigo{authorize}, \codigo{execute} e \codigo{filter}, e são agregadas em média, p50 e p95 em \codigo{latency.csv}. O subcomando \codigo{micro} materializa as medições isoladas em \codigo{micro.csv}, e a bateria materializa os vereditos pré-especificados em \codigo{adversarial.csv}. A execução atual é preliminar, de uma sessão e sem intervalo de confiança (IC); a execução definitiva requer $k\geq3$ sessões e IC de 95\% por \textit{bootstrap}, como especificado no plano de avaliação.
 
@@ -457,7 +460,7 @@ Mediação MCP desktop & implementação desktop WS de escopos, APPROVAL/OTP e a
 Sem retorno de bytes de chave & implementação de trânsito/assinatura & não elimina abuso como oráculo \\
 Redução de PII & sete categorias heurísticas em saída ANONYMIZED & não é anonimização genérica/LGPD; somente texto; NÃO detecta RG, CEP, nomes, endereços, datas de nascimento e telefones sem formatação \\
 Sobrecarga local & \textit{microbenchmark} N=1.000 & execução preliminar de desenvolvimento, uma sessão sem intervalo de confiança (IC); sem humano, WAN, inferência, baseline de nuvem ou utilidade \\
-Resultado adversarial & 10/10 sondas e 2/2 controles & execução preliminar de uma sessão; valida transporte WS, escopo, caminho e política simulada, sem controlador desktop real, atacante adaptativo ou inferência de taxa populacional \\
+Resultado adversarial & 10/10 sondas e 2/2 controles, sem falhas de transporte & execução preliminar de uma sessão; valida transporte WS, escopo, caminho e política simulada, sem controlador desktop real, atacante adaptativo ou inferência de taxa populacional \\
 \bottomrule
 \end{tabularx}
 \fonte{Elaboração própria com base nos crates citados e nos artefatos em \codigo{target/thesis-eval}.}
@@ -546,7 +549,7 @@ A Figura~\ref{fig:latencia-estagios} decompõe as médias por estágio a partir 
 Medições isoladas dos componentes também estão disponíveis no arquivo \codigo{micro.csv} do mesmo diretório de avaliação, na execução preliminar de uma sessão e sem intervalo de confiança: para 128 B, 1 KiB e 16 KiB, a leitura/decifra teve médias de 4,14\micro{}, 4,97\micro{} e 16,82\micro{}, e o filtro teve 1,17\micro{}, 7,86\micro{} e 125,08\micro{}, respectivamente. São medições fora do gateway e não devem ser somadas à Tabela~\ref{tab:microbenchmark-latencia} como se fossem uma nova latência fim a fim.
 
 \section{Bateria Adversarial Pré-especificada}
-Na execução preliminar única da bateria pré-especificada, o gateway bloqueou 10/10 chamadas maliciosas e aceitou 2/2 controles legítimos, conforme \codigo{target/thesis-eval/adversarial.csv} e Tabela~\ref{tab:sondas-adversariais}. O resultado valida somente transporte WebSocket, escopo, validação de caminho e aplicação de política HITL simulada; ele não exercita o controlador real de consentimento desktop, nem atribui cada bloqueio individual à sua causa. Não estima robustez geral contra adversário adaptativo, fluxo de exfiltração por operações permitidas ou população de ataques.
+Na execução preliminar única da bateria pré-especificada, o gateway bloqueou 10/10 chamadas maliciosas e aceitou 2/2 controles legítimos, conforme \codigo{target/thesis-eval/adversarial.csv} e Tabela~\ref{tab:sondas-adversariais}. Nenhuma sonda falhou em transporte nessa execução, de modo que as duas taxas incidem sobre a bateria completa; o critério de exclusão descrito na Seção~\ref{sec:dados-avaliacao} não retirou nenhuma observação. O resultado valida somente transporte WebSocket, escopo, validação de caminho e aplicação de política HITL simulada; ele não exercita o controlador real de consentimento desktop, nem atribui cada bloqueio individual à sua causa. Não estima robustez geral contra adversário adaptativo, fluxo de exfiltração por operações permitidas ou população de ataques.
 
 \begin{table}[htbp]
 \centering
@@ -647,6 +650,7 @@ Os contêineres de contexto descritos no ADR-0012 também permanecem propostos e
 
 \appendix
 \chapter{REPRODUTIBILIDADE DA EVIDÊNCIA ATUAL}
+\label{cap:reprodutibilidade}
 Os artefatos analisados estão versionados em \codigo{docs/thesis/evidence/}, nos arquivos \codigo{latency.csv}, \codigo{adversarial.csv} e \codigo{micro.csv}. São cópias fiéis, verificadas por resumo criptográfico, da saída gerada em \codigo{target/thesis-eval/}, diretório que não é versionado. O comando registrado para produzir a execução preliminar de desenvolvimento é:
 \begingroup
 \footnotesize
