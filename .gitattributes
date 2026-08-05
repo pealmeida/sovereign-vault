@@ -1,0 +1,59 @@
+# Line endings.
+#
+# Without this file, checkout behaviour depends on each contributor's
+# core.autocrlf setting. On Windows (autocrlf=true) a tool that rewrites a
+# file — pdflatex rewriting docs/thesis/paper.tex, for instance — can flip its
+# terminators wholesale, producing a diff of hundreds of lines where only a
+# few are real edits. Declaring the policy here makes it identical for
+# everyone regardless of platform or local config.
+#
+# LF is the stored form for every text file. Git still checks out CRLF for the
+# formats below that genuinely need it on Windows.
+#
+# Note: this normalises files as they are next edited. Blobs already committed
+# with CRLF keep it until touched; run `git add --renormalize .` if a
+# repository-wide sweep is ever wanted (it rewrites ~45 files in one commit).
+
+* text=auto eol=lf
+
+# Windows-native formats: CRLF in the working tree, LF in the repository.
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+*.ps1    text eol=crlf
+
+# Shell scripts and anything with a shebang must stay LF even on Windows:
+# CRLF breaks the interpreter line.
+*.sh     text eol=lf
+*.bash   text eol=lf
+
+# Binary: never touch, never diff as text.
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.icns   binary
+*.pdf    binary
+*.zip    binary
+*.gz     binary
+*.woff   binary
+*.woff2  binary
+*.ttf    binary
+*.otf    binary
+*.dll    binary
+*.exe    binary
+*.so     binary
+*.dylib  binary
+
+# Evidence CSVs are hashed and reproduced verbatim in the thesis appendix.
+# Keep them LF so a checkout on any platform reproduces the recorded SHA-256.
+docs/thesis/evidence/*.csv text eol=lf
+
+# Vendored USPSC template: upstream artefact, excluded from language stats and
+# from diffs by default.
+docs/thesis/uspsc/**    linguist-vendored
+target/uspsc/**         linguist-vendored
+
+# Lockfiles: keep them in diffs but collapse them in review UIs.
+Cargo.lock              linguist-generated
+package-lock.json       linguist-generated
