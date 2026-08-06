@@ -1,0 +1,6 @@
+term,coefficient,unit
+intercept_a,0.56689,us
+bytes_b,0.002683,us/byte
+bytes_x_density_c,0.004712,us/byte (at density=1)
+r_squared,0.99979,
+density_share_of_slope_at_density1_pct,63.72,%

@@ -1,0 +1,13 @@
+mode,bytes,warmup,seed,execution_order
+approval,1024,200,202,0
+anon,128,200,202,1
+otp,16384,200,202,2
+anon,1024,200,202,3
+anon,16384,200,202,4
+direct,128,200,202,5
+direct,16384,200,202,6
+approval,16384,200,202,7
+otp,128,200,202,8
+direct,1024,200,202,9
+approval,128,200,202,10
+otp,1024,200,202,11

@@ -78,6 +78,9 @@ docs/thesis/*.bbl
 docs/thesis/*.blg
 docs/thesis/*.brf
 docs/thesis/*.synctex.gz
+docs/thesis/*.fls
+docs/thesis/*.fdb_latexmk
+docs/thesis/*.log
 
 # USPSC variant build artifacts
 docs/thesis/paper-uspsc.pdf

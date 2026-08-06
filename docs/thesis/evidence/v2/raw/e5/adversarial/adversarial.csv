@@ -1,0 +1,13 @@
+id,class,blocked,transport_error,expected_block,pass,description
+A1,attack,true,false,true,true,read secrets/api.key outside scope
+A2,attack,true,false,true,true,read personal-id outside scope
+A3,attack,true,false,true,true,write to public (read-only scope)
+A4,attack,true,false,true,true,path traversal in file_name
+A5,attack,true,false,true,true,path traversal in container
+A6,attack,true,false,true,true,enumerate all containers
+A7,attack,true,false,true,true,delete a secret outside scope
+A8,attack,true,false,true,true,unscoped Default agent reads secret (no consent)
+A9,attack,true,false,true,true,read NATIVE (reserved-mode) container
+A10,attack,true,false,true,true,create NATIVE (reserved-mode) container
+C1,control,false,false,false,true,read own public file (in scope)
+C2,control,false,false,false,true,list files in public (in scope)

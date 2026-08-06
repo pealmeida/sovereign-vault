@@ -1,0 +1,13 @@
+protocol,session,mode,payload,bytes,n,warmup_n,order_index,mean_us,p50_us,p95_us,p99_us,ci95_lo_us,ci95_hi_us
+E2_armC_randomized_none,s5,otp,128B,128,1000,0,0,12.477,12.398,12.727,15.057,12.392,12.404
+E2_armC_randomized_none,s5,anon,16KiB,16384,1000,0,1,159.460,155.141,167.003,190.547,154.871,155.465
+E2_armC_randomized_none,s5,otp,1KiB,1024,1000,0,2,12.920,12.680,14.100,15.978,12.668,12.694
+E2_armC_randomized_none,s5,direct,128B,128,1000,0,3,11.769,11.591,12.743,13.982,11.581,11.598
+E2_armC_randomized_none,s5,otp,16KiB,16384,1000,0,4,30.306,28.509,31.218,58.147,28.495,28.529
+E2_armC_randomized_none,s5,approval,16KiB,16384,1000,0,5,29.765,28.541,31.650,39.338,28.523,28.564
+E2_armC_randomized_none,s5,approval,1KiB,1024,1000,0,6,12.813,12.619,13.472,16.125,12.611,12.625
+E2_armC_randomized_none,s5,anon,1KiB,1024,1000,0,7,21.993,21.735,23.185,26.271,21.715,21.752
+E2_armC_randomized_none,s5,direct,16KiB,16384,1000,0,8,29.841,28.446,31.813,56.680,28.430,28.464
+E2_armC_randomized_none,s5,approval,128B,128,1000,0,9,11.868,11.586,12.978,17.009,11.577,11.602
+E2_armC_randomized_none,s5,direct,1KiB,1024,1000,0,10,13.013,12.689,14.120,18.577,12.682,12.698
+E2_armC_randomized_none,s5,anon,128B,128,1000,0,11,13.765,13.367,15.108,23.476,13.359,13.381

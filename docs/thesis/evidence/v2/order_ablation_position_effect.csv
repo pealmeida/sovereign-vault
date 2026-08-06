@@ -1,0 +1,5 @@
+group,slope_pct_per_position,intercept_pct,n_points
+E2_armA_fixed_none,0.0285,0.5923,60
+E2_armB_fixed_discarded,-0.0153,1.6791,60
+E2_armC_randomized_none,-0.1739,0.812,60
+E2_armD_randomized_discarded,-0.0332,-0.76,60

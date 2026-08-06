@@ -1,0 +1,20 @@
+{
+  "session_id": "s1",
+  "eval_tag": "E2_armC_randomized_none",
+  "commit": "9d05c9fee791c57f56f8caf45d3874c072f9f609",
+  "command": "./target/release/thesis-eval latency --out docs/thesis/evidence/v2/raw/e2/armC/s1 --iterations 1000 --warmup 0 --session s1 --protocol E2_armC_randomized_none --seed 101",
+  "profile": "release",
+  "date_utc": "2026-08-06T18:18:05Z",
+  "host": {
+    "os": "Linux",
+    "kernel": "7.0.0-29-generic",
+    "cpu_model": "11th Gen Intel(R) Core(TM) i7-11600H @ 2.90GHz",
+    "cpu_cores": "12",
+    "ram_kb": "32108564",
+    "storage": "/dev/nvme1n1p2 932G 434G free",
+    "power_mode": "AC-powersave-governor-noturbo-lock-unavailable"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)"
+  }
+}

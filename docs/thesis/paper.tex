@@ -9,6 +9,7 @@
 \usepackage{microtype}
 \usepackage{amsmath}
 \usepackage{booktabs}
+\usepackage{multirow}
 \usepackage{tabularx}
 \usepackage{array}
 \usepackage{graphicx}
@@ -109,12 +110,12 @@ Trabalho aprovado. São Carlos, \rule[-0.2cm]{2.5cm}{0.15mm} de
 \end{folhadeaprovacao}
 
 \begin{resumo}
-Esta pesquisa propõe uma arquitetura Local-First para mediar acessos de agentes de IA a segredos e credenciais locais. A instância avaliada, denominada Sovereign Vault, combina cofre cifrado, gateway MCP, escopos de capacidade, modos de consentimento e auditoria com evidência de adulteração. A avaliação atual é deliberadamente limitada a um \textit{microbenchmark} local sintético e a uma bateria finita de chamadas de ferramenta; não mede inferência em nuvem, utilidade de tarefa ou tempo de decisão humana. No modo ANONYMIZED, nomes completos, endereços, RG, CEP e telefones sem formatação passam sem máscara: mesmo com CPF ou CNPJ mascarados, um documento com nome e endereço pode permanecer identificável sob o Art.~5º da LGPD. Assim, o artefato não é adequado a documentos em que a vinculação de identidade por campos não mascarados seja risco realista.\par
+Esta pesquisa propõe uma arquitetura Local-First para mediar acessos de agentes de IA a segredos e credenciais locais. A instância avaliada, denominada Sovereign Vault, combina cofre cifrado, gateway MCP, escopos de capacidade, modos de consentimento e auditoria com evidência de adulteração. Sob protocolo corrigido de medição ($k=10$ sessões, ordem de células aleatorizada, mediana com intervalo de confiança de 95\% por \textit{bootstrap}), o custo do gate de consentimento sob AutoAllow é indistinguível de zero nos seis contrastes pareados; a imposição de escopos no caminho WebSocket custa aproximadamente 2,1~$\mu$s com 20 escopos; e a extensão da bateria adversarial pré-especificada elevou a cobertura da superfície de 20 ferramentas MCP de 5/20 para 17/20, revelando um defeito real de imposição de escopos no modo \textit{headless}. A avaliação atual é deliberadamente limitada a um \textit{microbenchmark} local sintético e a uma bateria finita de chamadas de ferramenta; não mede inferência em nuvem, utilidade de tarefa, tempo de decisão humana ou o custo da escrita de auditoria, excluído da soma de estágios instrumentada. No modo ANONYMIZED, nomes completos, endereços, RG, CEP e telefones sem formatação passam sem máscara: mesmo com CPF ou CNPJ mascarados, um documento com nome e endereço pode permanecer identificável sob o Art.~5º da LGPD. Assim, o artefato não é adequado a documentos em que a vinculação de identidade por campos não mascarados seja risco realista.\par
 \textbf{Palavras-chave}: soberania de dados; agentes de IA; MCP; Local-First; privacidade.
 \end{resumo}
 \begin{resumo}[Abstract]
 \begin{otherlanguage*}{english}
-This research proposes a Local-First architecture to mediate AI-agent access to local secrets and credentials. The evaluated instance, called Sovereign Vault, combines an encrypted vault, an MCP gateway, capability scopes, consent modes, and auditability with tamper evidence. The current evaluation is deliberately limited to a synthetic local microbenchmark and a finite suite of tool calls; it does not measure cloud inference, task utility, or human decision time. In ANONYMIZED mode, full names, addresses, Brazilian RG identification numbers, CEP postal codes, and unformatted telephone numbers pass through unmasked: even with Brazilian CPF or CNPJ identifiers masked, a document containing a name and address may remain identifiable under Article 5 of the LGPD. Therefore, the artifact is not suitable for documents in which identity linkage through unmasked fields is a realistic risk.
+This research proposes a Local-First architecture to mediate AI-agent access to local secrets and credentials. The evaluated instance, called Sovereign Vault, combines an encrypted vault, an MCP gateway, capability scopes, consent modes, and auditability with tamper evidence. Under a corrected measurement protocol ($k=10$ sessions, randomized cell order, median with 95\% bootstrap confidence intervals), the cost of the consent gate under AutoAllow is indistinguishable from zero in all six paired contrasts; scope enforcement on the WebSocket path costs approximately 2.1~$\mu$s with 20 scopes; and the extension of the pre-specified adversarial battery raised coverage of the 20-tool MCP surface from 5/20 to 17/20, revealing a real scope-enforcement defect in headless mode. The current evaluation is deliberately limited to a synthetic local microbenchmark and a finite suite of tool calls; it does not measure cloud inference, task utility, human decision time, or the cost of the audit write, which is excluded from the instrumented stage sum. In ANONYMIZED mode, full names, addresses, Brazilian RG identification numbers, CEP postal codes, and unformatted telephone numbers pass through unmasked: even with Brazilian CPF or CNPJ identifiers masked, a document containing a name and address may remain identifiable under Article 5 of the LGPD. Therefore, the artifact is not suitable for documents in which identity linkage through unmasked fields is a realistic risk.
 \end{otherlanguage*}
 \textbf{Keywords}: data sovereignty; AI agents; MCP; Local-First; privacy.
 \end{resumo}
@@ -411,7 +412,7 @@ O desenho do \textit{microbenchmark} filia-se à tradição de avaliação de de
 \resizebox{\textwidth}{!}{$\displaystyle T_{gateway}=T_{parse+validacao+escopo}+T_{cofre}+I_{anon}(T_{mascaramento})+I_{consentimento}(T_{espera\ humana}+T_{despacho})$}
 \label{eq:gateway}
 \end{equation}
-Na Equação~\eqref{eq:gateway}, o indicador $I$ vale 1 somente quando o modo correspondente é aplicado. No \textit{microbenchmark stdio} atual, o termo $T_{parse+validacao+escopo}$ observa somente validação de parâmetros e caminho: o transporte usa \codigo{PairState::AlreadyPaired(None)}, portanto não há resolução de agente nem aplicação de escopo nesse caminho. O custo de \codigo{enforce_scopes} não é medido neste \textit{microbenchmark}; ele é exercido separadamente na bateria adversarial, no transporte WebSocket. Para uma única chamada MCP instrumentada, define-se separadamente:
+Na Equação~\eqref{eq:gateway}, o indicador $I$ vale 1 somente quando o modo correspondente é aplicado. No \textit{microbenchmark stdio} atual, o termo $T_{parse+validacao+escopo}$ observa somente validação de parâmetros e caminho: o transporte usa \codigo{PairState::AlreadyPaired(None)}, portanto não há resolução de agente nem aplicação de escopo nesse caminho. O custo de \codigo{enforce_scopes} não é medido neste \textit{microbenchmark}; ele é medido separadamente no transporte WebSocket autenticado (Seção~\ref{sec:custo-escopos}). Para uma única chamada MCP instrumentada, define-se separadamente:
 \begin{equation}
 T_{e2e}^{(1)}=T_{cliente,\,serializacao}+T_{transporte,\,ida}+T_{gateway}+T_{transporte,\,volta}+T_{cliente,\,recebimento}.
 \label{eq:e2e}
@@ -427,9 +428,9 @@ O estimando $T_{e2e}^{(1)}$ da Equação~\eqref{eq:e2e} começa imediatamente an
 Unidade de análise & uma leitura sintética \codigo{vault.read} pelo gateway local em \textit{stdio} \\
 Condições & DIRECT, APPROVAL--AutoAllow, OTP--AutoAllow e ANONYMIZED \\
 Cargas & 128 B, 1 KiB e 16 KiB \\
-N & 1.000 requisições por célula no CSV versionado \\
+N & na execução sob protocolo corrigido, $k=10$ sessões com $n=1.000$ requisições medidas por célula, 200 chamadas de aquecimento descartadas e ordem de células aleatorizada por sessão; estatística: mediana por célula com IC de 95\% por \textit{bootstrap} percentílico \\
 Medido & validação de parâmetros/caminho (sem resolução de agente nem escopo no caminho \textit{stdio}), despacho do controlador, leitura local do cofre e filtro de PII \\
-Não medido & custo de \codigo{enforce_scopes}, decisão humana, rede de longa distância (\textit{Wide Area Network} --- WAN), inferência em nuvem, carga de produção e utilidade de tarefa \\
+Não medido & custo de \codigo{enforce_scopes} no caminho \textit{stdio} (medido à parte no WebSocket, Tabela~\ref{tab:enforce-scopes}), escrita de auditoria (excluída da soma de estágios; ver Seção~\ref{sec:fronteira-evidencia}), decisão humana, rede de longa distância (\textit{Wide Area Network} --- WAN), inferência em nuvem, carga de produção e utilidade de tarefa \\
 \bottomrule
 \end{tabularx}
 \fonte{Elaboração própria a partir de \codigo{apps/thesis-eval/src/main.rs} e \codigo{target/thesis-eval/latency.csv}.}
@@ -446,6 +447,7 @@ Este capítulo definiu o método DSR e a arquitetura Local-First integrada ao MC
 
 \chapter{RESULTADOS}
 \section{Fronteira de Evidência}
+\label{sec:fronteira-evidencia}
 A Tabela~\ref{tab:fronteira-evidencia} delimita o que os dados e o código efetivamente sustentam e, para cada alegação, a qualificação que a acompanha obrigatoriamente. Ela funciona como contrato de leitura do restante do capítulo: nenhuma afirmação posterior deve ser interpretada além do que essa fronteira permite.
 
 \begin{table}[htbp]
@@ -458,95 +460,120 @@ A Tabela~\ref{tab:fronteira-evidencia} delimita o que os dados e o código efeti
 Armazenamento local cifrado & XChaCha20-Poly1305, KEK Argon2id e DEK & sem chaves por contêiner; metadados visíveis \\
 Mediação MCP desktop & implementação desktop WS de escopos, APPROVAL/OTP e auditoria & o resultado 10/10 usa \codigo{HitlPolicy} simulada e não exercita o controlador real de consentimento desktop; \textit{headless} excluído \\
 Sem retorno de bytes de chave & implementação de trânsito/assinatura & não elimina abuso como oráculo \\
-Redução de PII & sete categorias heurísticas em saída ANONYMIZED & não é anonimização genérica/LGPD; somente texto; NÃO detecta RG, CEP, nomes, endereços, datas de nascimento e telefones sem formatação \\
-Sobrecarga local & \textit{microbenchmark} N=1.000 & execução preliminar de desenvolvimento, uma sessão sem intervalo de confiança (IC); sem humano, WAN, inferência, baseline de nuvem ou utilidade \\
-Resultado adversarial & 10/10 sondas e 2/2 controles, sem falhas de transporte & execução preliminar de uma sessão; valida transporte WS, escopo, caminho e política simulada, sem controlador desktop real, atacante adaptativo ou inferência de taxa populacional \\
+Redução de PII & sete categorias heurísticas em saída ANONYMIZED; recall canônico 100\% (200/200 por categoria) e 0\% de falso positivo (0/500 por categoria) em identificadores sintéticos & não é anonimização genérica/LGPD; somente texto; robustez a formato varia por categoria (Tabela~\ref{tab:pii-robustez}); NÃO detecta RG, CEP, nomes, endereços, datas de nascimento e telefones sem formatação \\
+Sobrecarga local & \textit{microbenchmark} sob protocolo corrigido: $k=10$ sessões, $n=1.000$ por célula, mediana com IC de 95\% por \textit{bootstrap} & sem humano, WAN, inferência, baseline de nuvem ou utilidade; o total soma estágios e exclui a escrita de auditoria \\
+Custo de escopos & \codigo{enforce\_scopes} no caminho WebSocket: $\approx$2,1\micro{} com 20 escopos, IC excluindo zero nas três cargas & braços de escopo em ordem fixa por sessão; célula de 1 escopo/128 B com delta negativo implausível (Tabela~\ref{tab:enforce-scopes}) \\
+Resultado adversarial & bateria original: 10/10 sondas e 2/2 controles, sem falhas de transporte; extensão a 24 sondas: 11/12 vereditos pré-especificados confirmados e cobertura 17/20 & valida transporte WS, escopo, caminho e política simulada; A11--A15 dirigem o binário real como subprocesso; sem atacante adaptativo ou inferência de taxa populacional \\
 \bottomrule
 \end{tabularx}
-\fonte{Elaboração própria com base nos crates citados e nos artefatos em \codigo{target/thesis-eval}.}
+\fonte{Elaboração própria com base nos crates citados e nos artefatos em \codigo{target/thesis-eval} e \codigo{docs/thesis/evidence/v2}.}
 \end{table}
+
+Uma limitação de instrumentação aplica-se a todas as tabelas de latência deste capítulo. O total reportado por \codigo{StageTimings} é a soma dos estágios \codigo{validate}, \codigo{authorize}, \codigo{execute} e \codigo{filter}, e não um relógio de parede: a escrita obrigatória de auditoria pré-execução ocorre entre \codigo{authorize} e \codigo{execute} e, portanto, nunca é contada. Como a auditoria com evidência de adulteração é um dos pilares da arquitetura, seu custo é invisível em toda a avaliação de desempenho aqui reportada: a sobrecarga de mediação medida exclui o custo da escrita de auditoria. Esse custo não foi medido, e não é estimado aqui; sua instrumentação, como um quinto estágio de \codigo{StageTimings}, consta dos trabalhos futuros.
 
 \section{Microbenchmark Sintético de Leitura Local Mediada}
-O \textit{microbenchmark} cria cofre temporário, semeia cargas sintéticas e executa leituras reais pelo gateway local. A Tabela~\ref{tab:microbenchmark-latencia} resume as médias e p95 de total presentes em \codigo{target/thesis-eval/latency.csv}; N é 1.000 por célula e APPROVAL/OTP usam AutoAllow. Os dados são uma execução preliminar de desenvolvimento (uma sessão, sem intervalo de confiança), não figuras representativas da execução definitiva. Evidência final exige $k\geq3$ sessões independentes, IC de 95\% por bootstrap e regra explícita de \textit{warmup}/descarte.
+O \textit{microbenchmark} cria cofre temporário, semeia cargas sintéticas e executa leituras reais pelo gateway local. A execução preliminar de uma sessão, publicada em versão anterior deste texto, reportava DIRECT mais lento que APPROVAL--AutoAllow e OTP--AutoAllow nas seis comparações de média por carga. DIRECT executa um subconjunto estrito do trabalho desses dois modos, de modo que essa ordenação não pode ser um efeito causal. A reavaliação sobre este repositório mostrou que aquela tabela não é reprodutível: o \textit{harness} que a gerou foi reescrito em 495 linhas após a coleta (418 inserções e 81 remoções, commit \codigo{2fb252b}), não existe \codigo{run-metadata.json} daquela execução, e o braço que replica seu protocolo recupera a inversão em apenas 2 dos 6 contrastes por mediana --- nunca em 6/6. Os números daquela tabela são, portanto, retirados deste texto e substituídos pela Tabela~\ref{tab:latencia-pareada-v2}, obtida sob protocolo corrigido.
 
-\begin{table}[htbp]
+\begin{table}[htb]
 \centering
-\caption{Execução preliminar de desenvolvimento: \textit{microbenchmark} sintético de leitura local mediada (uma sessão, N=1.000 por célula; AutoAllow; resultados dependentes de host). Os valores não representam latência fim a fim nem tempo de decisão humana.}
-\label{tab:microbenchmark-latencia}
-\begin{tabular}{lrrr}
-\toprule Modo & Carga & Média total (\micro) & p95 total (\micro) \\ \midrule
-DIRECT & 128 B & 14,70 & 23,12 \\
-DIRECT & 1 KiB & 17,77 & 32,39 \\
-DIRECT & 16 KiB & 36,64 & 41,29 \\
-APPROVAL--AutoAllow & 128 B & 13,93 & 17,24 \\
-APPROVAL--AutoAllow & 1 KiB & 15,36 & 16,19 \\
-APPROVAL--AutoAllow & 16 KiB & 34,41 & 36,85 \\
-OTP--AutoAllow & 128 B & 13,57 & 17,92 \\
-OTP--AutoAllow & 1 KiB & 15,62 & 19,24 \\
-OTP--AutoAllow & 16 KiB & 35,23 & 40,15 \\
-ANONYMIZED & 128 B & 15,74 & 19,08 \\
-ANONYMIZED & 1 KiB & 26,07 & 29,79 \\
-ANONYMIZED & 16 KiB & 189,79 & 262,19 \\
+\caption{Diferenças pareadas de latência entre DIRECT e os modos de consentimento sob o protocolo corrigido (ordem de célula aleatorizada por sessão, 200 chamadas de aquecimento descartadas por célula, $k=10$ sessões, $n=1000$ chamadas medidas por célula). Estatística: mediana com IC95\% \textit{bootstrap} percentílico ($B=10\,000$, reamostragem por sessão).}
+\label{tab:latencia-pareada-v2}
+\begin{tabular}{llrrc}
+\toprule
+Carga & Contraste & $\Delta$ mediana (\micro) & IC95\% (\micro) & Exclui zero? \\
+\midrule
+128 B  & DIRECT $-$ APPROVAL & $+0{,}060$ & $[-0{,}046;\ 0{,}160]$ & Não \\
+128 B  & DIRECT $-$ OTP      & $+0{,}046$ & $[-0{,}046;\ 0{,}136]$ & Não \\
+1 KiB  & DIRECT $-$ APPROVAL & $-0{,}009$ & $[-0{,}106;\ 0{,}082]$ & Não \\
+1 KiB  & DIRECT $-$ OTP      & $+0{,}009$ & $[-0{,}050;\ 0{,}084]$ & Não \\
+16 KiB & DIRECT $-$ APPROVAL & $-0{,}134$ & $[-0{,}407;\ 0{,}063]$ & Não \\
+16 KiB & DIRECT $-$ OTP      & $-0{,}032$ & $[-0{,}090;\ 0{,}023]$ & Não \\
 \bottomrule
 \end{tabular}
-\fonte{\codigo{target/thesis-eval/latency.csv}.}
+\fonte{\codigo{docs/thesis/evidence/v2/latency_v2_paired_diffs.csv}.}
 \end{table}
 
-DIRECT apresentou médias de 14,70\micro{} (128 B), 17,77\micro{} (1 KiB) e 36,64\micro{} (16 KiB). Para ANONYMIZED, as médias foram 15,74\micro{}, 26,07\micro{} e 189,79\micro{}, respectivamente, compatíveis com custo crescente do mascaramento heurístico sobre o conteúdo sintético. APPROVAL e OTP ficaram aproximadamente entre 14 e 35\micro{} sob AutoAllow: esses valores são o piso mecânico de despacho do gateway. Em produção, $T_{espera\ humana}$ é dominado pelo tempo de reação humana, tipicamente em segundos, parâmetro externo não medido pelo gateway.
+Três resultados organizam a leitura da Tabela~\ref{tab:latencia-pareada-v2}. O primeiro é positivo e central para a QP2: o custo do gate de consentimento é indistinguível de zero. Nenhum dos seis contrastes pareados exclui zero. Sob AutoAllow, APPROVAL e OTP não adicionam latência mensurável sobre DIRECT --- o piso mecânico da mediação de consentimento não custa nada que o instrumento consiga distinguir de zero. Em produção, $T_{espera\ humana}$ permanece dominado pelo tempo de reação humana, tipicamente em segundos, parâmetro externo não medido pelo gateway.
 
-A Figura~\ref{fig:latencia-estagios} decompõe as médias por estágio a partir dos valores exatos de \codigo{latency.csv}. Em 16 KiB, a barra ANONYMIZED é visualmente dominada pelo segmento do filtro; a figura permanece uma execução preliminar de uma sessão, sem IC.
+O segundo resultado é a retirada da ordenação publicada: ela era um artefato de medição de origem não determinada. A lacuna de proveniência descrita acima --- reescrita do \textit{harness} após a coleta, ausência de metadados de execução e não replicação a partir deste repositório --- impede atribuir causa; o que os dados novos sustentam é somente que o padrão publicado não se reproduz a partir deste repositório.
+
+O terceiro resultado é metodológico: a média é a estatística errada para este estimando, e há um caso concreto nos dados novos. Em 16 KiB, a diferença DIRECT$-$OTP calculada pela média é $+6{,}005$\micro{}, com IC95\% $[5{,}690;\ 6{,}331]$ --- uma inversão significativa falsa ---, enquanto a mediana sobre os mesmos dados dá $-0{,}032$\micro{} e a rejeita corretamente. A causa é contaminação de cauda direita: o p99 de DIRECT em 16 KiB varia entre 38,5 e 61,7\micro{} entre sessões, contra uma mediana próxima de 29\micro{}. Essa única célula justifica o protocolo de mediana com \textit{bootstrap} melhor que qualquer argumento geral: o estimador sensível à cauda produz, nos mesmos dados, uma conclusão de sinal invertido que o estimador robusto exclui.
+
+\svnota{\textbf{Nota metodológica sobre a tabela retirada.} As células publicadas não eram ruído amostral ordinário: um teste de sinais sobre as seis diferenças dá $p=0{,}016$ (6/6, exato unilateral), e um limite de Cantelli livre de distribuição, calculado sobre p95$-$média, situa as seis diferenças entre 11,7 e 58,5 erros-padrão de zero. A causa foi, portanto, sistemática: aumentar o número de sessões não a corrigiria. Trata-se de análise dos dados antigos, não de resultado novo.}
+
+Para delimitar a origem provável do artefato, uma ablação $2\times2$ variou a ordem de execução das células e o descarte de aquecimento (Tabela~\ref{tab:ablacao-ordem} e Figura~\ref{fig:ablacao-ordem}). A fração de contrastes com sinal invertido cai de 70,0--73,3\% nos braços de ordem fixa para 53,3--56,7\% nos braços de ordem aleatorizada.
+
+\begin{table}[htb]
+\centering
+\caption{Ablação $2\times2$ de ordem de execução e descarte de aquecimento ($k=5$ sessões por braço, $n=1000$). A fração de sinal invertido conta contrastes em que DIRECT mede mais lento que um superconjunto estrito do seu próprio trabalho, o que é impossível como efeito causal.}
+\label{tab:ablacao-ordem}
+\begin{tabular}{clcrr}
+\toprule
+Braço & Ordem & Aquecimento & Sinal invertido & Efeito de posição \\
+\midrule
+A & fixa (protocolo publicado) & nenhum      & 70{,}0\% & $+0{,}029$\%/pos.$^{\dagger}$ \\
+B & fixa            & descartado  & 73{,}3\% & $-0{,}015$\%/pos.$^{\dagger}$ \\
+C & aleatorizada    & nenhum      & 53{,}3\% & $-0{,}174$\%/pos. \\
+D & aleatorizada    & descartado  & 56{,}7\% & $-0{,}033$\%/pos. \\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+\footnotesize
+$^{\dagger}$ Sob ordem fixa cada célula ocupa uma única posição em todas as sessões, de modo que célula e posição são colineares e a inclinação normalizada não é identificável. Os valores dos braços A e B não devem ser lidos como ausência de efeito de posição.
+
+\fonte{\codigo{docs/thesis/evidence/v2/order_ablation_contrast_ci.csv}.}
+\end{table}
 
 \begin{figure}[htbp]
 \centering
-\resizebox{\textwidth}{!}{%
-\begin{tikzpicture}
-\begin{axis}[
-  xbar stacked,
-  width=15cm,
-  height=11.2cm,
-  xmin=0, xmax=300,
-  xtick={0,50,100,150,200},
-  xlabel={média por estágio (\micro)},
-  ytick={1,2,3,4,5,6,7,8,9,10,11,12},
-  y dir=reverse,
-  ymin=0.4, ymax=12.6,
-  yticklabels={DIRECT 128 B,DIRECT 1 KiB,DIRECT 16 KiB,APPROVAL 128 B,APPROVAL 1 KiB,APPROVAL 16 KiB,OTP 128 B,OTP 1 KiB,OTP 16 KiB,ANONYMIZED 128 B,ANONYMIZED 1 KiB,ANONYMIZED 16 KiB},
-  tick label style={font=\footnotesize},
-  label style={font=\footnotesize},
-  yticklabel style={font=\footnotesize, text width=3.0cm, align=right},
-  legend style={font=\footnotesize, at={(0.5,1.03)}, anchor=south, legend columns=4, draw=none},
-  bar width=0.30cm,
-  xmajorgrids=true,
-  grid style={gray!25},
-  clip=false]
-\addplot[fill=blue!65, draw=blue!80!black] coordinates {(9.000,1) (10.035,2) (10.942,3) (8.542,4) (8.674,5) (9.523,6) (8.363,7) (8.891,8) (10.131,9) (8.514,10) (8.821,11) (11.224,12)};
-\addlegendentry{validate}
-\addplot[fill=green!55!black, draw=green!45!black] coordinates {(0.089,1) (0.098,2) (0.090,3) (0.078,4) (0.089,5) (0.082,6) (0.080,7) (0.080,8) (0.085,9) (0.087,10) (0.083,11) (0.097,12)};
-\addlegendentry{authorize}
-\addplot[fill=orange!75, draw=orange!80!black] coordinates {(5.582,1) (7.608,2) (25.581,3) (5.285,4) (6.573,5) (24.773,6) (5.108,7) (6.622,8) (24.993,9) (5.171,10) (6.478,11) (25.913,12)};
-\addlegendentry{execute}
-\addplot[fill=red!55, draw=red!70!black] coordinates {(0.026,1) (0.028,2) (0.025,3) (0.023,4) (0.024,5) (0.030,6) (0.023,7) (0.023,8) (0.026,9) (1.968,10) (10.693,11) (152.551,12)};
-\addlegendentry{filtro de PII}
-\node[anchor=west, font=\scriptsize] at (axis cs:16.5,1) {14,70};
-\node[anchor=west, font=\scriptsize] at (axis cs:19.5,2) {17,77};
-\node[anchor=west, font=\scriptsize] at (axis cs:38.5,3) {36,64};
-\node[anchor=west, font=\scriptsize] at (axis cs:15.8,4) {13,93};
-\node[anchor=west, font=\scriptsize] at (axis cs:17.3,5) {15,36};
-\node[anchor=west, font=\scriptsize] at (axis cs:36.3,6) {34,41};
-\node[anchor=west, font=\scriptsize] at (axis cs:15.5,7) {13,57};
-\node[anchor=west, font=\scriptsize] at (axis cs:17.5,8) {15,62};
-\node[anchor=west, font=\scriptsize] at (axis cs:37.1,9) {35,23};
-\node[anchor=west, font=\scriptsize] at (axis cs:17.6,10) {15,74};
-\node[anchor=west, font=\scriptsize] at (axis cs:28.0,11) {26,07};
-\node[anchor=west, font=\scriptsize] at (axis cs:191.5,12) {189,79};
-\end{axis}
-\end{tikzpicture}}
-\caption[Decomposição da latência por estágio]{Decomposição da latência por estágio. Execução preliminar de desenvolvimento, uma sessão, N=1.000 por célula e sem intervalo de confiança; valores médios em \micro{}. Usa-se escala linear para preservar a aditividade das barras empilhadas; o total de cada condição é anotado à direita. Os estágios \textit{authorize} e, nos modos não anonimizados, o filtro de PII situam-se abaixo de 0,1\micro{} e permanecem visualmente imperceptíveis nessa escala.}
-\label{fig:latencia-estagios}
-\fonte{Elaboração própria a partir de \codigo{target/thesis-eval/latency.csv}.}
+\includegraphics[width=\textwidth]{figuras/ablacao_ordem.png}
+\caption[Ablação de ordem e aquecimento]{Ablação $2\times2$ de ordem de execução e aquecimento: fração de contrastes com sinal invertido por braço (painel esquerdo) e inclinação do efeito de posição-na-execução (painel direito). $k=5$ sessões por braço, $n=1000$.}
+\label{fig:ablacao-ordem}
+\fonte{Elaboração própria a partir de \codigo{docs/thesis/evidence/v2/order_ablation_contrast_ci.csv}.}
 \end{figure}
 
-Medições isoladas dos componentes também estão disponíveis no arquivo \codigo{micro.csv} do mesmo diretório de avaliação, na execução preliminar de uma sessão e sem intervalo de confiança: para 128 B, 1 KiB e 16 KiB, a leitura/decifra teve médias de 4,14\micro{}, 4,97\micro{} e 16,82\micro{}, e o filtro teve 1,17\micro{}, 7,86\micro{} e 125,08\micro{}, respectivamente. São medições fora do gateway e não devem ser somadas à Tabela~\ref{tab:microbenchmark-latencia} como se fossem uma nova latência fim a fim.
+Uma atribuição linear do tipo ``a posição na execução explica parte da inversão'' não é testável sob ordem fixa: cada célula ocupa exatamente uma posição em todas as sessões, célula e posição são perfeitamente colineares, e a inclinação normalizada por célula não é identificável --- inclinação $\approx 0$ nos braços A e B é uma propriedade algébrica do estimador, não evidência de ausência de efeito. O padrão observado --- inversão concentrada em 128 B e ausente nas cargas maiores --- favorece um efeito categórico de estado frio sobre a primeira célula executada, em vez de uma deriva contínua por posição. A nota da Tabela~\ref{tab:ablacao-ordem} registra a ressalva de identificabilidade.
+
+A Figura~\ref{fig:latencia-estagios} apresenta as latências sob o protocolo corrigido. O painel esquerdo mostra a mediana do total por carga em escala log-log, com bigodes até o p95 e um recorte linear de 0 a 40\micro{} que torna legíveis os estágios sub-microssegundo de autorização e filtragem, invisíveis como frações de barra na escala principal; o painel direito mostra as diferenças pareadas DIRECT$-$APPROVAL/OTP com os IC95\% cruzando zero nos seis contrastes. Na condição ANONYMIZED, o custo do filtro de PII cresce com a carga e domina a leitura de 16 KiB.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{figuras/figura4_corrigida.png}
+\caption[Latência sob o protocolo corrigido]{Latência de leitura mediada sob o protocolo corrigido. Estimador: mediana (p50) por célula; $k=10$ sessões, $n=1000$ chamadas medidas por célula, 200 chamadas de aquecimento descartadas e ordem de células aleatorizada por sessão; IC de 95\% por \textit{bootstrap} percentílico ($B=10\,000$, reamostragem por sessão). Painel esquerdo: total por carga em escala log-log, com recorte linear de 0 a 40\micro{}; painel direito: diferenças pareadas DIRECT$-$APPROVAL/OTP com IC95\%, todos contendo zero.}
+\label{fig:latencia-estagios}
+\fonte{Elaboração própria a partir de \codigo{docs/thesis/evidence/v2/latency_v2.csv}.}
+\end{figure}
+
+Medições isoladas dos componentes também estão disponíveis no arquivo \codigo{micro.csv} do mesmo diretório de avaliação, na execução preliminar de uma sessão e sem intervalo de confiança: para 128 B, 1 KiB e 16 KiB, a leitura/decifra teve médias de 4,14\micro{}, 4,97\micro{} e 16,82\micro{}, e o filtro teve 1,17\micro{}, 7,86\micro{} e 125,08\micro{}, respectivamente. São medições fora do gateway e não devem ser somadas às medições do gateway como se fossem uma nova latência fim a fim.
+
+\section{Custo de Imposição de Escopos no Caminho WebSocket}
+\label{sec:custo-escopos}
+Versões anteriores deste texto declaravam o custo de \codigo{enforce\_scopes} como não medido. Ele foi medido no caminho WebSocket autenticado (Tabela~\ref{tab:enforce-scopes}): com 20 escopos, o custo adicional sobre a linha de base sem escopo é de $+2{,}106$\micro{} em 128 B, $+2{,}102$\micro{} em 1 KiB e $+2{,}231$\micro{} em 16 KiB, com IC95\% excluindo zero nas três cargas. O custo escala com o tamanho do conjunto de escopos, e não com a carga --- a forma esperada, pois a verificação itera o conjunto de escopos. A célula de 1 escopo em 128 B mede $-0{,}454$\micro{}, valor fisicamente impossível para uma verificação adicional; a nota da tabela registra a causa provável --- os três braços de escopo executam em ordem fixa dentro de cada sessão ---, limitação de desenho desta medição específica que não compromete o efeito consistente de aproximadamente 2,1\micro{} observado nas três cargas.
+
+\begin{table}[htb]
+\centering
+\caption{Custo de imposição de escopo no caminho WebSocket autenticado, medido pela primeira vez ($k=5$ sessões, $n=1000$). Linha de base: agente sem escopo, usando o ramo real \texttt{scopes.is\_empty()} de \texttt{enforce\_scopes} --- não um desvio de código.}
+\label{tab:enforce-scopes}
+\begin{tabular}{crrrc}
+\toprule
+Escopos & Carga & $\Delta$ vs.\ base (\micro) & IC95\% (\micro) & Exclui zero? \\
+\midrule
+1  & 128 B  & $-0{,}454$ & $[-0{,}855;\ -0{,}130]$ & Sim$^{\ddagger}$ \\
+1  & 1 KiB  & $-0{,}048$ & $[-0{,}438;\ 0{,}333]$  & Não \\
+1  & 16 KiB & $-0{,}026$ & $[-0{,}371;\ 0{,}263]$  & Não \\
+20 & 128 B  & $+2{,}106$ & $[1{,}656;\ 2{,}511]$   & Sim \\
+20 & 1 KiB  & $+2{,}102$ & $[1{,}842;\ 2{,}346]$   & Sim \\
+20 & 16 KiB & $+2{,}231$ & $[1{,}601;\ 2{,}615]$   & Sim \\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+\footnotesize
+$^{\ddagger}$ Delta negativo fisicamente implausível: uma verificação adicional não pode reduzir latência. Os três conjuntos de escopo foram executados em ordem fixa ($0 \rightarrow 1 \rightarrow 20$) dentro de cada sessão, de modo que o braço de 1 escopo mede em estado mais aquecido que a base. Limitação de desenho desta medição específica.
+
+\fonte{\codigo{docs/thesis/evidence/v2/enforce_scopes.csv}.}
+\end{table}
 
 \section{Bateria Adversarial Pré-especificada}
 Na execução preliminar única da bateria pré-especificada, o gateway bloqueou 10/10 chamadas maliciosas e aceitou 2/2 controles legítimos, conforme \codigo{target/thesis-eval/adversarial.csv} e Tabela~\ref{tab:sondas-adversariais}. Nenhuma sonda falhou em transporte nessa execução, de modo que as duas taxas incidem sobre a bateria completa; o critério de exclusão descrito na Seção~\ref{sec:dados-avaliacao} não retirou nenhuma observação. O resultado valida somente transporte WebSocket, escopo, validação de caminho e aplicação de política HITL simulada; ele não exercita o controlador real de consentimento desktop, nem atribui cada bloqueio individual à sua causa. Não estima robustez geral contra adversário adaptativo, fluxo de exfiltração por operações permitidas ou população de ataques.
@@ -575,11 +602,45 @@ C2 & controle & listagem de arquivos públicos no escopo & aceita \\
 \fonte{\codigo{target/thesis-eval/adversarial.csv}.}
 \end{table}
 
+\subsection{Cobertura da Superfície de Ferramentas e Extensão da Bateria}
+A bateria original cobre 5 das 20 ferramentas da superfície MCP (25\%): \codigo{vault.read}, \codigo{vault.write}, \codigo{vault.list}, \codigo{vault.delete} e \codigo{vault.create\_container}. A extensão para 24 sondas, com vereditos pré-especificados antes da execução, eleva a cobertura para 17 das 20 ferramentas, acrescentando as famílias de criptografia, corretagem e gestão de agentes (Tabela~\ref{tab:cobertura-sondas} e Figura~\ref{fig:cobertura-sondas}). Três ferramentas permanecem sem cobertura: \codigo{vault.destroy}, \codigo{vault.list\_transit\_keys} e \codigo{vault.list\_signing\_keys}.
+
+\begin{table}[htb]
+\centering
+\caption{Cobertura da superfície de 20 ferramentas MCP pela bateria de sondas adversariais, antes e depois da extensão. Vereditos das sondas novas foram pré-especificados antes da execução.}
+\label{tab:cobertura-sondas}
+\begin{tabular}{lcc}
+\toprule
+Bateria & Ferramentas cobertas & Fração \\
+\midrule
+Original (A1--A10, C1--C2)      & \texttt{vault.read}, \texttt{.write}, \texttt{.list}, \texttt{.delete}, \texttt{.create\_container} & 5/20 \\
+Estendida (24 sondas)           & + famílias crypto, broker e gestão de agentes & 17/20 \\
+\midrule
+\multicolumn{3}{l}{Sem cobertura após a extensão: \texttt{vault.destroy}, \texttt{vault.list\_transit\_keys}, \texttt{vault.list\_signing\_keys}.} \\
+\bottomrule
+\end{tabular}
+\fonte{\codigo{docs/thesis/evidence/v2/probe_coverage_matrix.csv}.}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.85\textwidth]{figuras/cobertura_sondas.png}
+\caption[Cobertura de sondas por ferramenta MCP]{Cobertura da superfície real de 20 ferramentas MCP pela bateria original (12 sondas) e pela bateria estendida (24 sondas), por família de ferramentas.}
+\label{fig:cobertura-sondas}
+\fonte{Elaboração própria a partir de \codigo{docs/thesis/evidence/v2/probe_coverage_matrix.csv}.}
+\end{figure}
+
+As sondas A11--A15 confirmam a correção \textit{fail-closed} de criptografia e corretagem, descrita na \hyperref[nota:headless]{nota de segurança do modo \textit{headless}}, contra o binário real compilado, dirigido como subprocesso --- e não contra uma política espelhada em código de teste. É essa distinção que torna o resultado evidência sobre o artefato, e não sobre uma reimplementação da sua política. Dos 12 vereditos pré-especificados da extensão, 11 corresponderam ao observado, e a cadeia de auditoria HMAC das execuções foi verificada (12 entradas, \codigo{verify\_chain}). O único desvio é objeto da subseção seguinte. Seguindo o critério já adotado neste capítulo, o resultado é reportado como contagens sobre a bateria executada, e não como taxa percentual de sucesso.
+
+\subsection{Defeito Revelado pela Sonda C4}
+\label{sec:defeito-c4}
+A sonda C4, cujo veredito esperado foi congelado antes da execução, revelou um defeito real do artefato: \codigo{enforce\_scopes} nega incondicionalmente \codigo{vault.info}, \codigo{vault.export\_agents} e \codigo{vault.import\_agents} para qualquer agente com escopos definidos, tornando essas operações inalcançáveis no modo \textit{headless} real --- enquanto a política \textit{headless} pretendida permite \codigo{vault.info} como consulta de metadados. O desvio entre o veredito pré-especificado e o observado não é tratado como falha da avaliação, e sim como resultado dela: uma sonda pré-especificada que falha e, com isso, expõe um defeito real é a evidência mais forte disponível de que estender a bateria era metodologicamente necessário. Um defeito encontrado por uma sonda cuja expectativa fosse escrita após a execução valeria muito menos, pois não excluiria acomodação \textit{post-hoc} da expectativa ao comportamento observado. O achado é, portanto, uma contribuição do desenho da avaliação; a correção do defeito consta dos trabalhos futuros.
+
 \chapter{DISCUSSÃO E CONSIDERAÇÕES FINAIS}
 \section{Síntese dos Resultados}
 O artefato concretiza, no domínio de segredos e credenciais, os quatro módulos da arquitetura de referência apresentados na Figura~\ref{fig:arquitetura-referencia}: cofre local cifrado, servidor MCP local, mediação com filtro de privacidade, modos de consentimento e auditoria implementados. A sequência da Figura~\ref{fig:fluxo-requisicao} explicita que autenticação, validação e escopo antecedem a operação no cofre, enquanto consentimento e filtragem dependem do modo configurado. Essa separação é lógica e não constitui isolamento de processo ou de sistema operacional.
 
-A síntese empírica permanece subordinada à Tabela~\ref{tab:fronteira-evidencia}. O \textit{microbenchmark} da Tabela~\ref{tab:microbenchmark-latencia} mede uma sessão preliminar de leituras locais sintéticas, com N=1.000 por célula e sem IC, e a Figura~\ref{fig:latencia-estagios} mostra que o filtro de PII domina a condição ANONYMIZED de maior carga. A bateria da Tabela~\ref{tab:sondas-adversariais}, também em uma execução preliminar, bloqueia 10/10 chamadas maliciosas e aceita 2/2 controles, mas valida somente as negativas enumeradas no transporte WebSocket, com escopo, caminho e política HITL simulada.
+A síntese empírica permanece subordinada à Tabela~\ref{tab:fronteira-evidencia}. Sob o protocolo corrigido, a Tabela~\ref{tab:latencia-pareada-v2} mostra que nenhum dos seis contrastes pareados entre DIRECT e os modos de consentimento exclui zero, e a Figura~\ref{fig:latencia-estagios} mostra que o filtro de PII domina a condição ANONYMIZED de maior carga. A imposição de escopos no caminho WebSocket custa aproximadamente 2,1\micro{} com 20 escopos (Tabela~\ref{tab:enforce-scopes}). A bateria da Tabela~\ref{tab:sondas-adversariais} bloqueia 10/10 chamadas maliciosas e aceita 2/2 controles; sua extensão a 24 sondas eleva a cobertura da superfície de ferramentas de 5/20 para 17/20 e revela o defeito da Seção~\ref{sec:defeito-c4}. O conjunto valida somente as negativas enumeradas no transporte WebSocket, com escopo, caminho e política HITL simulada.
 
 Em conjunto, os resultados mostram que a instância permite observar mediação de leituras nomeadas, decompor a latência interna do gateway e exercitar uma bateria finita de acessos laterais. Não se obtém desses dados evidência sobre experiência fim a fim, comportamento de um adversário adaptativo, comparação com nuvem, retenção no provedor ou identificabilidade de documentos. Tampouco se avaliam RAG, índice vetorial ou isolamento de memória no sistema operacional.
 
@@ -587,16 +648,45 @@ Em conjunto, os resultados mostram que a instância permite observar mediação 
 \subsection{QP1}
 A mediação de leituras nomeadas ocorre pela combinação de identidade autenticada, escopos de capacidade, validação de caminhos, modos de contêiner e registro de auditoria. No caminho desktop, APPROVAL e OTP submetem a liberação ao consentimento configurado, enquanto ANONYMIZED aplica mascaramento heurístico à saída textual. A auditoria encadeada por HMAC-SHA256 fornece evidência de adulteração, remoção e truncamento em relação ao ponto de verificação local presente, sem impedir a restauração de uma cópia completa e internamente consistente. A evidência experimental de escopo e consentimento refere-se ao gateway desktop WebSocket; o modo \textit{headless} fica excluído dessa avaliação e, embora preserve escopos e recuse operações secretas sem modelo de consentimento, não oferece consentimento humano.
 
-A redução de exposição sustentada pela evidência é, portanto, operacional e delimitada: escopos restringem as chamadas alcançáveis e o modo ANONYMIZED mascara as categorias detectadas antes da saída. Contêineres DIRECT liberam leituras sem consentimento por projeto e ficam fora da garantia de mediação humana, embora permaneçam sujeitos aos demais controles aplicáveis. O filtro cobre exatamente sete categorias heurísticas, mas as cargas sintéticas ANONYMIZED exercitam somente e-mail, CPF e IPv4; não há medição de precisão ou recall.
+A redução de exposição sustentada pela evidência é, portanto, operacional e delimitada: escopos restringem as chamadas alcançáveis e o modo ANONYMIZED mascara as categorias detectadas antes da saída. Contêineres DIRECT liberam leituras sem consentimento por projeto e ficam fora da garantia de mediação humana, embora permaneçam sujeitos aos demais controles aplicáveis. O filtro cobre exatamente sete categorias heurísticas, mas as cargas sintéticas ANONYMIZED do \textit{microbenchmark} exercitam somente e-mail, CPF e IPv4. Na caracterização dedicada do filtro, o recall em forma canônica é de 100\% nas sete categorias documentadas (200/200 por categoria), com 0\% de falso positivo em texto neutro (0/500 por categoria); a robustez fora da forma canônica varia por categoria, como detalhado na resposta à QP2.
 
 Essa resposta não equivale a garantia de anonimização ou de não identificabilidade. RG, CEP, nomes completos, endereços, datas de nascimento e telefones sem formatação não são detectados, e a presença combinada desses campos --- em especial nome e endereço --- é precisamente o que pode sustentar a identificabilidade referida no Art.~5º da LGPD, mantendo um documento identificável mesmo quando CPF ou CNPJ são mascarados. O resultado também não estabelece conformidade à LGPD.
 \subsection{QP2}
-A decomposição por estágio da Figura~\ref{fig:latencia-estagios} responde à QP2 no limite do caminho local instrumentado. Nessa execução, a barreira medida permanece abaixo de um milissegundo e o custo de despacho é pequeno e limitado em relação à recuperação local. A exceção relevante é o filtro de PII, cujo custo cresce com o conteúdo sintético e domina a leitura ANONYMIZED de 16 KiB; as medições isoladas e internas ao gateway não devem ser somadas como uma nova latência fim a fim.
+Sob o protocolo corrigido, a resposta à QP2 no limite do caminho local instrumentado é que o custo do gate de consentimento é indistinguível de zero: nenhum dos seis contrastes pareados da Tabela~\ref{tab:latencia-pareada-v2} exclui zero, e a latência total medida permanece abaixo de um milissegundo em todas as condições. A imposição de escopos no caminho WebSocket adiciona aproximadamente 2,1\micro{} com 20 escopos, escalando com o tamanho do conjunto de escopos e não com a carga (Tabela~\ref{tab:enforce-scopes}). A exceção relevante é o filtro de PII, cujo custo cresce com o conteúdo sintético e domina a leitura ANONYMIZED de 16 KiB; as medições isoladas e internas ao gateway não devem ser somadas como uma nova latência fim a fim.
 
-A Tabela~\ref{tab:metodologia-microbenchmark} delimita o estimando: o transporte \textit{stdio} mede validação de parâmetros e caminho, despacho, leitura/decifra e filtragem quando aplicável, mas não mede resolução de agente nem \codigo{enforce_scopes}. A Tabela~\ref{tab:microbenchmark-latencia} corresponde a uma sessão preliminar, sem IC, e seus valores dependem da máquina hospedeira. Não se mede a chamada MCP fim a fim, WAN, inferência, utilidade de tarefa ou tempo de decisão humana; APPROVAL e OTP usam \codigo{AutoAllow} e representam somente o piso mecânico do gateway.
+A Tabela~\ref{tab:metodologia-microbenchmark} delimita o estimando: o transporte \textit{stdio} mede validação de parâmetros e caminho, despacho, leitura/decifra e filtragem quando aplicável, mas não mede resolução de agente nem \codigo{enforce_scopes}, medido à parte no WebSocket. O total instrumentado soma estágios e exclui a escrita de auditoria (Seção~\ref{sec:fronteira-evidencia}), e os valores dependem da máquina hospedeira. Não se mede a chamada MCP fim a fim, WAN, inferência, utilidade de tarefa ou tempo de decisão humana; APPROVAL e OTP usam \codigo{AutoAllow} e representam somente o piso mecânico do gateway.
+
+A caracterização dedicada do filtro de privacidade real (\codigo{sv-privacy}) qualifica a QP2 em duas direções. Primeiro, a robustez a formato não é uniforme: ela é por categoria (Tabela~\ref{tab:pii-robustez}). CPF, CNPJ e cartão compartilham o mecanismo \codigo{collect\_grouped\_digits} e são 100\% robustos à variação de pontuação; telefone, SSN e e-mail exigem sintaxe fixa e caem a 0\% fora da forma canônica --- com a exceção do formato internacional \codigo{+55}, que é detectado. A formulação honesta é que as três categorias portadoras de dígito verificador ou soma de verificação são robustas a formato, e as três de sintaxe fixa não são.
+
+\begin{table}[htb]
+\centering
+\small
+\caption{Recall do filtro de privacidade real (\texttt{sv-privacy}) por categoria e por formato. Todos os identificadores são sintéticos (RFC 1918, RFC 2606, bloco NANP 555-01XX, faixa SSN 900--999, BIN de teste 400000).}
+\label{tab:pii-robustez}
+\begin{tabular}{llll}
+\toprule
+Categoria & Canônico & Não canônico & Mecanismo no código \\
+\midrule
+CPF               & 100\% & 100\% & \multirow{3}{*}{\texttt{collect\_grouped\_digits}: robusto} \\
+CNPJ              & 100\% & 100\% & \\
+Cartão (Luhn)     & 100\% & 100\% & \\
+\midrule
+IPv4              & 98\%  & 0\% espaçado; 93\% CIDR & sintaxe pontuada \\
+Telefone          & 100\% & 0\% sem símbolo; 100\% \texttt{+55} & exige \texttt{+} ou \texttt{(} \\
+SSN               & 100\% & 0\%   & exige hífen exato \\
+E-mail            & 100\% & 0\%   & sem tolerância a espaçamento \\
+\midrule
+\multicolumn{4}{l}{\emph{Lacunas admitidas} (RG, CEP, nome, endereço, data de nascimento,
+telefone não formatado): 0\% --- sem detector.} \\
+\bottomrule
+\end{tabular}
+\fonte{\codigo{docs/thesis/evidence/v2/pii_format_robustness.csv}.}
+\end{table}
+
+Segundo, o custo do filtro é dominado pela densidade de PII no documento, e não pela varredura do texto: a densidade responde por 63,7\% da inclinação marginal do custo ($R^2=0{,}99979$ no ajuste tamanho~$\times$~densidade). Uma verificação cruzada favorável confirma a consistência com a medição publicada: o ajuste novo, avaliado em densidade máxima, reproduz 97,0\% da inclinação do \codigo{micro.csv} publicado (7,395 contra 7,626~ns/B), o que confirma que as células publicadas operavam em densidade saturada de PII. O custo de filtragem publicado (7,63~ns/B) é, portanto, o custo em densidade máxima de PII. Um documento de mesmo tamanho sem PII custa 2,68~ns/B --- 36,6\% do valor publicado. A medição original caracteriza o pior caso, não o caso típico.
 
 \subsection{QP3}
-No modelo de ameaça de usuário único e máquina única, a bateria pré-especificada da Tabela~\ref{tab:sondas-adversariais} fornece evidência de que, sobre transporte WebSocket autenticado, o protocolo composto por escopos, validação de caminho e política HITL simulada bloqueia as chamadas maliciosas enumeradas e preserva os dois controles legítimos. A execução não isola a contribuição causal de cada controle nem avalia isoladamente a autenticação. O resultado de 10/10 sondas maliciosas bloqueadas e 2/2 controles aceitos é uma cobertura da bateria executada, não uma taxa populacional de ataques ou uma prova de robustez geral.
+No modelo de ameaça de usuário único e máquina única, a bateria pré-especificada da Tabela~\ref{tab:sondas-adversariais} fornece evidência de que, sobre transporte WebSocket autenticado, o protocolo composto por escopos, validação de caminho e política HITL simulada bloqueia as chamadas maliciosas enumeradas e preserva os dois controles legítimos. A execução não isola a contribuição causal de cada controle nem avalia isoladamente a autenticação. O resultado de 10/10 sondas maliciosas bloqueadas e 2/2 controles aceitos é uma cobertura da bateria executada, não uma taxa populacional de ataques ou uma prova de robustez geral. A extensão da bateria eleva a cobertura da superfície de ferramentas de 5/20 para 17/20, confirma contra o binário real, dirigido como subprocesso, a correção \textit{fail-closed} de criptografia e corretagem (sondas A11--A15, com 11 dos 12 vereditos pré-especificados correspondendo ao observado e cadeia de auditoria verificada) e revela o defeito de imposição de escopos da Seção~\ref{sec:defeito-c4}.
 
 A execução ocorre uma única vez sobre WebSocket autenticado e usa \codigo{HitlPolicy} simulada; o controlador desktop real \codigo{ApprovalState} não é exercitado. Também não se atribui cada bloqueio individual a uma causa observada, não se testa adversário adaptativo e não se avalia exfiltração por operações permitidas. Assim, a resposta à QP3 restringe-se ao protocolo e às negativas enumeradas.
 
@@ -622,23 +712,23 @@ As contribuições organizam-se segundo a taxonomia de March e Smith \cite{march
 Há ainda uma contribuição metodológica na documentação do ciclo construir--avaliar por ADRs. A observação de que o modo reservado NATIVE podia degradar para acesso sem solicitação de consentimento conduz à correção do mecanismo de consentimento e à inclusão das sondas A9 e A10 na bateria. Esse encadeamento registra achado, decisão, correção e ampliação da avaliação sem converter a bateria finita em prova geral de segurança.
 
 \section{Limitações}
-A validade externa é limitada pelo enquadramento artificial e somativo. A evidência de desempenho provém de uma sessão preliminar, sem IC, em cargas sintéticas e dependentes da máquina hospedeira; não inclui latência fim a fim, WAN, inferência, carga de produção, utilidade de tarefa ou decisão humana. O caminho \textit{stdio} também não cronometra resolução de agente nem aplicação de escopos.
+A validade externa é limitada pelo enquadramento artificial e somativo. A evidência de desempenho do gateway provém do protocolo corrigido ($k=10$ sessões, mediana com IC de 95\% por \textit{bootstrap}), mas permanece sintética e dependente da máquina hospedeira; não inclui latência fim a fim, WAN, inferência, carga de produção, utilidade de tarefa ou decisão humana, e o total instrumentado soma estágios e exclui a escrita de auditoria (Seção~\ref{sec:fronteira-evidencia}). O caminho \textit{stdio} não cronometra resolução de agente nem aplicação de escopos; o custo de \codigo{enforce\_scopes} foi medido à parte, no caminho WebSocket (Tabela~\ref{tab:enforce-scopes}), com a ressalva de ordem fixa dos braços de escopo registrada na nota daquela tabela.
 
-A bateria adversarial é finita, pré-especificada e executada uma vez. Ela exercita chamadas de ferramenta, e não um LLM submetido a \textit{prompt injection}; usa política HITL simulada, não o controlador desktop real; e não cobre adversário adaptativo, \textit{fuzzing} da superfície JSON-RPC ou exfiltração por caminhos permitidos. O resultado não permite estimar taxa populacional nem atribuir causalmente cada bloqueio a um controle específico.
+A bateria adversarial é finita e pré-especificada. Ela exercita chamadas de ferramenta, e não um LLM submetido a \textit{prompt injection}; a política HITL é simulada e o controlador real de consentimento desktop não é exercitado, embora as sondas A11--A15 da extensão dirijam o binário real compilado como subprocesso; e não cobre adversário adaptativo, \textit{fuzzing} da superfície JSON-RPC ou exfiltração por caminhos permitidos. Após a extensão, três ferramentas permanecem sem cobertura: \codigo{vault.destroy}, \codigo{vault.list\_transit\_keys} e \codigo{vault.list\_signing\_keys}. O resultado não permite estimar taxa populacional nem atribuir causalmente cada bloqueio a um controle específico.
 
 O artefato restringe-se a um usuário, uma máquina e segredos ou credenciais acessados por nome. Processos sob a mesma conta, comprometimento do sistema operacional, inspeção de memória, dependências nativas e roubo de \textit{token} ficam fora do limite avaliado; a separação entre contêineres é lógica, com uma única DEK ativa e sem isolamento por chave. Contêineres DIRECT dispensam consentimento por projeto, e a correção \textit{fail-closed} do \hyperref[nota:headless]{modo \textit{headless}} não transforma o modo \textit{headless} em caminho de consentimento humano. Pareamento, resolução de agente, aplicação de escopo e consentimento valem exclusivamente para o transporte WebSocket autenticado: iniciar o binário no transporte \textit{stdio} opera com \codigo{PairState::AlreadyPaired(None)} e, portanto, sem resolução de agente nem \codigo{enforce\_scopes} (\codigo{crates/sv-mcp/src/lib.rs:1003,1303}). Isso não é uma falha do mecanismo, e sim consequência do limite declarado: quem pode iniciar o processo já detém acesso local sob a mesma conta do usuário, condição situada fora do modelo de ameaça. A sequência de autenticação, validação e escopo da Figura~\ref{fig:fluxo-requisicao} descreve, assim, o caminho WebSocket, e é a esse caminho que se referem os resultados da bateria adversarial.
 
 O uso sem retorno de bytes de chave não elimina o risco de o gateway atuar como oráculo criptográfico, pois a autorização não está vinculada à referência de chave, ao hash do \textit{payload}, à semântica da operação, ao destinatário ou domínio e à identidade do agente. A auditoria detecta alteração em relação ao ponto de verificação local presente, mas não uma restauração completa e coerente do diretório. Nomes lógicos, modos, tamanhos e outros metadados também podem permanecer visíveis.
 
-O filtro ANONYMIZED opera somente sobre texto e cobre sete categorias heurísticas; as cargas medidas não representam documentos reais e não estabelecem precisão ou recall. Campos brasileiros relevantes, como RG, CEP, nomes e endereços, permanecem fora da detecção, assim como datas de nascimento e telefones sem formatação. Por isso, mascaramento parcial não implica anonimização, não identificabilidade ou conformidade à LGPD. Essa separação espelha uma lição da literatura de sistemas críticos: propriedades de \textit{safety} e de \textit{security} não se implicam mutuamente, e arquiteturas projetadas para satisfazer uma podem conter lacunas na outra, o que exige tratamento conjunto desde o projeto \cite{ferrao2022}. Analogamente, garantir uma propriedade técnica --- escopos, consentimento, mascaramento --- e satisfazer uma qualificação jurídica como a do Art.~5º da LGPD são exigências distintas, que divergem exatamente nos campos que o filtro não detecta.
+O filtro ANONYMIZED opera somente sobre texto e cobre sete categorias heurísticas; o recall e a taxa de falso positivo foram medidos por categoria e formato sobre identificadores sintéticos (Tabela~\ref{tab:pii-robustez}), o que não estabelece desempenho sobre documentos reais. Campos brasileiros relevantes, como RG, CEP, nomes e endereços, permanecem fora da detecção, assim como datas de nascimento e telefones sem formatação. Por isso, mascaramento parcial não implica anonimização, não identificabilidade ou conformidade à LGPD. Essa separação espelha uma lição da literatura de sistemas críticos: propriedades de \textit{safety} e de \textit{security} não se implicam mutuamente, e arquiteturas projetadas para satisfazer uma podem conter lacunas na outra, o que exige tratamento conjunto desde o projeto \cite{ferrao2022}. Analogamente, garantir uma propriedade técnica --- escopos, consentimento, mascaramento --- e satisfazer uma qualificação jurídica como a do Art.~5º da LGPD são exigências distintas, que divergem exatamente nos campos que o filtro não detecta.
 
 Por fim, não há braço de comparação em nuvem, verificação de retenção ou descarte pelo provedor, contêineres de contexto, busca semântica ou \textit{embeddings} locais. Essas ausências impedem responder por superioridade perante uma arquitetura em nuvem e por generalização da instanciação para documentos. Elas definem a agenda de continuidade, e não capacidades implícitas do protótipo atual.
 \section{Trabalhos Futuros}
-A primeira prioridade empírica é executar a avaliação definitiva em perfil \codigo{release}, com $k\geq3$ sessões independentes, IC de 95\% por \textit{bootstrap} e regra explícita de \textit{warmup}/descarte. Sobre o desenho fatorial completo já adotado, cabe acrescentar a análise da influência de cada fator --- modo de contêiner e tamanho da carga --- sobre a variável de resposta, na linha da avaliação de algoritmos criptográficos de Silva et al. \cite{silva2016}, quantificando quanto do custo observado é atribuível ao filtro de PII em relação ao tamanho da carga. Cada sessão deve registrar SO/kernel, CPU, RAM, armazenamento, \codigo{rustc}, perfil, comando, modo de energia e data. Essa execução substitui a evidência preliminar somente depois da conferência dos CSVs e de seus resumos criptográficos.
+A avaliação de latência do gateway foi reexecutada sob protocolo corrigido, com $k=10$ sessões, IC de 95\% por \textit{bootstrap} e descarte explícito de aquecimento (Tabela~\ref{tab:latencia-pareada-v2}), e a influência da densidade de PII sobre o custo do filtro foi quantificada na linha da avaliação por fatores de Silva et al. \cite{silva2016}. Permanecem prioridades empíricas: instrumentar a escrita de auditoria como um quinto estágio de \codigo{StageTimings}, hoje excluída do total reportado; registrar por sessão SO/kernel, CPU, RAM, armazenamento, \codigo{rustc}, perfil, comando, modo de energia e data; e aleatorizar a ordem dos braços de escopo, cuja ordem fixa produziu o delta negativo implausível registrado na nota da Tabela~\ref{tab:enforce-scopes}.
 
 O protocolo de dois braços deve comparar o mesmo modelo e versão com acesso ao material sintético pelo gateway local e por um caminho de contexto em nuvem, com telemetria, \textit{baseline}, governança e plano estatístico definidos antes da execução. Em complemento, um estudo com participantes deve medir mediana, p95, \textit{timeouts} e negações do tempo de decisão humana para APPROVAL e OTP. Esses estudos permitem avaliar comparação e experiência, mas a retenção ou o descarte no provedor exige verificação própria e não decorre automaticamente do protocolo.
 
-A bateria de segurança deve incorporar o controlador desktop real, registro causal por sonda, adversário adaptativo, casos de exfiltração por operações permitidas e testes de entradas JSON-RPC malformadas ou superdimensionadas. \textit{Fuzzing} e execuções independentes ampliam a cobertura observada, sem converter resultados finitos em garantia universal. O tratamento do \textit{token} também deve migrar para arquivo com permissão 0600 ou chaveiro do sistema operacional.
+A bateria de segurança deve incorporar o controlador desktop real, registro causal por sonda, adversário adaptativo, casos de exfiltração por operações permitidas e testes de entradas JSON-RPC malformadas ou superdimensionadas. Cabe também corrigir o defeito revelado pela sonda C4 --- alinhar \codigo{enforce\_scopes} à política \textit{headless} pretendida, que permite \codigo{vault.info} --- e cobrir as três ferramentas restantes: \codigo{vault.destroy}, \codigo{vault.list\_transit\_keys} e \codigo{vault.list\_signing\_keys}. \textit{Fuzzing} e execuções independentes ampliam a cobertura observada, sem converter resultados finitos em garantia universal. O tratamento do \textit{token} também deve migrar para arquivo com permissão 0600 ou chaveiro do sistema operacional.
 
 O classificador determinístico de sensibilidade e consentimento adaptativo descrito no ADR-0013 permanece proposto e não implementado. Antes de qualquer alegação de eficácia, requer implementação com elevação apenas, falha fechada e limites de complexidade, além de conjunto rotulado, pré-registro dos pisos de precisão e recall, separação entre calibração e teste e sondas sobre WebSocket autenticado. Resultado abaixo dos pisos deve ser reportado como negativo, pois o mecanismo constitui uma rede de segurança de usabilidade para exposição acidental, e não um controle de segurança contra agente com escrita.
 
@@ -671,6 +761,8 @@ adversarial.csv: 845a1d042ba68d52123d726c415dc2b21e50f39e3f708ccfc3a18788d2e81d5
 micro.csv:       d526ed70ebf659e72247a53ddd4de27dbf2a3ffc789c421b1d4e95fc056bf4c6
 \end{verbatim}
 \endgroup
+
+A evidência do protocolo corrigido está versionada em \codigo{docs/thesis/evidence/v2/}, com os agregados por experimento --- latência pareada, ablação de ordem, custo de escopos, caracterização do filtro de PII e cobertura de sondas --- e os dados brutos por sessão em \codigo{raw/}. Cada número do texto revisado é rastreável por identificador em \codigo{docs/thesis/evidence/v2/numeros_autorizados.csv}; o relatório de medição e sua auditoria estão em \codigo{docs/thesis/RESULTS-V2-ARTEFATO.md} e \codigo{docs/thesis/AUDITORIA-RESULTS-V2-ARTEFATO.md}. A execução da Tabela retirada não possui \codigo{run-metadata.json}; o \textit{harness} que a produziu foi reescrito após a coleta (commit \codigo{2fb252b}), como registrado na Seção~4.2.
 
 \postextual
 \begin{thebibliography}{99}

@@ -1,0 +1,13 @@
+id,provisional_name,real_tool,class,expected_verdict,observed_verdict,transport_error,pass,audit_chain_ok,audit_chain_entries,audit_chain_reason
+A11,transit.decrypt,vault.decrypt,attack,BLOCKED,BLOCKED,false,true,true,12,""
+A12,signing.sign,vault.sign,attack,BLOCKED,BLOCKED,false,true,true,12,""
+A13,transit.encrypt,vault.encrypt,attack,BLOCKED,BLOCKED,false,true,true,12,""
+A14,broker.issue,vault.create_broker_secret,attack,BLOCKED,BLOCKED,false,true,true,12,""
+A15,broker.exchange,vault.broker_request,attack,BLOCKED,BLOCKED,false,true,true,12,""
+A16,n/a,vault.create_signing_key,attack,BLOCKED,BLOCKED,false,true,true,12,""
+A17,n/a,vault.create_transit_key,attack,BLOCKED,BLOCKED,false,true,true,12,""
+A18,n/a,vault.export_agents,attack,BLOCKED,BLOCKED,false,true,true,12,""
+A19,n/a,vault.import_agents,attack,BLOCKED,BLOCKED,false,true,true,12,""
+A20,n/a,vault.list_broker_secrets,attack,BLOCKED,BLOCKED,false,true,true,12,""
+C3,n/a,vault.verify,control,ALLOWED,ALLOWED,false,true,true,12,""
+C4,n/a,vault.info,control,ALLOWED,BLOCKED,false,false,true,12,""
