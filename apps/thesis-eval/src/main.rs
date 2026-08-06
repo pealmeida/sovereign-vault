@@ -39,6 +39,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1752,8 +1753,12 @@ async fn run_headless_probes(out: &Path) {
     let token_file = scratch.join("agent-token");
     fs::write(&pass_file, "evaluation-passphrase").expect("write passphrase file");
     fs::write(&token_file, &token).expect("write token file");
-    fs::set_permissions(&pass_file, fs::Permissions::from_mode(0o600)).unwrap();
-    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    // Owner-only: both files carry live secret material for the subprocess.
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&pass_file, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     // Release the in-process lock before the subprocess opens the same root.
     drop(handle);
