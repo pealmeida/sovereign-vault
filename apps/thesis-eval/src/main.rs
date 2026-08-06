@@ -903,7 +903,9 @@ async fn run_enforce_scopes(out: &Path, iterations: usize, warmup: usize, sessio
         .create_agent("scope-large", large_scopes)
         .expect("agent");
 
-    handle.ensure_default_agent(PAIRING_SECRET).expect("default agent");
+    handle
+        .ensure_default_agent(PAIRING_SECRET)
+        .expect("default agent");
     let token_key = handle.agent_token_key();
 
     let shared: SharedVault<VaultHandle> = Arc::new(Mutex::new(Some(handle)));
@@ -962,7 +964,7 @@ async fn run_enforce_scopes(out: &Path, iterations: usize, warmup: usize, sessio
             }
             ws_drive_reads(&url, creds, "bench", &file, iterations).await;
             let records: Vec<StageTimings> = timing.0.lock().unwrap().drain(..).collect();
-            let cell_seed = 0xE5C0_9E5_u64 ^ (arm.scope_set_size as u64) ^ (size as u64) << 16;
+            let cell_seed = 0x0E5C_09E5_u64 ^ (arm.scope_set_size as u64) ^ (size as u64) << 16;
             rows.push(EnforceScopesRow {
                 label: arm.label,
                 scope_set_size: arm.scope_set_size,
@@ -991,7 +993,13 @@ async fn run_enforce_scopes(out: &Path, iterations: usize, warmup: usize, sessio
 /// Pair once, then drive `n` sequential `vault.read` calls over one
 /// authenticated WS connection — the real network stack, not the in-process
 /// stdio duplex `run_latency` uses.
-async fn ws_drive_reads(url: &str, creds: Option<(&str, &str)>, container: &str, file: &str, n: usize) {
+async fn ws_drive_reads(
+    url: &str,
+    creds: Option<(&str, &str)>,
+    container: &str,
+    file: &str,
+    n: usize,
+) {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");
@@ -999,13 +1007,19 @@ async fn ws_drive_reads(url: &str, creds: Option<(&str, &str)>, container: &str,
         Some((id, tok)) => {
             json!({"jsonrpc":"2.0","id":0,"method":"vault.pair","params":{"agent_id":id,"token":tok}})
         }
-        None => json!({"jsonrpc":"2.0","id":0,"method":"vault.pair","params":{"secret":PAIRING_SECRET}}),
+        None => {
+            json!({"jsonrpc":"2.0","id":0,"method":"vault.pair","params":{"secret":PAIRING_SECRET}})
+        }
     };
     ws.send(Message::Text(pair.to_string().into()))
         .await
         .expect("send pair");
     let resp = next_json(&mut ws).await.expect("pair response");
-    assert_eq!(resp["result"]["paired"], json!(true), "pairing failed: {resp}");
+    assert_eq!(
+        resp["result"]["paired"],
+        json!(true),
+        "pairing failed: {resp}"
+    );
 
     for i in 0..n {
         let call = json!({
@@ -1166,7 +1180,11 @@ fn pii_cpf_check_digits(base: &[u8; 9]) -> (u8, u8) {
 fn pii_cnpj_check_digits(base: &[u8; 12]) -> (u8, u8) {
     let weights1 = [5usize, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
     let digit = |data: &[u8], weights: &[usize]| -> u8 {
-        let sum: usize = data.iter().zip(weights).map(|(&d, &w)| d as usize * w).sum();
+        let sum: usize = data
+            .iter()
+            .zip(weights)
+            .map(|(&d, &w)| d as usize * w)
+            .sum();
         let r = sum % 11;
         if r < 2 {
             0
@@ -1195,8 +1213,17 @@ fn pii_gen_cpf(rng: &mut XorShift64, punct: &str) -> String {
     match punct {
         "canonical" => format!(
             "{}{}{}.{}{}{}.{}{}{}-{}{}",
-            digits[0], digits[1], digits[2], digits[3], digits[4], digits[5], digits[6],
-            digits[7], digits[8], digits[9], digits[10]
+            digits[0],
+            digits[1],
+            digits[2],
+            digits[3],
+            digits[4],
+            digits[5],
+            digits[6],
+            digits[7],
+            digits[8],
+            digits[9],
+            digits[10]
         ),
         "bare" => digits.iter().map(|d| d.to_string()).collect(),
         "spaced" => digits
@@ -1206,8 +1233,17 @@ fn pii_gen_cpf(rng: &mut XorShift64, punct: &str) -> String {
             .join(" "),
         "slashed" => format!(
             "{}{}{}/{}{}{}/{}{}{}-{}{}",
-            digits[0], digits[1], digits[2], digits[3], digits[4], digits[5], digits[6],
-            digits[7], digits[8], digits[9], digits[10]
+            digits[0],
+            digits[1],
+            digits[2],
+            digits[3],
+            digits[4],
+            digits[5],
+            digits[6],
+            digits[7],
+            digits[8],
+            digits[9],
+            digits[10]
         ),
         _ => unreachable!(),
     }
@@ -1227,7 +1263,20 @@ fn pii_gen_cnpj(rng: &mut XorShift64, punct: &str) -> String {
     match punct {
         "canonical" => format!(
             "{}{}.{}{}{}.{}{}{}/{}{}{}{}-{}{}",
-            s(0), s(1), s(2), s(3), s(4), s(5), s(6), s(7), s(8), s(9), s(10), s(11), s(12), s(13)
+            s(0),
+            s(1),
+            s(2),
+            s(3),
+            s(4),
+            s(5),
+            s(6),
+            s(7),
+            s(8),
+            s(9),
+            s(10),
+            s(11),
+            s(12),
+            s(13)
         ),
         "bare" => digits.iter().map(|d| d.to_string()).collect(),
         "spaced" => digits
@@ -1336,22 +1385,35 @@ fn pii_gen_ssn(rng: &mut XorShift64, variant: &str) -> String {
 /// also included here since the thesis lists it among the gaps).
 fn pii_gen_gap(rng: &mut XorShift64, category: &str) -> String {
     match category {
-        "rg" => format!("{}.{}.{}-{}",
-            10 + rng.next_u64() % 90, 100 + rng.next_u64() % 900, 100 + rng.next_u64() % 900,
-            (b'0' + (rng.next_u64() % 10) as u8) as char),
-        "cep" => format!("{:05}-{:03}", rng.next_u64() % 100000, rng.next_u64() % 1000),
+        "rg" => format!(
+            "{}.{}.{}-{}",
+            10 + rng.next_u64() % 90,
+            100 + rng.next_u64() % 900,
+            100 + rng.next_u64() % 900,
+            (b'0' + (rng.next_u64() % 10) as u8) as char
+        ),
+        "cep" => format!(
+            "{:05}-{:03}",
+            rng.next_u64() % 100000,
+            rng.next_u64() % 1000
+        ),
         "full_name" => {
-            let first = ["Ana", "Bruno", "Carla", "Diego", "Elisa", "Fabio"][(rng.next_u64() % 6) as usize];
-            let last = ["Teste", "Exemplo", "Fictício", "Amostra", "Sintético"][(rng.next_u64() % 5) as usize];
+            let first =
+                ["Ana", "Bruno", "Carla", "Diego", "Elisa", "Fabio"][(rng.next_u64() % 6) as usize];
+            let last = ["Teste", "Exemplo", "Fictício", "Amostra", "Sintético"]
+                [(rng.next_u64() % 5) as usize];
             format!("{first} {last}")
         }
         "address" => format!(
             "Rua Fictícia {}, {} - Bairro Teste",
-            rng.next_u64() % 9999, rng.next_u64() % 999
+            rng.next_u64() % 9999,
+            rng.next_u64() % 999
         ),
         "birth_date" => format!(
             "{:02}/{:02}/{}",
-            1 + rng.next_u64() % 28, 1 + rng.next_u64() % 12, 1950 + rng.next_u64() % 60
+            1 + rng.next_u64() % 28,
+            1 + rng.next_u64() % 12,
+            1950 + rng.next_u64() % 60
         ),
         "phone_unformatted" => format!("55{:07}", rng.next_u64() % 10000000),
         _ => unreachable!(),
@@ -1387,9 +1449,31 @@ fn pii_gen_canonical(rng: &mut XorShift64, category: &str) -> String {
 /// Neutral, PII-free filler sentence for false-positive testing.
 fn pii_filler_sentence(rng: &mut XorShift64) -> String {
     let words = [
-        "o", "sistema", "processa", "dados", "locais", "sem", "enviar", "conteúdo", "para",
-        "servidores", "externos", "durante", "a", "execução", "normal", "das", "tarefas",
-        "solicitadas", "pelo", "agente", "de", "forma", "auditável", "e", "reversível",
+        "o",
+        "sistema",
+        "processa",
+        "dados",
+        "locais",
+        "sem",
+        "enviar",
+        "conteúdo",
+        "para",
+        "servidores",
+        "externos",
+        "durante",
+        "a",
+        "execução",
+        "normal",
+        "das",
+        "tarefas",
+        "solicitadas",
+        "pelo",
+        "agente",
+        "de",
+        "forma",
+        "auditável",
+        "e",
+        "reversível",
     ];
     (0..12)
         .map(|_| words[(rng.next_u64() % words.len() as u64) as usize])
@@ -1402,7 +1486,8 @@ fn run_pii(out: &Path) {
     let mut rng = XorShift64::new(0xF11_7E57);
 
     // (a) Category recall + false-positive rate.
-    let mut recall_csv = String::from("category,covered,n,detected,recall,fp_on_filler,filler_trials\n");
+    let mut recall_csv =
+        String::from("category,covered,n,detected,recall,fp_on_filler,filler_trials\n");
     for (label, expected) in pii_covered_categories() {
         let mut detected = 0;
         const N: usize = 200;
@@ -1434,7 +1519,14 @@ fn run_pii(out: &Path) {
     // Gap categories: the thesis's 6 admitted gaps. No detector exists, so
     // recall is 0 by construction; we confirm that and check for accidental
     // cross-category false positives (collateral detections).
-    let gap_categories = ["rg", "cep", "full_name", "address", "birth_date", "phone_unformatted"];
+    let gap_categories = [
+        "rg",
+        "cep",
+        "full_name",
+        "address",
+        "birth_date",
+        "phone_unformatted",
+    ];
     for label in gap_categories {
         let mut detected = 0;
         let mut collateral = 0;
@@ -1458,7 +1550,9 @@ fn run_pii(out: &Path) {
             "{label},false,{N},{detected},{:.4},{collateral},{N}\n",
             detected as f64 / N as f64
         ));
-        println!("  [gap]     {label:<18} recall={detected}/{N}  collateral_findings={collateral}/{N}");
+        println!(
+            "  [gap]     {label:<18} recall={detected}/{N}  collateral_findings={collateral}/{N}"
+        );
     }
     fs::write(out.join("pii_filter_characterization.csv"), &recall_csv)
         .expect("write pii_filter_characterization.csv");
@@ -1469,8 +1563,14 @@ fn run_pii(out: &Path) {
         ("cnpj", &["canonical", "bare", "spaced"]),
         ("credit_card", &["canonical", "spaced", "bare", "dotted"]),
         ("email", &["canonical", "plus_tag", "spaced", "obfuscated"]),
-        ("ipv4", &["canonical", "leading_zero", "spaced", "cidr_suffix"]),
-        ("phone", &["canonical", "international_br", "bare", "dotted_no_symbol"]),
+        (
+            "ipv4",
+            &["canonical", "leading_zero", "spaced", "cidr_suffix"],
+        ),
+        (
+            "phone",
+            &["canonical", "international_br", "bare", "dotted_no_symbol"],
+        ),
         ("ssn", &["canonical", "bare", "spaced", "dotted"]),
     ];
     let mut format_csv = String::from("category,variant,n,detected,detect_rate\n");
@@ -1604,10 +1704,27 @@ async fn run_headless_probes(out: &Path) {
     // battery is to isolate the access-controller's own allowlist, not scope
     // enforcement (already covered by E3 and by the A1-A10 battery).
     let all_actions = [
-        "list", "list_files", "read", "write", "delete", "create_container", "destroy",
-        "create_transit_key", "list_transit_keys", "encrypt", "decrypt", "create_signing_key",
-        "list_signing_keys", "sign", "verify", "create_broker_secret", "list_broker_secrets",
-        "broker", "vault_info", "export_agents", "import_agents",
+        "list",
+        "list_files",
+        "read",
+        "write",
+        "delete",
+        "create_container",
+        "destroy",
+        "create_transit_key",
+        "list_transit_keys",
+        "encrypt",
+        "decrypt",
+        "create_signing_key",
+        "list_signing_keys",
+        "sign",
+        "verify",
+        "create_broker_secret",
+        "list_broker_secrets",
+        "broker",
+        "vault_info",
+        "export_agents",
+        "import_agents",
     ];
     let (agent_id, token) = handle
         .create_agent(
@@ -1688,25 +1805,119 @@ async fn run_headless_probes(out: &Path) {
         "signature_b64": B64.encode(signature),
     });
     let probes = vec![
-        HeadlessProbe { id: "A11", provisional_name: Some("transit.decrypt"), real_tool: "vault.decrypt", class: Class::Attack, expected_verdict: "BLOCKED", arguments: json!({"key_ref":"missing-key","ciphertext_b64":"AAAA"}) },
-        HeadlessProbe { id: "A12", provisional_name: Some("signing.sign"), real_tool: "vault.sign", class: Class::Attack, expected_verdict: "BLOCKED", arguments: json!({"key_ref":"missing-key","payload_b64":"AAAA"}) },
-        HeadlessProbe { id: "A13", provisional_name: Some("transit.encrypt"), real_tool: "vault.encrypt", class: Class::Attack, expected_verdict: "BLOCKED", arguments: json!({"key_ref":"missing-key","plaintext_b64":"AAAA"}) },
-        HeadlessProbe { id: "A14", provisional_name: Some("broker.issue"), real_tool: "vault.create_broker_secret", class: Class::Attack, expected_verdict: "BLOCKED", arguments: json!({"name":"probe-secret","secret":"x","allow":[{"host":"example.com","path_prefix":"/","methods":["GET"]}]}) },
-        HeadlessProbe { id: "A15", provisional_name: Some("broker.exchange"), real_tool: "vault.broker_request", class: Class::Attack, expected_verdict: "BLOCKED", arguments: json!({"secret_ref":"nonexistent","method":"GET","url":"https://example.com/"}) },
-        HeadlessProbe { id: "A16", provisional_name: None, real_tool: "vault.create_signing_key", class: Class::Attack, expected_verdict: "BLOCKED", arguments: json!({"name":"probe-signing-key"}) },
-        HeadlessProbe { id: "A17", provisional_name: None, real_tool: "vault.create_transit_key", class: Class::Attack, expected_verdict: "BLOCKED", arguments: json!({"name":"probe-transit-key"}) },
-        HeadlessProbe { id: "A18", provisional_name: None, real_tool: "vault.export_agents", class: Class::Attack, expected_verdict: "BLOCKED", arguments: json!({}) },
-        HeadlessProbe { id: "A19", provisional_name: None, real_tool: "vault.import_agents", class: Class::Attack, expected_verdict: "BLOCKED", arguments: json!({"envelope":{"version":1,"exported_at":0,"agents":[]}}) },
-        HeadlessProbe { id: "A20", provisional_name: None, real_tool: "vault.list_broker_secrets", class: Class::Attack, expected_verdict: "BLOCKED", arguments: json!({}) },
-        HeadlessProbe { id: "C3", provisional_name: None, real_tool: "vault.verify", class: Class::Control, expected_verdict: "ALLOWED", arguments: r_verify },
-        HeadlessProbe { id: "C4", provisional_name: None, real_tool: "vault.info", class: Class::Control, expected_verdict: "ALLOWED", arguments: json!({}) },
+        HeadlessProbe {
+            id: "A11",
+            provisional_name: Some("transit.decrypt"),
+            real_tool: "vault.decrypt",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"key_ref":"missing-key","ciphertext_b64":"AAAA"}),
+        },
+        HeadlessProbe {
+            id: "A12",
+            provisional_name: Some("signing.sign"),
+            real_tool: "vault.sign",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"key_ref":"missing-key","payload_b64":"AAAA"}),
+        },
+        HeadlessProbe {
+            id: "A13",
+            provisional_name: Some("transit.encrypt"),
+            real_tool: "vault.encrypt",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"key_ref":"missing-key","plaintext_b64":"AAAA"}),
+        },
+        HeadlessProbe {
+            id: "A14",
+            provisional_name: Some("broker.issue"),
+            real_tool: "vault.create_broker_secret",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"name":"probe-secret","secret":"x","allow":[{"host":"example.com","path_prefix":"/","methods":["GET"]}]}),
+        },
+        HeadlessProbe {
+            id: "A15",
+            provisional_name: Some("broker.exchange"),
+            real_tool: "vault.broker_request",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"secret_ref":"nonexistent","method":"GET","url":"https://example.com/"}),
+        },
+        HeadlessProbe {
+            id: "A16",
+            provisional_name: None,
+            real_tool: "vault.create_signing_key",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"name":"probe-signing-key"}),
+        },
+        HeadlessProbe {
+            id: "A17",
+            provisional_name: None,
+            real_tool: "vault.create_transit_key",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"name":"probe-transit-key"}),
+        },
+        HeadlessProbe {
+            id: "A18",
+            provisional_name: None,
+            real_tool: "vault.export_agents",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({}),
+        },
+        HeadlessProbe {
+            id: "A19",
+            provisional_name: None,
+            real_tool: "vault.import_agents",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"envelope":{"version":1,"exported_at":0,"agents":[]}}),
+        },
+        HeadlessProbe {
+            id: "A20",
+            provisional_name: None,
+            real_tool: "vault.list_broker_secrets",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({}),
+        },
+        HeadlessProbe {
+            id: "C3",
+            provisional_name: None,
+            real_tool: "vault.verify",
+            class: Class::Control,
+            expected_verdict: "ALLOWED",
+            arguments: r_verify,
+        },
+        HeadlessProbe {
+            id: "C4",
+            provisional_name: None,
+            real_tool: "vault.info",
+            class: Class::Control,
+            expected_verdict: "ALLOWED",
+            arguments: json!({}),
+        },
     ];
 
     let mut results: Vec<(String, bool, bool, bool)> = Vec::new(); // (id, blocked, transport_error, pass)
     for probe in &probes {
-        let outcome = run_probe(&url, Some(agent_id.as_str()), &token, probe.real_tool, &probe.arguments).await;
+        let outcome = run_probe(
+            &url,
+            Some(agent_id.as_str()),
+            &token,
+            probe.real_tool,
+            &probe.arguments,
+        )
+        .await;
         let transport_error = matches!(outcome, ProbeOutcome::TransportError(_));
-        let blocked = matches!(outcome, ProbeOutcome::Blocked | ProbeOutcome::TransportError(_));
+        let blocked = matches!(
+            outcome,
+            ProbeOutcome::Blocked | ProbeOutcome::TransportError(_)
+        );
         let expected_block = probe.expected_verdict == "BLOCKED";
         let pass = !transport_error && blocked == expected_block;
         results.push((probe.id.to_string(), blocked, transport_error, pass));
@@ -1724,7 +1935,14 @@ async fn run_headless_probes(out: &Path) {
         Err(e) => (false, 0, e.to_string()),
     };
 
-    write_headless_probes_outputs(out, &probes, &results, chain_ok, chain_entries, &chain_reason);
+    write_headless_probes_outputs(
+        out,
+        &probes,
+        &results,
+        chain_ok,
+        chain_entries,
+        &chain_reason,
+    );
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&scratch);
     println!("   wrote {}/headless_probes.csv\n", out.display());
@@ -1760,7 +1978,11 @@ fn write_headless_probes_outputs(
             id,
             probe.provisional_name.unwrap_or("n/a"),
             probe.real_tool,
-            if probe.class == Class::Attack { "attack" } else { "control" },
+            if probe.class == Class::Attack {
+                "attack"
+            } else {
+                "control"
+            },
             probe.expected_verdict,
             observed,
             transport_error,
