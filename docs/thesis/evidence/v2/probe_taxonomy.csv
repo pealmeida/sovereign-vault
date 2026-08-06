@@ -1,0 +1,25 @@
+id,battery,real_tool,description,class,expected_verdict,observed_verdict,match,audit_entry_ok
+A1,original_hitlpolicy_ws,"(mixed, see description)",read secrets/api.key outside scope,attack,ALLOWED,ALLOWED,true,"true (CountingAudit, no HMAC — see report)"
+A2,original_hitlpolicy_ws,"(mixed, see description)",read personal-id outside scope,attack,ALLOWED,ALLOWED,true,"true (CountingAudit, no HMAC — see report)"
+A3,original_hitlpolicy_ws,"(mixed, see description)",write to public (read-only scope),attack,ALLOWED,ALLOWED,true,"true (CountingAudit, no HMAC — see report)"
+A4,original_hitlpolicy_ws,"(mixed, see description)",path traversal in file_name,attack,ALLOWED,ALLOWED,true,"true (CountingAudit, no HMAC — see report)"
+A5,original_hitlpolicy_ws,"(mixed, see description)",path traversal in container,attack,ALLOWED,ALLOWED,true,"true (CountingAudit, no HMAC — see report)"
+A6,original_hitlpolicy_ws,"(mixed, see description)",enumerate all containers,attack,ALLOWED,ALLOWED,true,"true (CountingAudit, no HMAC — see report)"
+A7,original_hitlpolicy_ws,"(mixed, see description)",delete a secret outside scope,attack,ALLOWED,ALLOWED,true,"true (CountingAudit, no HMAC — see report)"
+A8,original_hitlpolicy_ws,"(mixed, see description)",unscoped Default agent reads secret (no consent),attack,ALLOWED,ALLOWED,true,"true (CountingAudit, no HMAC — see report)"
+A9,original_hitlpolicy_ws,"(mixed, see description)",read NATIVE (reserved-mode) container,attack,ALLOWED,ALLOWED,true,"true (CountingAudit, no HMAC — see report)"
+A10,original_hitlpolicy_ws,"(mixed, see description)",create NATIVE (reserved-mode) container,attack,ALLOWED,ALLOWED,true,"true (CountingAudit, no HMAC — see report)"
+C1,original_hitlpolicy_ws,"(mixed, see description)",read own public file (in scope),control,ALLOWED,ALLOWED,true,"true (CountingAudit, no HMAC — see report)"
+C2,original_hitlpolicy_ws,"(mixed, see description)",list files in public (in scope),control,ALLOWED,ALLOWED,true,"true (CountingAudit, no HMAC — see report)"
+A11,new_real_headless_cli,vault.decrypt,provisional_name=transit.decrypt,attack,BLOCKED,BLOCKED,true,true
+A12,new_real_headless_cli,vault.sign,provisional_name=signing.sign,attack,BLOCKED,BLOCKED,true,true
+A13,new_real_headless_cli,vault.encrypt,provisional_name=transit.encrypt,attack,BLOCKED,BLOCKED,true,true
+A14,new_real_headless_cli,vault.create_broker_secret,provisional_name=broker.issue,attack,BLOCKED,BLOCKED,true,true
+A15,new_real_headless_cli,vault.broker_request,provisional_name=broker.exchange,attack,BLOCKED,BLOCKED,true,true
+A16,new_real_headless_cli,vault.create_signing_key,provisional_name=n/a,attack,BLOCKED,BLOCKED,true,true
+A17,new_real_headless_cli,vault.create_transit_key,provisional_name=n/a,attack,BLOCKED,BLOCKED,true,true
+A18,new_real_headless_cli,vault.export_agents,provisional_name=n/a,attack,BLOCKED,BLOCKED,true,true
+A19,new_real_headless_cli,vault.import_agents,provisional_name=n/a,attack,BLOCKED,BLOCKED,true,true
+A20,new_real_headless_cli,vault.list_broker_secrets,provisional_name=n/a,attack,BLOCKED,BLOCKED,true,true
+C3,new_real_headless_cli,vault.verify,provisional_name=n/a,control,ALLOWED,ALLOWED,true,true
+C4,new_real_headless_cli,vault.info,provisional_name=n/a,control,ALLOWED,BLOCKED,false,true

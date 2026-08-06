@@ -1,0 +1,10 @@
+path,scope_set_size,mode,payload,n,k,median_us,ci95_lo_us,ci95_hi_us,delta_vs_bypass_us,delta_ci95_lo,delta_ci95_hi
+ws_authenticated,0,direct,128B,1000,1,13.084,13.065,13.101,0.000,,
+ws_authenticated,0,direct,1KiB,1000,1,14.861,14.842,14.885,0.000,,
+ws_authenticated,0,direct,16KiB,1000,1,39.864,39.845,39.894,0.000,,
+ws_authenticated,1,direct,128B,1000,1,13.147,13.130,13.167,0.063,,
+ws_authenticated,1,direct,1KiB,1000,1,14.738,14.727,14.753,-0.123,,
+ws_authenticated,1,direct,16KiB,1000,1,39.213,39.193,39.242,-0.651,,
+ws_authenticated,20,direct,128B,1000,1,15.709,15.645,15.760,2.625,,
+ws_authenticated,20,direct,1KiB,1000,1,17.023,16.987,17.047,2.162,,
+ws_authenticated,20,direct,16KiB,1000,1,42.541,42.494,42.590,2.677,,
