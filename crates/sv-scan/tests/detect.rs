@@ -148,9 +148,7 @@ fn private_key_pem_matches_header_line_only() {
     // fixture that trips CI on every run trains people to ignore CI.
     let begin = format!("-----BEGIN RSA {} KEY-----", "PRIVATE");
     let end = format!("-----END RSA {} KEY-----", "PRIVATE");
-    let content = format!("{begin}
-MIIblahbase64
-{end}");
+    let content = format!("{begin}\nMIIblahbase64\n{end}");
     let body = begin;
     let findings = detect_secrets(&content, Path::new(TOML));
     let pem = findings
