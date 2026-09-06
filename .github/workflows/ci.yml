@@ -142,7 +142,7 @@ jobs:
       # advisories (e.g. the GTK3 bindings Tauri pulls in on Linux) are reported
       # but non-fatal — unlike the rustsec/audit-check action, which fails on them.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2
         with:
           tool: cargo-audit
       - name: cargo audit (fail only on vulnerabilities)
