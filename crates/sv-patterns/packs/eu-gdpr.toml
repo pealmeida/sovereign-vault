@@ -1,0 +1,55 @@
+# European identifier patterns (GDPR context). Extends baseline detection;
+# it can never reduce it. Regulatory references are informational pointers,
+# not legal claims. All example values are synthetic; checksummed examples
+# were computed to pass their checksums.
+schema = "1"
+id = "eu-gdpr"
+version = "0.1.0"
+name = "European Union (GDPR) identifier pack"
+jurisdictions = ["EU"]
+regulatory_references = ["GDPR"]
+
+[[rules]]
+name = "iban"
+description = "International Bank Account Number (ISO 13616): two country letters, two check digits, BBAN of 11-30 alphanumerics; mod-97-10 validation. Unspaced form only."
+pattern = '\b[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}\b'
+validator = "iban_v1"
+confidence = "high"
+examples_valid = ["DE89370400440532013000", "GB33BUKB20201555555555", "NL91ABNA0417164300"]
+examples_invalid = ["DE89370400440532013001", "GB82WEST12345698765400"]
+
+[[rules]]
+name = "uk_nino"
+description = "United Kingdom National Insurance Number: two allowed prefix letters, six digits, suffix A-D. Structural rules only (no checksum exists for NINO)."
+pattern = '\b(?:QQ|[ABCEGHJKLMNPRSTWXYZ][ABCEGHJKLMNOPRSTWXYZ])[0-9]{6}[A-D]\b'
+validator = "nino_v1"
+confidence = "medium"
+examples_valid = ["QQ123456A", "AB123456C"]
+examples_invalid = ["ZZ123456A", "BG123456B", "QQ123456E"]
+
+[[rules]]
+name = "de_steuer_id"
+description = "German Steuer-Identifikationsnummer: 11 digits; structural validation enforces the repeated-digit rule. The mod-11 check digit is not verified."
+pattern = '\b[0-9]{11}\b'
+validator = "steuer_id_v1"
+confidence = "medium"
+examples_valid = ["26954371821", "12345678912"]
+examples_invalid = ["11111111111", "12345678901"]
+
+[[rules]]
+name = "es_dni"
+description = "Spanish DNI: eight digits plus the mod-23 check letter. NIE (X/Y/Z-prefixed) is not covered by this rule."
+pattern = '\b[0-9]{8}[A-Z]\b'
+validator = "dni_v1"
+confidence = "high"
+examples_valid = ["12345678Z", "23456789D"]
+examples_invalid = ["12345678X", "1234567Z"]
+
+[[rules]]
+name = "it_codice_fiscale"
+description = "Italian Codice Fiscale: six letters, birth-date encoding, town code, and the mod-26 check letter from the odd/even character maps."
+pattern = '\b[A-Z]{6}[0-9]{2}[A-Z][0-9]{2}[A-Z][0-9]{3}[A-Z]\b'
+validator = "codice_fiscale_v1"
+confidence = "high"
+examples_valid = ["MRTMTT25D09F205Z", "ABCDEF12G34H567S"]
+examples_invalid = ["MRTMTT25D09F205Y", "ABCDEF12G34H56"]

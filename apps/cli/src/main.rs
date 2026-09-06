@@ -4,6 +4,7 @@
 
 mod agent_commands;
 mod mcp_stdio;
+mod scan_command;
 mod serve;
 
 use std::net::SocketAddr;
@@ -31,6 +32,64 @@ enum Cmd {
     Serve(ServeCli),
     /// Detect, repair, and report on a vault (manifest auth, agents, audit).
     Migrate(MigrateCli),
+    /// Scan a project tree for secrets and personal data (read-only).
+    Scan(ScanCli),
+}
+
+/// `sovereign-vault scan` — read-only discovery over a project tree.
+///
+/// The scan never modifies the scanned files. Storing the report in the vault
+/// (`--store`) is what makes it reachable by an agent through the existing
+/// `vault.read` MCP tool, gated by the container's security mode.
+#[derive(Args, Debug)]
+struct ScanCli {
+    /// Directory to scan. Defaults to the current directory.
+    #[arg(default_value = ".")]
+    path: PathBuf,
+
+    /// Emit the report as JSON instead of text.
+    #[arg(long)]
+    json: bool,
+
+    /// Store the report in the vault so agents can read it under consent.
+    #[arg(long)]
+    store: bool,
+
+    /// Container to store the report in.
+    #[arg(long, default_value = scan_command::DEFAULT_REPORT_CONTAINER)]
+    container: String,
+
+    /// Skip files larger than this many bytes.
+    #[arg(long, default_value_t = 5 * 1024 * 1024)]
+    max_file_bytes: u64,
+
+    /// Scan files that `.gitignore` would otherwise exclude.
+    #[arg(long)]
+    no_gitignore: bool,
+
+    /// Only report findings at this confidence or above (low, medium, high).
+    #[arg(long)]
+    min_confidence: Option<String>,
+
+    /// Jurisdiction pattern packs to enable, by id or TOML path. Repeatable.
+    ///
+    /// Bundled ids: `br-lgpd`, `eu-gdpr`, `us`. Packs only ever add rules —
+    /// they can never disable the baseline detectors. Off by default because
+    /// enabling everything turns most long digit runs into candidates.
+    #[arg(long = "pack")]
+    packs: Vec<String>,
+
+    /// List the bundled jurisdiction packs and exit.
+    #[arg(long)]
+    list_packs: bool,
+
+    /// Vault root. Defaults to the OS app-data dir. Only used with --store.
+    #[arg(long, env = "SV_ROOT")]
+    root: Option<PathBuf>,
+
+    /// Passphrase for passphrase custody. Only used with --store.
+    #[arg(long, env = "SV_PASSPHRASE")]
+    passphrase: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -174,7 +233,127 @@ async fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        Some(Cmd::Scan(scan)) => match run_scan(scan) {
+            Ok(found) => {
+                // Exit 2 signals "findings present" so a pre-commit hook or CI
+                // step can act on it without parsing stdout. Exit 1 stays
+                // reserved for a scanner failure.
+                if found {
+                    ExitCode::from(2)
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(e) => {
+                eprintln!("sovereign-vault scan: {e}");
+                ExitCode::from(1)
+            }
+        },
     }
+}
+
+/// Run a project scan. Returns whether any finding survived filtering.
+fn run_scan(scan: ScanCli) -> Result<bool, String> {
+    if scan.list_packs {
+        print!("{}", scan_command::render_pack_list());
+        return Ok(false);
+    }
+
+    let root = scan
+        .path
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", scan.path.display()))?;
+
+    let min_confidence = match scan.min_confidence.as_deref() {
+        None => None,
+        Some("low") => Some(sv_scan::Confidence::Low),
+        Some("medium") => Some(sv_scan::Confidence::Medium),
+        Some("high") => Some(sv_scan::Confidence::High),
+        Some(other) => {
+            return Err(format!(
+                "unknown --min-confidence {other}: expected low, medium, or high"
+            ))
+        }
+    };
+
+    let config =
+        scan_command::build_config(scan.max_file_bytes, scan.no_gitignore, scan.packs.clone());
+
+    let started = std::time::Instant::now();
+    let report = sv_scan::scan_project(&root, &config).map_err(|e| e.to_string())?;
+    let elapsed = started.elapsed();
+    let report = scan_command::apply_min_confidence(report, min_confidence);
+
+    let document = scan_command::report_document(&report, &root);
+
+    if scan.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&document).map_err(|e| e.to_string())?
+        );
+    } else {
+        print!("{}", scan_command::render_text(&report, &root, elapsed));
+    }
+
+    if scan.store {
+        let vault_root = scan
+            .root
+            .clone()
+            .or_else(|| dirs::data_dir().map(|d| d.join("sovereign-vault")))
+            .ok_or_else(|| "cannot determine vault root; set --root".to_string())?;
+        let stored = store_report(
+            &vault_root,
+            &scan.container,
+            &root,
+            &document,
+            scan.passphrase.as_deref(),
+        )?;
+        eprintln!(
+            "[scan] report stored: container={} file={}",
+            scan.container, stored
+        );
+        eprintln!(
+            "[scan] an agent can now read it via vault.read, subject to that container's mode"
+        );
+    }
+
+    Ok(!report.findings.is_empty())
+}
+
+/// Write the report into a vault container, creating it if needed.
+///
+/// The container is created in `APPROVAL` mode when it does not exist: a report
+/// names where sensitive material lives, so an agent reading one should raise a
+/// human prompt rather than pass silently.
+fn store_report(
+    vault_root: &std::path::Path,
+    container: &str,
+    scanned_root: &std::path::Path,
+    document: &serde_json::Value,
+    passphrase: Option<&str>,
+) -> Result<String, String> {
+    let custody = sv_core::VaultHandle::detect_custody(vault_root).map_err(|e| e.to_string())?;
+    let handle =
+        sv_core::VaultHandle::unlock(vault_root, custody, passphrase).map_err(|e| e.to_string())?;
+
+    let existing = handle.list_containers().map_err(|e| e.to_string())?;
+    if !existing.iter().any(|c| c.name == container) {
+        handle
+            .create_container(
+                container,
+                sv_core::sv_storage::SecurityMode::Approval,
+                Some("Sovereign Vault scan reports (masked; no secret values)".to_string()),
+            )
+            .map_err(|e| e.to_string())?;
+        eprintln!("[scan] created container {container} in APPROVAL mode");
+    }
+
+    let file_name = scan_command::report_file_name(scanned_root);
+    let bytes = serde_json::to_vec_pretty(document).map_err(|e| e.to_string())?;
+    handle
+        .write_file(container, &file_name, &bytes)
+        .map_err(|e| e.to_string())?;
+    Ok(file_name)
 }
 
 fn run_agents(agents: AgentsCli) -> Result<(), String> {

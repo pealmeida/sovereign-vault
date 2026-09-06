@@ -1,0 +1,52 @@
+# Brazilian identifier patterns (LGPD context). Extends baseline detection;
+# it can never reduce it. Regulatory references are informational pointers,
+# not legal claims. All example values are synthetic; checksummed examples
+# were computed to pass their checksums.
+schema = "1"
+id = "br-lgpd"
+version = "0.1.0"
+name = "Brazil (LGPD) identifier pack"
+jurisdictions = ["BR"]
+regulatory_references = ["LGPD"]
+
+[[rules]]
+name = "cpf"
+description = "Brazilian CPF in formatted form (000.000.000-00); two mod-11 check digits, repdigits rejected. sv-privacy already detects the bare form; this rule covers the punctuated form."
+pattern = '\b[0-9]{3}\.[0-9]{3}\.[0-9]{3}-[0-9]{2}\b'
+validator = "cpf_v1"
+confidence = "high"
+examples_valid = ["111.444.777-35", "123.456.789-09"]
+examples_invalid = ["111.444.777-36", "111.111.111-11"]
+
+[[rules]]
+name = "cnpj"
+description = "Brazilian CNPJ in formatted form (00.000.000/0000-00); two mod-11 check digits with the standard weights, repdigits rejected."
+pattern = '\b[0-9]{2}\.[0-9]{3}\.[0-9]{3}/[0-9]{4}-[0-9]{2}\b'
+validator = "cnpj_v1"
+confidence = "high"
+examples_valid = ["11.222.333/0001-81", "04.252.011/0001-10"]
+examples_invalid = ["11.222.333/0001-82", "11.111.111/1111-11"]
+
+[[rules]]
+name = "cep"
+description = "Brazilian postal code (CEP) in formatted form (00000-000). Structural only; no checksum exists."
+pattern = '\b[0-9]{5}-[0-9]{3}\b'
+confidence = "low"
+examples_valid = ["12345-678", "99999-999"]
+examples_invalid = ["1234-567", "12345 678"]
+
+[[rules]]
+name = "phone_br"
+description = "Brazilian mobile phone number with area code in parentheses, nine-digit form: (DD) 9XXXX-XXXX. Structural only."
+pattern = '\([1-9][0-9]\)\s?9[0-9]{4}-[0-9]{4}'
+confidence = "medium"
+examples_valid = ["(11) 91234-5678", "(21) 92345-6789"]
+examples_invalid = ["(11) 1234-5678", "11 91234-5678"]
+
+[[rules]]
+name = "rg"
+description = "Brazilian RG (Registro Geral) in the common XX.XXX.XXX-D formatted form. Structural only: the check digit algorithm varies by issuing state, so none is enforced."
+pattern = '\b[0-9]{2}\.[0-9]{3}\.[0-9]{3}-[0-9X]\b'
+confidence = "low"
+examples_valid = ["12.345.678-9", "98.765.432-X"]
+examples_invalid = ["123456789", "12.345.678-"]

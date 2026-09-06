@@ -8,8 +8,11 @@ members = [
     "crates/sv-audit",
     "crates/sv-privacy",
     "crates/sv-mcp",
+    "crates/sv-runtime",
     "crates/sv-http",
     "crates/sv-core",
+    "crates/sv-scan",
+    "crates/sv-patterns",
     "apps/cli",
     "apps/desktop/src-tauri",
     "apps/thesis-eval",
@@ -38,6 +41,9 @@ sv-recovery  = { path = "crates/sv-recovery",  version = "0.1.0" }
 sv-audit     = { path = "crates/sv-audit",     version = "0.1.0" }
 sv-privacy   = { path = "crates/sv-privacy",   version = "0.1.0" }
 sv-mcp       = { path = "crates/sv-mcp",       version = "0.1.0" }
+sv-runtime   = { path = "crates/sv-runtime",   version = "0.1.0" }
+sv-scan      = { path = "crates/sv-scan",      version = "0.1.0" }
+sv-patterns  = { path = "crates/sv-patterns",  version = "0.1.0" }
 sv-http      = { path = "crates/sv-http",      version = "0.1.0" }
 sv-core      = { path = "crates/sv-core",      version = "0.1.0" }
 
@@ -67,6 +73,9 @@ getrandom    = "0.4"
 tempfile     = "3.27"
 fs4          = "1.1"
 atomicwrites = "0.4.4"
+ignore       = "0.4"
+regex        = "1.11"
+toml         = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 
 [profile.release]
 lto = "thin"

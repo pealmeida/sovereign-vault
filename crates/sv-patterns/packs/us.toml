@@ -1,0 +1,41 @@
+# United States identifier patterns (HIPAA/CCPA context). Extends baseline
+# detection; it can never reduce it. Regulatory references are informational
+# pointers, not legal claims. All example values are synthetic.
+schema = "1"
+id = "us"
+version = "0.1.0"
+name = "United States identifier pack"
+jurisdictions = ["US"]
+regulatory_references = ["HIPAA", "CCPA"]
+
+[[rules]]
+name = "ssn"
+description = "US Social Security Number in the classic dashed form (000-00-0000). Structural only: area/group/serial exclusions (000, 666, 900+ areas) are not expressible in this pattern language and are not enforced."
+pattern = '\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b'
+confidence = "medium"
+examples_valid = ["123-45-6789", "212-12-3456"]
+examples_invalid = ["123456789", "123-4-56789"]
+
+[[rules]]
+name = "ein"
+description = "US Employer Identification Number in the dashed form (00-0000000). Structural only."
+pattern = '\b[0-9]{2}-[0-9]{7}\b'
+confidence = "low"
+examples_valid = ["12-3456789", "98-7654321"]
+examples_invalid = ["123456789", "12-345678"]
+
+[[rules]]
+name = "us_passport"
+description = "US passport number in the current one-letter-plus-eight-digits format. Structural only; older all-digit formats are not covered."
+pattern = '\b[A-Z][0-9]{8}\b'
+confidence = "low"
+examples_valid = ["A12345678", "Z98765432"]
+examples_invalid = ["123456789", "A1234567"]
+
+[[rules]]
+name = "medicare_bic"
+description = "CMS Medicare Beneficiary Identifier, structural skeleton derived from the CMS-published example format (11 characters, letter/digit positions, B/I/L/O/S/Z excluded from letter positions). No checksum exists; the position rules enforced here are a conservative subset."
+pattern = '\b[1-9][AC-HJKMNPQRT-Z][AC-HJKMNPQRT-Z0-9][0-9][AC-HJKMNPQRT-Z][AC-HJKMNPQRT-Z0-9][0-9][AC-HJKMNPQRT-Z][AC-HJKMNPQRT-Z0-9][0-9][0-9]\b'
+confidence = "low"
+examples_valid = ["1EG4TE5MK73", "2AC4DE6HJ22"]
+examples_invalid = ["0EG4TE5MK73", "1EB4TE5MK73"]
