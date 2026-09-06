@@ -1,0 +1,14 @@
+category,covered,n,detected,recall,fp_on_filler,filler_trials
+email,true,200,200,1.0000,0,500
+cpf,true,200,200,1.0000,0,500
+cnpj,true,200,200,1.0000,0,500
+credit_card,true,200,200,1.0000,0,500
+ipv4,true,200,200,1.0000,0,500
+phone,true,200,200,1.0000,0,500
+ssn,true,200,200,1.0000,0,500
+rg,false,200,0,0.0000,0,200
+cep,false,200,0,0.0000,0,200
+full_name,false,200,0,0.0000,0,200
+address,false,200,0,0.0000,0,200
+birth_date,false,200,0,0.0000,0,200
+phone_unformatted,false,200,0,0.0000,0,200

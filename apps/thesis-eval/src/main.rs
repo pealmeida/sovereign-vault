@@ -39,6 +39,8 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -74,6 +76,8 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let seed: Option<u64> = flag(&args, "--seed").and_then(|s| s.parse().ok());
+    let session = flag(&args, "--session").unwrap_or_else(|| "s0".to_string());
+    let protocol = flag(&args, "--protocol").unwrap_or_else(|| "legacy".to_string());
     let out = PathBuf::from(&out_dir);
     if let Err(e) = fs::create_dir_all(&out) {
         eprintln!("cannot create {}: {e}", out.display());
@@ -81,16 +85,21 @@ async fn main() {
     }
 
     match cmd {
-        "latency" => run_latency(&out, iterations, warmup, seed).await,
+        "latency" => run_latency(&out, iterations, warmup, seed, &session, &protocol).await,
         "micro" => run_micro(&out, iterations, warmup).await,
         "adversarial" => run_adversarial(&out).await,
+        "enforce_scopes" => run_enforce_scopes(&out, iterations, warmup, &session).await,
+        "pii" => run_pii(&out),
+        "headless_probes" => run_headless_probes(&out).await,
         "all" => {
-            run_latency(&out, iterations, warmup, seed).await;
+            run_latency(&out, iterations, warmup, seed, &session, &protocol).await;
             run_micro(&out, iterations, warmup).await;
             run_adversarial(&out).await;
         }
         other => {
-            eprintln!("unknown subcommand {other:?}; use: latency | micro | adversarial | all");
+            eprintln!(
+                "unknown subcommand {other:?}; use: latency | micro | adversarial | enforce_scopes | all"
+            );
             std::process::exit(2);
         }
     }
@@ -273,9 +282,23 @@ struct Stats {
     mean_us: f64,
     p50_us: f64,
     p95_us: f64,
+    p99_us: f64,
+    /// Bootstrap 95% CI on the *median*, resampled with replacement from this
+    /// session's own `n` timed calls (session remains the independent unit
+    /// for cross-session inference — see `docs/thesis/evidence/aggregate.py`;
+    /// this is a within-session precision estimate, not a substitute for it).
+    ci95_lo_us: f64,
+    ci95_hi_us: f64,
 }
 
-fn summarize(mut micros: Vec<f64>) -> Stats {
+fn summarize(micros: Vec<f64>) -> Stats {
+    summarize_seeded(micros, 0)
+}
+
+/// Same as [`summarize`] plus p99 and a bootstrap CI on the median. `seed`
+/// only drives the bootstrap resampling (deterministic, auditable), never the
+/// measured values themselves.
+fn summarize_seeded(mut micros: Vec<f64>, seed: u64) -> Stats {
     let n = micros.len();
     if n == 0 {
         return Stats {
@@ -283,20 +306,56 @@ fn summarize(mut micros: Vec<f64>) -> Stats {
             mean_us: 0.0,
             p50_us: 0.0,
             p95_us: 0.0,
+            p99_us: 0.0,
+            ci95_lo_us: 0.0,
+            ci95_hi_us: 0.0,
         };
     }
     let mean_us = micros.iter().sum::<f64>() / n as f64;
     micros.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let pick = |q: f64| -> f64 {
-        let idx = ((n as f64 - 1.0) * q).round() as usize;
-        micros[idx.min(n - 1)]
+    let pick = |v: &[f64], q: f64| -> f64 {
+        let idx = ((v.len() as f64 - 1.0) * q).round() as usize;
+        v[idx.min(v.len() - 1)]
     };
+    let (ci95_lo_us, ci95_hi_us) = bootstrap_median_ci(&micros, seed);
     Stats {
         n,
         mean_us,
-        p50_us: pick(0.50),
-        p95_us: pick(0.95),
+        p50_us: pick(&micros, 0.50),
+        p95_us: pick(&micros, 0.95),
+        p99_us: pick(&micros, 0.99),
+        ci95_lo_us,
+        ci95_hi_us,
     }
+}
+
+/// Percentile-bootstrap 95% CI on the median of an already-sorted sample,
+/// resampling with replacement B=2000 times. Uses the existing [`XorShift64`]
+/// generator so no `rand` dependency is needed for this deterministic op.
+fn bootstrap_median_ci(sorted: &[f64], seed: u64) -> (f64, f64) {
+    const B: usize = 2000;
+    let n = sorted.len();
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let mut rng = XorShift64::new(seed ^ 0xC1A0_DA7A_5EED_u64 ^ n as u64);
+    let mut medians: Vec<f64> = Vec::with_capacity(B);
+    let mut resample = vec![0.0f64; n];
+    for _ in 0..B {
+        for slot in resample.iter_mut() {
+            let idx = (rng.next_u64() % n as u64) as usize;
+            *slot = sorted[idx];
+        }
+        resample.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let idx = ((n as f64 - 1.0) * 0.50).round() as usize;
+        medians.push(resample[idx.min(n - 1)]);
+    }
+    medians.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let at = |q: f64| -> f64 {
+        let idx = ((medians.len() as f64 - 1.0) * q).round() as usize;
+        medians[idx.min(medians.len() - 1)]
+    };
+    (at(0.025), at(0.975))
 }
 
 fn us(d: Duration) -> f64 {
@@ -450,7 +509,14 @@ fn measure_iterations<T>(iterations: usize, mut operation: impl FnMut() -> T) ->
 // Latency evaluation (§3.9.1, Equation 1)
 // ---------------------------------------------------------------------------
 
-async fn run_latency(out: &Path, iterations: usize, warmup: usize, seed: Option<u64>) {
+async fn run_latency(
+    out: &Path,
+    iterations: usize,
+    warmup: usize,
+    seed: Option<u64>,
+    session: &str,
+    protocol: &str,
+) {
     println!("== Latency evaluation (thesis §3.9.1) ==");
     let (handle, root) = bootstrap("latency");
 
@@ -499,13 +565,14 @@ async fn run_latency(out: &Path, iterations: usize, warmup: usize, seed: Option<
         drive_reads_stdio(&server, cell.name, &format!("f{}", cell.bytes), iterations).await;
 
         let records = timing.0.lock().unwrap();
+        let cell_seed = seed.unwrap_or(0) ^ (cell.bytes as u64) ^ (execution_order as u64) << 32;
         let row = LatencyRow {
             mode: cell.name.to_string(),
             bytes: cell.bytes,
             warmup,
             seed,
             execution_order,
-            total: summarize(records.iter().map(|t| us(t.total)).collect()),
+            total: summarize_seeded(records.iter().map(|t| us(t.total)).collect(), cell_seed),
             validate: summarize(records.iter().map(|t| us(t.validate)).collect()),
             authorize: summarize(records.iter().map(|t| us(t.authorize)).collect()),
             execute: summarize(records.iter().map(|t| us(t.execute)).collect()),
@@ -515,8 +582,50 @@ async fn run_latency(out: &Path, iterations: usize, warmup: usize, seed: Option<
     }
 
     write_latency_outputs(out, &rows);
+    write_latency_v2(out, &rows, protocol, session);
     let _ = fs::remove_dir_all(&root);
     println!("   wrote {}/latency.csv and latency.md\n", out.display());
+}
+
+/// Payload-size label matching the thesis's three fixed sizes.
+fn payload_label(bytes: usize) -> String {
+    match bytes {
+        128 => "128B".to_string(),
+        1024 => "1KiB".to_string(),
+        16384 => "16KiB".to_string(),
+        other => format!("{other}B"),
+    }
+}
+
+/// Per-session, per-cell row for the corrected-protocol evidence set
+/// (docs/thesis/EVAL-PROTOCOL.md extension, reviewer items E1/E2). One row
+/// per (mode, payload); `ci95_*` bounds the *median* (`p50_us`), bootstrapped
+/// within this session's own `n` calls.
+fn write_latency_v2(out: &Path, rows: &[LatencyRow], protocol: &str, session: &str) {
+    let mut csv = String::from(
+        "protocol,session,mode,payload,bytes,n,warmup_n,order_index,mean_us,p50_us,p95_us,p99_us,ci95_lo_us,ci95_hi_us\n",
+    );
+    for r in rows {
+        let s = &r.total;
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}\n",
+            protocol,
+            session,
+            r.mode,
+            payload_label(r.bytes),
+            r.bytes,
+            s.n,
+            r.warmup,
+            r.execution_order,
+            s.mean_us,
+            s.p50_us,
+            s.p95_us,
+            s.p99_us,
+            s.ci95_lo_us,
+            s.ci95_hi_us,
+        ));
+    }
+    let _ = fs::write(out.join("latency_v2.csv"), &csv);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -725,6 +834,1178 @@ fn write_latency_metadata(out: &Path, rows: &[LatencyRow]) {
         ));
     }
     let _ = fs::write(out.join("latency-metadata.csv"), csv);
+}
+
+// ---------------------------------------------------------------------------
+// enforce_scopes on the authenticated WS path (reviewer item 5 / E3)
+// ---------------------------------------------------------------------------
+//
+// The stdio path used by `run_latency` never resolves an agent, so
+// `enforce_scopes` (crates/sv-mcp/src/lib.rs) is never invoked there — that is
+// the exact gap reviewer item 5 flags (thesis §4.1). This measures the real
+// authenticated WebSocket path, which does resolve an agent and does run
+// `enforce_scopes`, and decomposes it by scope-set size.
+//
+// `enforce_scopes` short-circuits to `Ok(())` when `agent.scopes.is_empty()`
+// (see sv-mcp), so the unscoped agent is not a code-level bypass — it is the
+// same function, real code, taking its cheapest branch. A literal bypass
+// (skipping the `if let Some(agent)` check) was intentionally not built: the
+// task's hard constraint is not to modify the gateway to make a measurement
+// easier, and this comparison does not require it.
+
+/// One (scope_set_size, creds) arm of the WS enforcement decomposition.
+struct ScopeArm {
+    label: &'static str,
+    scope_set_size: usize,
+    creds: Option<(String, String)>,
+}
+
+async fn run_enforce_scopes(out: &Path, iterations: usize, warmup: usize, session: &str) {
+    println!("== enforce_scopes on the authenticated WS path (reviewer item 5) ==");
+    let (handle, root) = bootstrap("enforce_scopes");
+    handle
+        .create_container("bench", SecurityMode::Direct, None)
+        .expect("container");
+    let sizes = [128usize, 1024, 16384];
+    for size in sizes {
+        let content = payload_for(SecurityMode::Direct, size);
+        handle
+            .write_file("bench", &format!("f{size}"), &content)
+            .expect("seed file");
+    }
+
+    // Small scope set: exactly one scope, matching immediately.
+    let (small_id, small_token) = handle
+        .create_agent(
+            "scope-small",
+            vec![AgentScope {
+                container_glob: "bench".into(),
+                actions: vec!["read".into()],
+                mode_ceiling: None,
+            }],
+        )
+        .expect("agent");
+
+    // Large scope set: 19 non-matching decoys plus the matching scope LAST,
+    // so `enforce_scopes`'s linear scan pays its worst case for this request.
+    let mut large_scopes: Vec<AgentScope> = (0..19)
+        .map(|i| AgentScope {
+            container_glob: format!("decoy-{i}"),
+            actions: vec!["read".into()],
+            mode_ceiling: None,
+        })
+        .collect();
+    large_scopes.push(AgentScope {
+        container_glob: "bench".into(),
+        actions: vec!["read".into()],
+        mode_ceiling: None,
+    });
+    let (large_id, large_token) = handle
+        .create_agent("scope-large", large_scopes)
+        .expect("agent");
+
+    handle
+        .ensure_default_agent(PAIRING_SECRET)
+        .expect("default agent");
+    let token_key = handle.agent_token_key();
+
+    let shared: SharedVault<VaultHandle> = Arc::new(Mutex::new(Some(handle)));
+    let timing = Arc::new(CaptureTiming::default());
+    let authenticator = Arc::new(HarnessAuthenticator {
+        root: root.clone(),
+        token_key,
+        shared_secret: PAIRING_SECRET.to_string(),
+    });
+    let server = Arc::new(
+        McpServer::new(shared.clone(), PAIRING_SECRET)
+            .with_access_controller(Arc::new(AutoAllow))
+            .with_timing_sink(timing.clone())
+            .with_agent_authenticator(authenticator),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let serve_task = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let _ = server.serve_ws_listener(listener, shutdown_rx).await;
+        })
+    };
+    let url = format!("ws://{addr}");
+
+    let arms = [
+        ScopeArm {
+            label: "scope_0_unscoped",
+            scope_set_size: 0,
+            creds: None,
+        },
+        ScopeArm {
+            label: "scope_1_small",
+            scope_set_size: 1,
+            creds: Some((small_id.clone(), small_token.clone())),
+        },
+        ScopeArm {
+            label: "scope_20_large",
+            scope_set_size: 20,
+            creds: Some((large_id.clone(), large_token.clone())),
+        },
+    ];
+
+    let mut rows: Vec<EnforceScopesRow> = Vec::new();
+    for (order_index, arm) in arms.iter().enumerate() {
+        for &size in &sizes {
+            let file = format!("f{size}");
+            let creds = arm.creds.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+            if warmup > 0 {
+                ws_drive_reads(&url, creds, "bench", &file, warmup).await;
+                timing.0.lock().unwrap().clear();
+            } else {
+                timing.0.lock().unwrap().clear();
+            }
+            ws_drive_reads(&url, creds, "bench", &file, iterations).await;
+            let records: Vec<StageTimings> = timing.0.lock().unwrap().drain(..).collect();
+            let cell_seed = 0x0E5C_09E5_u64 ^ (arm.scope_set_size as u64) ^ (size as u64) << 16;
+            rows.push(EnforceScopesRow {
+                label: arm.label,
+                scope_set_size: arm.scope_set_size,
+                bytes: size,
+                total: summarize_seeded(records.iter().map(|t| us(t.total)).collect(), cell_seed),
+                validate: summarize(records.iter().map(|t| us(t.validate)).collect()),
+                authorize: summarize(records.iter().map(|t| us(t.authorize)).collect()),
+                execute: summarize(records.iter().map(|t| us(t.execute)).collect()),
+                filter: summarize(records.iter().map(|t| us(t.filter)).collect()),
+                order_index,
+            });
+        }
+    }
+
+    let _ = shutdown_tx.send(());
+    let _ = serve_task.await;
+
+    write_enforce_scopes_outputs(out, &rows, session, iterations, warmup);
+    let _ = fs::remove_dir_all(&root);
+    println!(
+        "   wrote {}/enforce_scopes.csv and enforce_scopes_stages.csv\n",
+        out.display()
+    );
+}
+
+/// Pair once, then drive `n` sequential `vault.read` calls over one
+/// authenticated WS connection — the real network stack, not the in-process
+/// stdio duplex `run_latency` uses.
+async fn ws_drive_reads(
+    url: &str,
+    creds: Option<(&str, &str)>,
+    container: &str,
+    file: &str,
+    n: usize,
+) {
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
+    let pair = match creds {
+        Some((id, tok)) => {
+            json!({"jsonrpc":"2.0","id":0,"method":"vault.pair","params":{"agent_id":id,"token":tok}})
+        }
+        None => {
+            json!({"jsonrpc":"2.0","id":0,"method":"vault.pair","params":{"secret":PAIRING_SECRET}})
+        }
+    };
+    ws.send(Message::Text(pair.to_string().into()))
+        .await
+        .expect("send pair");
+    let resp = next_json(&mut ws).await.expect("pair response");
+    assert_eq!(
+        resp["result"]["paired"],
+        json!(true),
+        "pairing failed: {resp}"
+    );
+
+    for i in 0..n {
+        let call = json!({
+            "jsonrpc":"2.0","id":i+1,"method":"tools/call",
+            "params": {"name": "vault.read", "arguments": {"container": container, "file_name": file}}
+        });
+        ws.send(Message::Text(call.to_string().into()))
+            .await
+            .expect("send call");
+        let resp = next_json(&mut ws).await.expect("call response");
+        assert!(
+            resp.get("error").is_none() && resp["result"]["isError"] != json!(true),
+            "call failed: {resp}"
+        );
+    }
+    let _ = ws.send(Message::Close(None)).await;
+}
+
+struct EnforceScopesRow {
+    label: &'static str,
+    scope_set_size: usize,
+    bytes: usize,
+    total: Stats,
+    validate: Stats,
+    authorize: Stats,
+    execute: Stats,
+    filter: Stats,
+    order_index: usize,
+}
+
+fn write_enforce_scopes_outputs(
+    out: &Path,
+    rows: &[EnforceScopesRow],
+    session: &str,
+    iterations: usize,
+    warmup: usize,
+) {
+    // Primary schema (docs/thesis §8): delta vs the scope_0_unscoped floor at
+    // the same payload, paired within this session.
+    let mut csv = String::from(
+        "path,scope_set_size,mode,payload,n,k,median_us,ci95_lo_us,ci95_hi_us,delta_vs_bypass_us,delta_ci95_lo,delta_ci95_hi\n",
+    );
+    for r in rows {
+        let floor = rows
+            .iter()
+            .find(|f| f.scope_set_size == 0 && f.bytes == r.bytes)
+            .map(|f| f.total.p50_us)
+            .unwrap_or(0.0);
+        let delta = r.total.p50_us - floor;
+        csv.push_str(&format!(
+            "ws_authenticated,{},direct,{},{},{},{:.3},{:.3},{:.3},{:.3},,\n",
+            r.scope_set_size,
+            payload_label(r.bytes),
+            iterations,
+            1,
+            r.total.p50_us,
+            r.total.ci95_lo_us,
+            r.total.ci95_hi_us,
+            delta,
+        ));
+    }
+    let _ = fs::write(out.join("enforce_scopes.csv"), &csv);
+
+    // Stage decomposition companion — not in the fixed filename list but
+    // needed to answer "which stages could you isolate" (§5, E3).
+    let mut stages_csv = String::from(
+        "session,label,scope_set_size,payload,bytes,order_index,stage,n,mean_us,p50_us,p95_us,p99_us\n",
+    );
+    for r in rows {
+        for (stage, s) in [
+            ("validate_plus_scope_check", &r.validate),
+            ("authorize_hitl", &r.authorize),
+            ("execute_vault", &r.execute),
+            ("filter_pii", &r.filter),
+            ("total", &r.total),
+        ] {
+            stages_csv.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3}\n",
+                session,
+                r.label,
+                r.scope_set_size,
+                payload_label(r.bytes),
+                r.bytes,
+                r.order_index,
+                stage,
+                s.n,
+                s.mean_us,
+                s.p50_us,
+                s.p95_us,
+                s.p99_us,
+            ));
+        }
+    }
+    let _ = fs::write(out.join("enforce_scopes_stages.csv"), &stages_csv);
+
+    for r in rows {
+        println!(
+            "   {:<18} {:>6}B  total_p50={:>7.3}us (validate+scope={:.3} authorize={:.3} execute={:.3} filter={:.3})",
+            r.label, r.bytes, r.total.p50_us, r.validate.p50_us, r.authorize.p50_us, r.execute.p50_us, r.filter.p50_us
+        );
+    }
+    let _ = warmup; // recorded via run-metadata.json (collect-metadata.sh), not per-row here
+}
+
+// ---------------------------------------------------------------------------
+// PII filter characterization against the real sv-privacy crate (E4)
+// ---------------------------------------------------------------------------
+//
+// Calls `sv_privacy::scan`/`redact` directly — no vault, no gateway. All
+// generated identifiers are synthetic: CPF/CNPJ/card numbers are randomly
+// generated digits passed through the *same public, standard* check-digit
+// algorithms sv-privacy itself validates against (CPF/CNPJ have no official
+// reserved-test range; this mirrors the fixed synthetic CPF the harness
+// already uses elsewhere in this file). Card numbers use the recognized
+// 400000 test BIN. Email uses RFC 2606 reserved domains. IPv4 uses RFC 1918
+// ranges. Phone uses the NANP 555-01XX fictional-use block. SSN uses the
+// 900-999 area range the SSA states it will never issue.
+
+fn pii_luhn_check_digit(prefix: &[u8]) -> u8 {
+    // Compute the trailing digit that makes `prefix + digit` Luhn-valid.
+    let mut sum = 0u32;
+    let mut double = true; // the check digit itself is never doubled
+    for &d in prefix.iter().rev() {
+        let mut v = d as u32;
+        if double {
+            v *= 2;
+            if v > 9 {
+                v -= 9;
+            }
+        }
+        sum += v;
+        double = !double;
+    }
+    ((10 - (sum % 10)) % 10) as u8
+}
+
+fn pii_cpf_check_digits(base: &[u8; 9]) -> (u8, u8) {
+    let check = |data: &[u8], start_weight: usize| -> u8 {
+        let sum: usize = data
+            .iter()
+            .enumerate()
+            .map(|(k, &d)| d as usize * (start_weight - k))
+            .sum();
+        let r = (sum * 10) % 11;
+        if r == 10 {
+            0
+        } else {
+            r as u8
+        }
+    };
+    let d1 = check(base, 10);
+    let mut with_d1 = base.to_vec();
+    with_d1.push(d1);
+    let d2 = check(&with_d1, 11);
+    (d1, d2)
+}
+
+fn pii_cnpj_check_digits(base: &[u8; 12]) -> (u8, u8) {
+    let weights1 = [5usize, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
+    let digit = |data: &[u8], weights: &[usize]| -> u8 {
+        let sum: usize = data
+            .iter()
+            .zip(weights)
+            .map(|(&d, &w)| d as usize * w)
+            .sum();
+        let r = sum % 11;
+        if r < 2 {
+            0
+        } else {
+            (11 - r) as u8
+        }
+    };
+    let d1 = digit(base, &weights1);
+    let mut with_d1 = base.to_vec();
+    with_d1.push(d1);
+    let weights2 = [6usize, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
+    let d2 = digit(&with_d1, &weights2);
+    (d1, d2)
+}
+
+fn pii_gen_cpf(rng: &mut XorShift64, punct: &str) -> String {
+    let mut base = [0u8; 9];
+    for slot in base.iter_mut() {
+        *slot = (rng.next_u64() % 10) as u8;
+    }
+    if base.iter().all(|&x| x == base[0]) {
+        base[0] = (base[0] + 1) % 10;
+    }
+    let (d1, d2) = pii_cpf_check_digits(&base);
+    let digits: Vec<u8> = base.iter().copied().chain([d1, d2]).collect();
+    match punct {
+        "canonical" => format!(
+            "{}{}{}.{}{}{}.{}{}{}-{}{}",
+            digits[0],
+            digits[1],
+            digits[2],
+            digits[3],
+            digits[4],
+            digits[5],
+            digits[6],
+            digits[7],
+            digits[8],
+            digits[9],
+            digits[10]
+        ),
+        "bare" => digits.iter().map(|d| d.to_string()).collect(),
+        "spaced" => digits
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
+        "slashed" => format!(
+            "{}{}{}/{}{}{}/{}{}{}-{}{}",
+            digits[0],
+            digits[1],
+            digits[2],
+            digits[3],
+            digits[4],
+            digits[5],
+            digits[6],
+            digits[7],
+            digits[8],
+            digits[9],
+            digits[10]
+        ),
+        _ => unreachable!(),
+    }
+}
+
+fn pii_gen_cnpj(rng: &mut XorShift64, punct: &str) -> String {
+    let mut base = [0u8; 12];
+    for slot in base.iter_mut() {
+        *slot = (rng.next_u64() % 10) as u8;
+    }
+    if base.iter().all(|&x| x == base[0]) {
+        base[0] = (base[0] + 1) % 10;
+    }
+    let (d1, d2) = pii_cnpj_check_digits(&base);
+    let digits: Vec<u8> = base.iter().copied().chain([d1, d2]).collect();
+    let s = |i: usize| digits[i].to_string();
+    match punct {
+        "canonical" => format!(
+            "{}{}.{}{}{}.{}{}{}/{}{}{}{}-{}{}",
+            s(0),
+            s(1),
+            s(2),
+            s(3),
+            s(4),
+            s(5),
+            s(6),
+            s(7),
+            s(8),
+            s(9),
+            s(10),
+            s(11),
+            s(12),
+            s(13)
+        ),
+        "bare" => digits.iter().map(|d| d.to_string()).collect(),
+        "spaced" => digits
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => unreachable!(),
+    }
+}
+
+fn pii_gen_card(rng: &mut XorShift64, punct: &str) -> String {
+    // Recognized 400000 test BIN + 9 random digits + Luhn check digit = 16.
+    let mut prefix = vec![4u8, 0, 0, 0, 0, 0];
+    for _ in 0..9 {
+        prefix.push((rng.next_u64() % 10) as u8);
+    }
+    let check = pii_luhn_check_digit(&prefix);
+    let digits: Vec<u8> = prefix.into_iter().chain([check]).collect();
+    let groups: Vec<String> = digits
+        .chunks(4)
+        .map(|c| c.iter().map(|d| d.to_string()).collect::<String>())
+        .collect();
+    match punct {
+        "canonical" => groups.join("-"),
+        "spaced" => groups.join(" "),
+        "bare" => digits.iter().map(|d| d.to_string()).collect(),
+        "dotted" => groups.join("."),
+        _ => unreachable!(),
+    }
+}
+
+fn pii_gen_email(rng: &mut XorShift64, variant: &str) -> String {
+    let domains = ["example.com", "example.org", "example.net"];
+    let domain = domains[(rng.next_u64() % 3) as usize];
+    let local = format!("user{}", rng.next_u64() % 100000);
+    match variant {
+        "canonical" => format!("{local}@{domain}"),
+        "plus_tag" => format!("{local}+tag{}@{domain}", rng.next_u64() % 100),
+        "spaced" => {
+            let d = domain.replace('.', " . ");
+            format!("{local} @ {d}")
+        }
+        "obfuscated" => {
+            let d = domain.replace('.', "[dot]");
+            format!("{local}[at]{d}")
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn pii_gen_ipv4(rng: &mut XorShift64, variant: &str) -> String {
+    // RFC 1918 private ranges only.
+    let block = rng.next_u64() % 3;
+    let (a, b_range): (u8, (u8, u8)) = match block {
+        0 => (10, (0, 255)),
+        1 => (172, (16, 31)),
+        _ => (192, (168, 168)),
+    };
+    let b = if b_range.0 == b_range.1 {
+        b_range.0
+    } else {
+        b_range.0 + (rng.next_u64() % (b_range.1 as u64 - b_range.0 as u64 + 1)) as u8
+    };
+    let c = (rng.next_u64() % 256) as u8;
+    let d = (rng.next_u64() % 254 + 1) as u8;
+    match variant {
+        "canonical" => format!("{a}.{b}.{c}.{d}"),
+        "leading_zero" => format!("{a:03}.{b:03}.{c:03}.{d:03}"),
+        "spaced" => format!("{a} . {b} . {c} . {d}"),
+        "cidr_suffix" => format!("{a}.{b}.{c}.{d}/24"),
+        _ => unreachable!(),
+    }
+}
+
+fn pii_gen_phone(rng: &mut XorShift64, variant: &str) -> String {
+    // NANP fictional-use block: any area code, exchange 555, subscriber 01XX.
+    let area = 200 + (rng.next_u64() % 700) as u32; // avoid 0/1 leading area codes
+    let sub = 100 + (rng.next_u64() % 100) as u32; // 0100-0199
+    match variant {
+        "canonical" => format!("({area}) 555-01{:02}", sub % 100),
+        "international_br" => format!("+55 11 555-01{:02}", sub % 100),
+        "bare" => format!("{area}5550{:03}", 100 + sub % 100),
+        "dotted_no_symbol" => format!("{area}.555.01{:02}", sub % 100),
+        _ => unreachable!(),
+    }
+}
+
+fn pii_gen_ssn(rng: &mut XorShift64, variant: &str) -> String {
+    // Area 900-999: SSA states these will never be issued.
+    let area = 900 + (rng.next_u64() % 100) as u32;
+    let group = 1 + (rng.next_u64() % 99) as u32;
+    let serial = 1 + (rng.next_u64() % 9999) as u32;
+    match variant {
+        "canonical" => format!("{area:03}-{group:02}-{serial:04}"),
+        "bare" => format!("{area:03}{group:02}{serial:04}"),
+        "spaced" => format!("{area:03} {group:02} {serial:04}"),
+        "dotted" => format!("{area:03}.{group:02}.{serial:04}"),
+        _ => unreachable!(),
+    }
+}
+
+/// Synthetic examples for categories sv-privacy has NO detector for (the
+/// thesis's admitted gaps): RG, CEP, full name, address, birth date,
+/// unformatted phone (covered separately above as a *format* variant, but
+/// also included here since the thesis lists it among the gaps).
+fn pii_gen_gap(rng: &mut XorShift64, category: &str) -> String {
+    match category {
+        "rg" => format!(
+            "{}.{}.{}-{}",
+            10 + rng.next_u64() % 90,
+            100 + rng.next_u64() % 900,
+            100 + rng.next_u64() % 900,
+            (b'0' + (rng.next_u64() % 10) as u8) as char
+        ),
+        "cep" => format!(
+            "{:05}-{:03}",
+            rng.next_u64() % 100000,
+            rng.next_u64() % 1000
+        ),
+        "full_name" => {
+            let first =
+                ["Ana", "Bruno", "Carla", "Diego", "Elisa", "Fabio"][(rng.next_u64() % 6) as usize];
+            let last = ["Teste", "Exemplo", "Fictício", "Amostra", "Sintético"]
+                [(rng.next_u64() % 5) as usize];
+            format!("{first} {last}")
+        }
+        "address" => format!(
+            "Rua Fictícia {}, {} - Bairro Teste",
+            rng.next_u64() % 9999,
+            rng.next_u64() % 999
+        ),
+        "birth_date" => format!(
+            "{:02}/{:02}/{}",
+            1 + rng.next_u64() % 28,
+            1 + rng.next_u64() % 12,
+            1950 + rng.next_u64() % 60
+        ),
+        "phone_unformatted" => format!("55{:07}", rng.next_u64() % 10000000),
+        _ => unreachable!(),
+    }
+}
+
+fn pii_covered_categories() -> [(&'static str, sv_privacy::PiiCategory); 7] {
+    use sv_privacy::PiiCategory::*;
+    [
+        ("email", Email),
+        ("cpf", Cpf),
+        ("cnpj", Cnpj),
+        ("credit_card", CreditCard),
+        ("ipv4", Ipv4),
+        ("phone", Phone),
+        ("ssn", Ssn),
+    ]
+}
+
+fn pii_gen_canonical(rng: &mut XorShift64, category: &str) -> String {
+    match category {
+        "email" => pii_gen_email(rng, "canonical"),
+        "cpf" => pii_gen_cpf(rng, "canonical"),
+        "cnpj" => pii_gen_cnpj(rng, "canonical"),
+        "credit_card" => pii_gen_card(rng, "canonical"),
+        "ipv4" => pii_gen_ipv4(rng, "canonical"),
+        "phone" => pii_gen_phone(rng, "canonical"),
+        "ssn" => pii_gen_ssn(rng, "canonical"),
+        _ => unreachable!(),
+    }
+}
+
+/// Neutral, PII-free filler sentence for false-positive testing.
+fn pii_filler_sentence(rng: &mut XorShift64) -> String {
+    let words = [
+        "o",
+        "sistema",
+        "processa",
+        "dados",
+        "locais",
+        "sem",
+        "enviar",
+        "conteúdo",
+        "para",
+        "servidores",
+        "externos",
+        "durante",
+        "a",
+        "execução",
+        "normal",
+        "das",
+        "tarefas",
+        "solicitadas",
+        "pelo",
+        "agente",
+        "de",
+        "forma",
+        "auditável",
+        "e",
+        "reversível",
+    ];
+    (0..12)
+        .map(|_| words[(rng.next_u64() % words.len() as u64) as usize])
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn run_pii(out: &Path) {
+    println!("== PII filter characterization against real sv-privacy (E4) ==");
+    let mut rng = XorShift64::new(0xF11_7E57);
+
+    // (a) Category recall + false-positive rate.
+    let mut recall_csv =
+        String::from("category,covered,n,detected,recall,fp_on_filler,filler_trials\n");
+    for (label, expected) in pii_covered_categories() {
+        let mut detected = 0;
+        const N: usize = 200;
+        for _ in 0..N {
+            let item = pii_gen_canonical(&mut rng, label);
+            let text = format!("Contact record: {item} please process.");
+            let findings = sv_privacy::scan(&text, &sv_privacy::Policy::all());
+            if findings.iter().any(|f| f.category == expected) {
+                detected += 1;
+            }
+        }
+        // False positives: how often filler text (no PII) trips *any* detector.
+        let mut fp = 0;
+        const FILLER_N: usize = 500;
+        for _ in 0..FILLER_N {
+            let text = pii_filler_sentence(&mut rng);
+            let findings = sv_privacy::scan(&text, &sv_privacy::Policy::all());
+            if !findings.is_empty() {
+                fp += 1;
+            }
+        }
+        recall_csv.push_str(&format!(
+            "{label},true,{N},{detected},{:.4},{fp},{FILLER_N}\n",
+            detected as f64 / N as f64
+        ));
+        println!("  [covered] {label:<12} recall={detected}/{N}  fp_on_filler={fp}/{FILLER_N}");
+    }
+
+    // Gap categories: the thesis's 6 admitted gaps. No detector exists, so
+    // recall is 0 by construction; we confirm that and check for accidental
+    // cross-category false positives (collateral detections).
+    let gap_categories = [
+        "rg",
+        "cep",
+        "full_name",
+        "address",
+        "birth_date",
+        "phone_unformatted",
+    ];
+    for label in gap_categories {
+        let mut detected = 0;
+        let mut collateral = 0;
+        const N: usize = 200;
+        for _ in 0..N {
+            let item = pii_gen_gap(&mut rng, label);
+            let text = format!("Contact record: {item} please process.");
+            let findings = sv_privacy::scan(&text, &sv_privacy::Policy::all());
+            // "detected" would mean some detector fired ON the inserted span;
+            // approximate by checking whether the item substring is still
+            // present verbatim in the redaction output (i.e. untouched).
+            let redaction = sv_privacy::redact(&text, &sv_privacy::Policy::all());
+            if !redaction.output.contains(&item) {
+                detected += 1; // something masked part of our inserted span
+            }
+            if !findings.is_empty() {
+                collateral += 1;
+            }
+        }
+        recall_csv.push_str(&format!(
+            "{label},false,{N},{detected},{:.4},{collateral},{N}\n",
+            detected as f64 / N as f64
+        ));
+        println!(
+            "  [gap]     {label:<18} recall={detected}/{N}  collateral_findings={collateral}/{N}"
+        );
+    }
+    fs::write(out.join("pii_filter_characterization.csv"), &recall_csv)
+        .expect("write pii_filter_characterization.csv");
+
+    // (b) Format robustness.
+    let variant_sets: &[(&str, &[&str])] = &[
+        ("cpf", &["canonical", "bare", "spaced", "slashed"]),
+        ("cnpj", &["canonical", "bare", "spaced"]),
+        ("credit_card", &["canonical", "spaced", "bare", "dotted"]),
+        ("email", &["canonical", "plus_tag", "spaced", "obfuscated"]),
+        (
+            "ipv4",
+            &["canonical", "leading_zero", "spaced", "cidr_suffix"],
+        ),
+        (
+            "phone",
+            &["canonical", "international_br", "bare", "dotted_no_symbol"],
+        ),
+        ("ssn", &["canonical", "bare", "spaced", "dotted"]),
+    ];
+    let mut format_csv = String::from("category,variant,n,detected,detect_rate\n");
+    for (category, variants) in variant_sets {
+        let expected = pii_covered_categories()
+            .into_iter()
+            .find(|(l, _)| l == category)
+            .unwrap()
+            .1;
+        for variant in *variants {
+            const N: usize = 60;
+            let mut detected = 0;
+            for _ in 0..N {
+                let item = match *category {
+                    "cpf" => pii_gen_cpf(&mut rng, variant),
+                    "cnpj" => pii_gen_cnpj(&mut rng, variant),
+                    "credit_card" => pii_gen_card(&mut rng, variant),
+                    "email" => pii_gen_email(&mut rng, variant),
+                    "ipv4" => pii_gen_ipv4(&mut rng, variant),
+                    "phone" => pii_gen_phone(&mut rng, variant),
+                    "ssn" => pii_gen_ssn(&mut rng, variant),
+                    _ => unreachable!(),
+                };
+                let text = format!("Contact record: {item} please process.");
+                let findings = sv_privacy::scan(&text, &sv_privacy::Policy::all());
+                if findings.iter().any(|f| f.category == expected) {
+                    detected += 1;
+                }
+            }
+            format_csv.push_str(&format!(
+                "{category},{variant},{N},{detected},{:.4}\n",
+                detected as f64 / N as f64
+            ));
+            println!("  [format]  {category:<12} {variant:<18} {detected}/{N}");
+        }
+    }
+    fs::write(out.join("pii_format_robustness.csv"), &format_csv)
+        .expect("write pii_format_robustness.csv");
+
+    // (c) Cost decomposition: size x density grid.
+    let sizes = [128usize, 1024, 4096, 16384, 65536];
+    let densities = [0.0f64, 0.25, 0.5, 0.75, 1.0];
+    let pii_unit = "user jane.doe@example.com cpf 529.982.247-25 ip 192.168.0.1; ";
+    let filler_unit = "lorem ipsum dolor sit amet consectetur adipiscing elit sed; ";
+    let mut cost_csv = String::from("bytes,density,n,mean_us,p50_us\n");
+    const COST_N: usize = 50;
+    for &size in &sizes {
+        for &density in &densities {
+            let mut text = String::with_capacity(size + 64);
+            while text.len() < size {
+                let roll = (rng.next_u64() % 1000) as f64 / 1000.0;
+                if roll < density {
+                    text.push_str(pii_unit);
+                } else {
+                    text.push_str(filler_unit);
+                }
+            }
+            text.truncate(size);
+            let policy = sv_privacy::Policy::all();
+            let times: Vec<f64> = (0..COST_N)
+                .map(|_| {
+                    let t0 = std::time::Instant::now();
+                    let _ = sv_privacy::redact(&text, &policy);
+                    us(t0.elapsed())
+                })
+                .collect();
+            let stats = summarize(times);
+            cost_csv.push_str(&format!(
+                "{size},{density},{COST_N},{:.4},{:.4}\n",
+                stats.mean_us, stats.p50_us
+            ));
+        }
+    }
+    fs::write(out.join("pii_cost_size_x_density.csv"), &cost_csv)
+        .expect("write pii_cost_size_x_density.csv");
+    println!("   wrote {}/pii_*.csv\n", out.display());
+}
+
+// ---------------------------------------------------------------------------
+// Headless fail-closed probe battery, against the REAL headless CLI (E5)
+// ---------------------------------------------------------------------------
+//
+// `run_adversarial`'s `HitlPolicy` is a hand-written mirror of the desktop's
+// consent policy (its own doc comment says so) — it is not the real headless
+// fail-closed path the thesis's reviewer item 5 asks about. That real path
+// is `apps/cli/src/serve.rs`'s `HeadlessAccessController`
+// (`is_headless_allowed_action`, lines ~246-261): an explicit ALLOWLIST, not
+// a denylist. `apps/cli` has no library target, so this battery does not
+// import that function — it spawns the real `sovereign-vault serve` binary
+// as a subprocess and drives probes over its real authenticated WebSocket
+// port, so the policy under test is the actual compiled artifact, not a
+// reimplementation of it.
+
+struct HeadlessProbe {
+    id: &'static str,
+    /// Name used in the thesis briefing's provisional reconstruction, for
+    /// the required name-reconciliation (§7). `None` = no provisional name
+    /// existed (this probe covers a gap found while reading the real code).
+    provisional_name: Option<&'static str>,
+    real_tool: &'static str,
+    class: Class,
+    expected_verdict: &'static str,
+    arguments: Value,
+}
+
+async fn run_headless_probes(out: &Path) {
+    println!("== Headless fail-closed probe battery vs. the real CLI (E5) ==");
+    let bin = PathBuf::from("target/release/sovereign-vault");
+    if !bin.exists() {
+        let msg = "NÃO MEDIDO: target/release/sovereign-vault not built (run `cargo build --release -p sovereign-vault` first)";
+        eprintln!("{msg}");
+        fs::write(out.join("headless_probes_status.txt"), msg).ok();
+        return;
+    }
+
+    let (handle, root) = bootstrap("headless-probes");
+    handle
+        .create_container("bench", SecurityMode::Direct, None)
+        .expect("container");
+    handle
+        .write_file("bench", "f1", b"direct content")
+        .expect("seed file");
+    handle
+        .create_container("anon-bench", SecurityMode::Anonymized, None)
+        .expect("container");
+    handle
+        .write_file("anon-bench", "f1", b"user jane.doe@example.com")
+        .expect("seed file");
+
+    // One scope granting EVERY action on every container: the point of this
+    // battery is to isolate the access-controller's own allowlist, not scope
+    // enforcement (already covered by E3 and by the A1-A10 battery).
+    let all_actions = [
+        "list",
+        "list_files",
+        "read",
+        "write",
+        "delete",
+        "create_container",
+        "destroy",
+        "create_transit_key",
+        "list_transit_keys",
+        "encrypt",
+        "decrypt",
+        "create_signing_key",
+        "list_signing_keys",
+        "sign",
+        "verify",
+        "create_broker_secret",
+        "list_broker_secrets",
+        "broker",
+        "vault_info",
+        "export_agents",
+        "import_agents",
+    ];
+    let (agent_id, token) = handle
+        .create_agent(
+            "headless-probe-agent",
+            vec![AgentScope {
+                container_glob: "*".into(),
+                actions: all_actions.iter().map(|s| s.to_string()).collect(),
+                mode_ceiling: None,
+            }],
+        )
+        .expect("agent");
+
+    let audit_key = handle.audit_hmac_key();
+
+    // A real Ed25519 keypair for the C3 (`vault.verify`) control, so a
+    // legitimate call succeeds instead of erroring on a malformed key —
+    // which would misclassify an ALLOWED call as blocked.
+    let (secret, public) = sv_core::sv_crypto::ed25519_generate().expect("ed25519 keygen");
+    let message = b"headless-probe-c3";
+    let signature = sv_core::sv_crypto::ed25519_sign(&secret, message).expect("sign");
+
+    let scratch = std::env::temp_dir().join(format!("sv-headless-probes-{}", std::process::id()));
+    fs::create_dir_all(&scratch).expect("scratch dir");
+    let pass_file = scratch.join("passphrase");
+    let token_file = scratch.join("agent-token");
+    fs::write(&pass_file, "evaluation-passphrase").expect("write passphrase file");
+    fs::write(&token_file, &token).expect("write token file");
+    // Owner-only: both files carry live secret material for the subprocess.
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&pass_file, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // Release the in-process lock before the subprocess opens the same root.
+    drop(handle);
+
+    let ws_port = free_port();
+    let http_port = free_port();
+
+    let mut child = tokio::process::Command::new(&bin)
+        .arg("serve")
+        .arg("--root")
+        .arg(&root)
+        .arg("--passphrase-file")
+        .arg(&pass_file)
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{ws_port}"))
+        .arg("--http-bind")
+        .arg(format!("127.0.0.1:{http_port}"))
+        .arg("--agent-id")
+        .arg(&agent_id)
+        .arg("--agent-token-file")
+        .arg(&token_file)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sovereign-vault serve");
+
+    let url = format!("ws://127.0.0.1:{ws_port}");
+    let mut connected = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if tokio_tungstenite::connect_async(&url).await.is_ok() {
+            connected = true;
+            break;
+        }
+    }
+    if !connected {
+        let _ = child.kill().await;
+        let msg = "NÃO MEDIDO: sovereign-vault serve did not bind the WS port within 5s";
+        eprintln!("{msg}");
+        fs::write(out.join("headless_probes_status.txt"), msg).ok();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&scratch);
+        return;
+    }
+
+    let r_verify = json!({
+        "public_key_b64": B64.encode(public),
+        "payload_b64": B64.encode(message),
+        "signature_b64": B64.encode(signature),
+    });
+    let probes = vec![
+        HeadlessProbe {
+            id: "A11",
+            provisional_name: Some("transit.decrypt"),
+            real_tool: "vault.decrypt",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"key_ref":"missing-key","ciphertext_b64":"AAAA"}),
+        },
+        HeadlessProbe {
+            id: "A12",
+            provisional_name: Some("signing.sign"),
+            real_tool: "vault.sign",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"key_ref":"missing-key","payload_b64":"AAAA"}),
+        },
+        HeadlessProbe {
+            id: "A13",
+            provisional_name: Some("transit.encrypt"),
+            real_tool: "vault.encrypt",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"key_ref":"missing-key","plaintext_b64":"AAAA"}),
+        },
+        HeadlessProbe {
+            id: "A14",
+            provisional_name: Some("broker.issue"),
+            real_tool: "vault.create_broker_secret",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"name":"probe-secret","secret":"x","allow":[{"host":"example.com","path_prefix":"/","methods":["GET"]}]}),
+        },
+        HeadlessProbe {
+            id: "A15",
+            provisional_name: Some("broker.exchange"),
+            real_tool: "vault.broker_request",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"secret_ref":"nonexistent","method":"GET","url":"https://example.com/"}),
+        },
+        HeadlessProbe {
+            id: "A16",
+            provisional_name: None,
+            real_tool: "vault.create_signing_key",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"name":"probe-signing-key"}),
+        },
+        HeadlessProbe {
+            id: "A17",
+            provisional_name: None,
+            real_tool: "vault.create_transit_key",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"name":"probe-transit-key"}),
+        },
+        HeadlessProbe {
+            id: "A18",
+            provisional_name: None,
+            real_tool: "vault.export_agents",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({}),
+        },
+        HeadlessProbe {
+            id: "A19",
+            provisional_name: None,
+            real_tool: "vault.import_agents",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({"envelope":{"version":1,"exported_at":0,"agents":[]}}),
+        },
+        HeadlessProbe {
+            id: "A20",
+            provisional_name: None,
+            real_tool: "vault.list_broker_secrets",
+            class: Class::Attack,
+            expected_verdict: "BLOCKED",
+            arguments: json!({}),
+        },
+        HeadlessProbe {
+            id: "C3",
+            provisional_name: None,
+            real_tool: "vault.verify",
+            class: Class::Control,
+            expected_verdict: "ALLOWED",
+            arguments: r_verify,
+        },
+        HeadlessProbe {
+            id: "C4",
+            provisional_name: None,
+            real_tool: "vault.info",
+            class: Class::Control,
+            expected_verdict: "ALLOWED",
+            arguments: json!({}),
+        },
+    ];
+
+    let mut results: Vec<(String, bool, bool, bool)> = Vec::new(); // (id, blocked, transport_error, pass)
+    for probe in &probes {
+        let outcome = run_probe(
+            &url,
+            Some(agent_id.as_str()),
+            &token,
+            probe.real_tool,
+            &probe.arguments,
+        )
+        .await;
+        let transport_error = matches!(outcome, ProbeOutcome::TransportError(_));
+        let blocked = matches!(
+            outcome,
+            ProbeOutcome::Blocked | ProbeOutcome::TransportError(_)
+        );
+        let expected_block = probe.expected_verdict == "BLOCKED";
+        let pass = !transport_error && blocked == expected_block;
+        results.push((probe.id.to_string(), blocked, transport_error, pass));
+    }
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+
+    // Verify the real HMAC audit chain now that the subprocess has exited.
+    let (chain_ok, chain_entries, chain_reason) = match sv_audit::AuditLog::open(&root, audit_key) {
+        Ok(log) => match log.verify_chain() {
+            Ok(report) => (report.ok, report.entries, report.reason.unwrap_or_default()),
+            Err(e) => (false, 0, e.to_string()),
+        },
+        Err(e) => (false, 0, e.to_string()),
+    };
+
+    write_headless_probes_outputs(
+        out,
+        &probes,
+        &results,
+        chain_ok,
+        chain_entries,
+        &chain_reason,
+    );
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&scratch);
+    println!("   wrote {}/headless_probes.csv\n", out.display());
+}
+
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    listener.local_addr().unwrap().port()
+}
+
+fn write_headless_probes_outputs(
+    out: &Path,
+    probes: &[HeadlessProbe],
+    results: &[(String, bool, bool, bool)],
+    chain_ok: bool,
+    chain_entries: usize,
+    chain_reason: &str,
+) {
+    let mut csv = String::from(
+        "id,provisional_name,real_tool,class,expected_verdict,observed_verdict,transport_error,pass,audit_chain_ok,audit_chain_entries,audit_chain_reason\n",
+    );
+    for (probe, (id, blocked, transport_error, pass)) in probes.iter().zip(results) {
+        debug_assert_eq!(probe.id, id);
+        let observed = if *transport_error {
+            "TRANSPORT_ERROR"
+        } else if *blocked {
+            "BLOCKED"
+        } else {
+            "ALLOWED"
+        };
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},\"{}\"\n",
+            id,
+            probe.provisional_name.unwrap_or("n/a"),
+            probe.real_tool,
+            if probe.class == Class::Attack {
+                "attack"
+            } else {
+                "control"
+            },
+            probe.expected_verdict,
+            observed,
+            transport_error,
+            pass,
+            chain_ok,
+            chain_entries,
+            chain_reason.replace('"', "'"),
+        ));
+        println!(
+            "   {id:<4} {:<28} expected={:<8} observed={:<8} {}",
+            probe.real_tool,
+            probe.expected_verdict,
+            observed,
+            if *pass { "MATCH" } else { "*** MISMATCH ***" },
+        );
+    }
+    let _ = fs::write(out.join("headless_probes.csv"), &csv);
+    println!("   audit chain ok={chain_ok} entries={chain_entries} reason={chain_reason:?}");
 }
 
 // ---------------------------------------------------------------------------
