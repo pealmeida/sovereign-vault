@@ -2,9 +2,3 @@
 # The values are fixed strings (`secret` and `secret-launch-*`), not credentials.
 200d600b6fd6b7337b57276236afa67a1a631a01:crates/sv-core/src/agents.rs:generic-api-key:333
 200d600b6fd6b7337b57276236afa67a1a631a01:crates/sv-core/src/agents.rs:generic-api-key:336
-
-# PEM header fixture in the sv-scan detector test. The value is a
-# `-----BEGIN RSA PRIVATE KEY-----` header line plus the literal body
-# `MIIblahbase64` — no key material. HEAD assembles the header from fragments
-# so it is no longer matched; this entry covers the commit that introduced it.
-d722ec8aec724d1963aa9b0daef10693edf78cd3:crates/sv-scan/tests/detect.rs:private-key:145
