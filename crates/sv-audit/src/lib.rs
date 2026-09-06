@@ -1070,7 +1070,9 @@ fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut output = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    // `as_chunks` yields `&[u8; 2]` rather than a slice, so the pair indexing
+    // below is checked at compile time instead of at run time.
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = decode_nibble(pair[0])?;
         let low = decode_nibble(pair[1])?;
         output[index] = (high << 4) | low;
