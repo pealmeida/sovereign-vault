@@ -848,7 +848,8 @@ fn decode_hex_32(encoded: &str, label: &str) -> Result<[u8; 32]> {
         )));
     }
     let mut out = [0u8; 32];
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+    // `as_chunks` yields `&[u8; 2]`, so the chunk length is known statically.
+    for (index, pair) in encoded.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair = std::str::from_utf8(pair)
             .map_err(|_| StorageError::Manifest(format!("{label} is not valid UTF-8")))?;
         out[index] = u8::from_str_radix(pair, 16)
