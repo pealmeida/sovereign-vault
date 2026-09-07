@@ -28,6 +28,24 @@ vi.mock('../lib/tauri', () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
 
+/// Errors surfaced to the user, so a test can assert that a cancelled export
+/// is treated as a normal outcome rather than a failure.
+const toastErrors: unknown[] = [];
+vi.mock('../stores/toast.svelte', () => ({
+  toastStore: {
+    setError: (e: unknown) => {
+      toastErrors.push(e);
+    },
+    setNotice: () => {},
+    get notice() {
+      return '';
+    },
+    get error() {
+      return '';
+    },
+  },
+}));
+
 const FILE_BYTES = Array.from(new TextEncoder().encode('# hello\n\nsome markdown\n'));
 
 function countReads(): number {
@@ -47,6 +65,7 @@ function props(name: string) {
 describe('FileViewerModal', () => {
   beforeEach(() => {
     invokeMock.mockReset();
+    toastErrors.length = 0;
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === 'vault_read_file') return Promise.resolve(FILE_BYTES);
       return Promise.resolve(null);
@@ -85,6 +104,47 @@ describe('FileViewerModal', () => {
       .filter(([cmd]) => cmd === 'vault_read_file')
       .map(([, args]) => (args as { fileName: string }).fileName);
     expect(readNames).toEqual(['notes.md', 'other.md']);
+  });
+
+  it('exports through the backend command and reports the destination', async () => {
+    const { getByTitle } = render(FileViewerModal, { props: props('notes.md') });
+    await waitFor(() => expect(countReads()).toBe(1));
+
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'vault_read_file') return Promise.resolve(FILE_BYTES);
+      if (cmd === 'vault_export_file') return Promise.resolve('C:\Users\me\notes.md');
+      return Promise.resolve(null);
+    });
+
+    getByTitle('Download').click();
+
+    await waitFor(() => {
+      const exports = invokeMock.mock.calls.filter(([cmd]) => cmd === 'vault_export_file');
+      expect(exports).toHaveLength(1);
+      // The command must exist under this exact name: it was previously invoked
+      // by the UI but never registered in Rust, so every export silently failed.
+      expect(exports[0]?.[1]).toEqual({ container: 'personal', fileName: 'notes.md' });
+    });
+  });
+
+  it('stays quiet when the user cancels the export dialog', async () => {
+    const { getByTitle } = render(FileViewerModal, { props: props('notes.md') });
+    await waitFor(() => expect(countReads()).toBe(1));
+
+    // The backend returns null when the native save dialog is dismissed.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'vault_read_file') return Promise.resolve(FILE_BYTES);
+      if (cmd === 'vault_export_file') return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    getByTitle('Download').click();
+
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter(([c]) => c === 'vault_export_file')).toHaveLength(1),
+    );
+    // A cancelled export is not an error and must not raise one.
+    expect(toastErrors).toEqual([]);
   });
 
   it('reads once for a file whose props object is recreated with equal values', async () => {
