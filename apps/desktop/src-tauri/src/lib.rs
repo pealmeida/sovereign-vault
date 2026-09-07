@@ -79,6 +79,7 @@ type SharedHandle = Arc<Mutex<Option<VaultHandle>>>;
 /// Remediation persistence (plan P8): the desktop `VaultSink` over the
 /// vault handle. P9 wires the plan registry and Tauri commands on top.
 mod remediate;
+mod tray;
 use remediate::HandleSink;
 
 /// Shutdown signals for the MCP + HTTP background tasks.
@@ -584,6 +585,9 @@ impl<R: Runtime> ApprovalState<R> {
             let _ = self
                 .app
                 .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: old });
+            if let Some(tray_state) = self.app.try_state::<tray::TrayApprovals>() {
+                tray_state.remove(old);
+            }
         }
 
         let payload = ApprovalPrompt {
@@ -597,6 +601,17 @@ impl<R: Runtime> ApprovalState<R> {
             import_summary: request.import_summary.clone(),
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
+        // Mirror this request into the tray menu. Only the click path does
+        // this: an OTP request must stay answerable at the desktop only, and
+        // `handle_otp` returns before ever reaching here.
+        if let Some(tray_state) = self.app.try_state::<tray::TrayApprovals>() {
+            tray_state.insert(tray::TrayApproval {
+                id,
+                action_label: tray::action_label(&request.action),
+                audit_action: audit_action_for(&request.action),
+            });
+        }
+        tray::refresh(&self.app);
         notify_once(
             &self.app,
             NotificationKind::Approval,
@@ -613,6 +628,12 @@ impl<R: Runtime> ApprovalState<R> {
                 drop(pending);
                 // Tell the UI to drop the now-defunct modal.
                 let _ = self.app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id });
+                // A timed-out request must not stay clickable in the tray: the
+                // channel is gone, so the menu row would be a dead control.
+                if let Some(tray_state) = self.app.try_state::<tray::TrayApprovals>() {
+                    tray_state.remove(id);
+                }
+                tray::refresh(&self.app);
                 Err("approval timed out".into())
             }
         }
@@ -633,10 +654,16 @@ impl<R: Runtime> ApprovalState<R> {
         let Some(pending_request) = pending.remove(&id) else {
             return Err(format!("unknown approval request: {id}"));
         };
-        pending_request
+        let sent = pending_request
             .tx
             .send(approved)
-            .map_err(|_| "approval request already closed".to_string())
+            .map_err(|_| "approval request already closed".to_string());
+        // Whichever surface decided, the tray row is now stale.
+        if let Some(tray_state) = self.app.try_state::<tray::TrayApprovals>() {
+            tray_state.remove(id);
+        }
+        tray::refresh(&self.app);
+        sent
     }
 }
 
@@ -1705,6 +1732,73 @@ fn desktop_event(
     event
 }
 
+/// Apply an approval decision taken from the system-tray menu.
+///
+/// The tray is a lower-context surface than the in-app modal: it shows the
+/// action class only, so the audit record must say where the decision came
+/// from. The transport is `desktop-tray`, distinct from `desktop-ui`, so a
+/// reviewer can tell a decision made against a full request view from one made
+/// against a menu label.
+///
+/// Refuses while the vault is locked. `respond` would otherwise still resolve
+/// the waiting channel, letting a decision land after the user deliberately
+/// ended access; the pending set is cleared on lock, so this is a
+/// belt-and-braces check against a request that arrived mid-transition.
+async fn respond_from_tray<R: Runtime>(app: &AppHandle<R>, id: u64, approved: bool) {
+    let Some(state) = app.try_state::<VaultState<R>>() else {
+        return;
+    };
+
+    if state.handle.lock().await.is_none() {
+        // Locked: drop the stale entry and re-render rather than deciding.
+        if let Some(tray_state) = app.try_state::<tray::TrayApprovals>() {
+            tray_state.remove(id);
+        }
+        tray::refresh(app);
+        return;
+    }
+
+    // The action is read BEFORE responding, so the audit names the action that
+    // was actually authorised rather than a placeholder. A request missing from
+    // the registry is not decided here at all: without it there is nothing
+    // truthful to record, and the app remains the way to answer.
+    let Some(audit_action) = app
+        .try_state::<tray::TrayApprovals>()
+        .and_then(|s| s.snapshot().into_iter().find(|a| a.id == id))
+        .map(|a| a.audit_action)
+    else {
+        tray::refresh(app);
+        return;
+    };
+
+    // A tray click is a real human at the machine, exactly like a click in the
+    // app, so it refreshes the idle timer the same way `approval_respond` does.
+    state.touch_human_activity();
+
+    // No OTP is ever passed from the tray: OTP-mode requests never enter the
+    // tray registry, and `respond` rejects an approval whose pending entry
+    // carries a code when none is supplied.
+    let result = state.approvals.respond(id, approved, None).await;
+
+    if result.is_ok() {
+        let event = AuditEvent::new(
+            audit_action,
+            if approved {
+                AuditDecision::Allowed
+            } else {
+                AuditDecision::Denied
+            },
+            "desktop-tray",
+        );
+        record_desktop_event(&state, event);
+    }
+
+    if let Some(tray_state) = app.try_state::<tray::TrayApprovals>() {
+        tray_state.remove(id);
+    }
+    tray::refresh(app);
+}
+
 fn record_desktop_event<R: Runtime>(state: &VaultState<R>, event: AuditEvent) {
     let Ok(root) = audit_root(state) else {
         return;
@@ -1865,6 +1959,38 @@ fn slice_page(
     AuditTailResult {
         events: page,
         malformed_skipped,
+    }
+}
+
+/// Audit action corresponding to an access action.
+///
+/// `sv_mcp` keeps its own mapping private, so the desktop carries this one for
+/// tray decisions. Exhaustive: a new action must be mapped here rather than
+/// silently audited as something else.
+fn audit_action_for(action: &sv_mcp::AccessAction) -> AuditAction {
+    use sv_mcp::AccessAction as A;
+    match action {
+        A::ListContainers => AuditAction::ListContainers,
+        A::ListFiles => AuditAction::ListFiles,
+        A::ReadFile => AuditAction::ReadFile,
+        A::WriteFile => AuditAction::WriteFile,
+        A::DeleteFile => AuditAction::DeleteFile,
+        A::CreateContainer => AuditAction::CreateContainer,
+        A::DestroyContainer => AuditAction::DeleteContainer,
+        A::CreateTransitKey => AuditAction::CreateTransitKey,
+        A::ListTransitKeys => AuditAction::ListTransitKeys,
+        A::Encrypt => AuditAction::Encrypt,
+        A::Decrypt => AuditAction::Decrypt,
+        A::CreateSigningKey => AuditAction::CreateSigningKey,
+        A::ListSigningKeys => AuditAction::ListSigningKeys,
+        A::Sign => AuditAction::Sign,
+        A::Verify => AuditAction::Verify,
+        A::CreateBrokerSecret => AuditAction::CreateBrokerSecret,
+        A::ListBrokerSecrets => AuditAction::ListBrokerSecrets,
+        A::Broker => AuditAction::Broker,
+        A::VaultInfo => AuditAction::VaultInfo,
+        A::ExportAgents => AuditAction::AgentExport,
+        A::ImportAgents => AuditAction::AgentImport,
     }
 }
 
@@ -2316,6 +2442,12 @@ async fn perform_vault_lock(state: &VaultState, reason: &str) {
     // unlock is cheap and re-reads the file, which is the behaviour we want
     // anyway.
     state.pending_plans.lock().await.clear();
+    // Same reasoning for the tray menu: a pending Approve row is a live
+    // authorization, and it must not survive the user ending their session.
+    if let Some(tray_state) = state.app.try_state::<tray::TrayApprovals>() {
+        tray_state.clear();
+    }
+    tray::refresh(&state.app);
     // Stop the local gateway; the monitor task has already ended by the time
     // it calls this, so there is no race with itself.
     {
@@ -4564,6 +4696,20 @@ pub fn run() {
         .setup(|app| {
             app.manage(VaultState::new(app.handle().clone()));
             app.manage(NotificationState::new());
+            app.manage(tray::TrayApprovals::new());
+            // The tray is the only surface that can carry Approve/Deny while
+            // the user is in another app: the notification plugin's actions
+            // API is mobile-only on this stack. A failure to create it must
+            // not stop the app from starting -- the in-app queue remains the
+            // authoritative path to every pending request.
+            if let Err(error) = tray::build_tray(app.handle(), |app, id, approved| {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    respond_from_tray(&app, id, approved).await;
+                });
+            }) {
+                eprintln!("tray unavailable: {error}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
