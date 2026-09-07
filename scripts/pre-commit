@@ -1,0 +1,70 @@
+#!/bin/sh
+# Sovereign Vault pre-commit hook (P14 step 2).
+#
+# Scans ONLY what git has staged — never the working tree — and BLOCKS the
+# commit when the scanner reports a finding or fails. Fail-closed by design:
+# a security hook that fails open produces false confidence.
+#
+# Installed by scripts/install-precommit-hook.sh.
+#
+# Bypass (deliberate, per-user): git commit --no-verify
+# A hook users cannot escape is a hook they will uninstall, so the escape
+# hatch is printed on every block.
+#
+# If a flagged credential is ALREADY exposed somewhere, rotate it first:
+# this hook prevents the NEXT leak; it does nothing for a key already out.
+
+set -u
+
+# Resolve the scanner binary, cross-platform, in this order:
+#   $SOVEREIGN_VAULT_BIN  explicit override
+#   repo target/release   cargo release build
+#   repo target/debug     cargo debug build
+#   PATH                  installed binary
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "[sv-precommit] BLOCKED: not inside a git repository." >&2
+    exit 1
+}
+EXE="sovereign-vault"; [ "${OS:-}" = "Windows_NT" ] && EXE="sovereign-vault.exe"
+
+SV_BIN="${SOVEREIGN_VAULT_BIN:-}"
+if [ -n "$SV_BIN" ] && [ ! -x "$SV_BIN" ]; then
+    echo "[sv-precommit] BLOCKED: SOVEREIGN_VAULT_BIN is set but not executable: $SV_BIN" >&2
+    exit 1
+fi
+if [ -z "$SV_BIN" ]; then
+    if [ -x "$REPO_ROOT/target/release/$EXE" ]; then
+        SV_BIN="$REPO_ROOT/target/release/$EXE"
+    elif [ -x "$REPO_ROOT/target/debug/$EXE" ]; then
+        SV_BIN="$REPO_ROOT/target/debug/$EXE"
+    elif command -v "$EXE" >/dev/null 2>&1; then
+        SV_BIN="$EXE"
+    fi
+fi
+if [ -z "$SV_BIN" ]; then
+    echo "[sv-precommit] BLOCKED: scanner binary not found (fail closed)." >&2
+    echo "[sv-precommit]   Build it:  cargo build -p sovereign-vault" >&2
+    echo "[sv-precommit]   Or point SOVEREIGN_VAULT_BIN at an existing binary." >&2
+    echo "[sv-precommit]   Bypass (deliberate): git commit --no-verify" >&2
+    exit 1
+fi
+
+"$SV_BIN" precommit
+rc=$?
+
+case $rc in
+    0)
+        exit 0
+        ;;
+    2)
+        # Findings were already printed by the scanner, including the bypass.
+        echo "[sv-precommit] commit blocked by Sovereign Vault scan." >&2
+        exit 1
+        ;;
+    *)
+        echo "[sv-precommit] BLOCKED: scanner failed (exit $rc); failing closed." >&2
+        echo "[sv-precommit]   The commit is NOT allowed while the scanner is broken." >&2
+        echo "[sv-precommit]   Bypass (deliberate): git commit --no-verify" >&2
+        exit 1
+        ;;
+esac
