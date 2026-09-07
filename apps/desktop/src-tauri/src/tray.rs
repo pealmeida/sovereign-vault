@@ -186,9 +186,8 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, pending: &[TrayApproval]) -> tauri
             let approve =
                 MenuItemBuilder::with_id(format!("{APPROVE_PREFIX}{}", approval.id), "Approve")
                     .build(app)?;
-            let deny =
-                MenuItemBuilder::with_id(format!("{DENY_PREFIX}{}", approval.id), "Deny")
-                    .build(app)?;
+            let deny = MenuItemBuilder::with_id(format!("{DENY_PREFIX}{}", approval.id), "Deny")
+                .build(app)?;
             let sub = SubmenuBuilder::new(app, approval.action_label)
                 .item(&deny)
                 .separator()
@@ -405,8 +404,12 @@ mod tests {
             .find("pub struct TrayApproval {")
             .expect("TrayApproval struct must exist");
         let body = &src[start..];
-        let end = body.find("
-}").expect("struct must terminate");
+        let end = body
+            .find(
+                "
+}",
+            )
+            .expect("struct must terminate");
         let fields = &body[..end];
         for forbidden in ["container", "file_name", "byte_size", "otp", "agent"] {
             for line in fields.lines() {
