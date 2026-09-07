@@ -40,14 +40,19 @@ pub enum Exposure {
     },
     /// Found, and the repository is known to be public.
     ///
-    /// Local git metadata cannot determine public/private status. This variant
-    /// is produced only when an external check (P12) confirms the repository is
-    /// public.
+    /// Local git metadata cannot determine public/private status, and a current
+    /// visibility response cannot establish visibility history. This variant is
+    /// produced only when the credential-bearing content is established as
+    /// reachable from the currently public repository. `earliest_commit` remains
+    /// a commit timestamp, never a first-exposure time.
     FoundPublic {
         /// Name of the remote.
         remote: String,
-        /// Earliest commit timestamp observed among the hits.
+        /// Earliest commit timestamp observed among the hits. Commits may be
+        /// backdated; this is an observation, not an exposure time.
         earliest_commit: DateTime<Utc>,
+        /// When the public visibility was observed.
+        visibility_observed_at: DateTime<Utc>,
     },
 }
 
@@ -81,7 +86,18 @@ pub enum ScanLimit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RotationUrgency {
-    /// No exposure detected in scanned history, and the scan had no limits.
+    /// No exposure was observed in the scanned local history, and the scan
+    /// reported no limits.
+    ///
+    /// **This is not "rotation unnecessary".** It is the absence of an
+    /// exposure-based recommendation, and it is bounded by what a local
+    /// repository can show. An apparently complete local scan cannot exclude
+    /// exposure elsewhere: the credential may have been pushed from another
+    /// machine, committed to a fork, or carried in a pull-request branch that
+    /// was never fetched into this clone.
+    ///
+    /// Render it as "no exposure-based recommendation", never as a clean
+    /// verdict, and never with a green check.
     None,
     /// Coverage was incomplete, so no negative conclusion is available. The UI
     /// must surface the limits rather than a clean verdict.

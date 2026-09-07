@@ -9,10 +9,21 @@ description = "Sovereign Vault exposure classification: determine whether a disc
 
 [dependencies]
 sv-scan    = { workspace = true }
+sv-crypto  = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
 chrono     = { workspace = true }
+sha2       = { workspace = true }
+hex        = { workspace = true }
+subtle     = { workspace = true }
+reqwest    = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enables outbound GitHub API calls. This is the only network-touching code in
+# the crate and is off by default.
+github = ["dep:reqwest"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

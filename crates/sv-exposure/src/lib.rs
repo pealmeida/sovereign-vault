@@ -15,6 +15,9 @@
 //! * Detected credential values are never passed as command-line arguments,
 //!   written to logs, or sent to external services. Detection runs in-process
 //!   over blob bytes loaded from `git cat-file`.
+//! * The optional `github` feature transmits the user's GitHub connector token
+//!   to GitHub's API. That token is a separately authorized connector credential,
+//!   not a discovered secret. No discovered credential is ever sent to GitHub.
 //! * Git runs with external diff/textconv helpers disabled and no implicit
 //!   network fetch.
 //! * A commit timestamp is reported as "earliest commit observed", never as an
@@ -30,9 +33,18 @@ mod git;
 mod issuer;
 mod urgency;
 
+#[cfg(feature = "github")]
+mod github;
+
 pub use git::{classify_finding, collect_blobs, BlobIndex, ClassificationError, GitRunError};
 pub use issuer::{Issuer, IssuerRule, RotationState, RULE_ISSUERS};
-pub use urgency::{Exposure, FindingExposure, RotationUrgency, ScanLimit};
+pub use urgency::{derive_urgency, Exposure, FindingExposure, RotationUrgency, ScanLimit};
+
+#[cfg(feature = "github")]
+pub use github::{
+    transient_fingerprint, GitHubClient, GitHubError, PushProtectionStatus, RepoId, RepoVisibility,
+    RepositorySecurityPosture, SecretScanningAlert, SecretScanningAlerts,
+};
 
 /// Crate version string.
 pub fn version() -> &'static str {
