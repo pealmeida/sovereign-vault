@@ -556,12 +556,12 @@ mod tests {
     #[test]
     fn collect_blobs_indexes_committed_blob() {
         let dir = temp_repo();
-        write_and_commit(
-            &dir,
-            "secret.txt",
-            "gho_deadbeef00000000000000000000000000000000\n",
-            "add secret",
-        );
+        // This test only checks that a committed blob lands in the index, so
+        // it deliberately holds no credential-shaped literal: a fixture token
+        // in a source file is a real match for history scanners, ours and
+        // other people's alike. Tests that need a token shape build it at
+        // runtime, as `classify_finding_detects_secret_in_history` does.
+        write_and_commit(&dir, "notes.txt", "ordinary file contents\n", "add file");
         let index = collect_blobs(dir.path()).unwrap();
         assert!(!index.is_empty());
         assert_eq!(index.scanned_refs, 1); // refs/heads/main only
