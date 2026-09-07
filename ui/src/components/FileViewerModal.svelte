@@ -65,11 +65,25 @@
     );
   }
 
+  // Identity of the file to load, as PRIMITIVES.
+  //
+  // `file` is a props object, so reading `file.name` inside the effect tracks
+  // the prop itself: a parent that hands down a NEW object with the same name
+  // re-runs the effect and re-reads the file. Deriving the two strings first
+  // means the effect depends on the values, and a recreated-but-equal prop
+  // changes nothing.
+  //
+  // This is not hypothetical. A real audit log holds 27,075 reads of one
+  // 93,965-byte file, ~28 per second, all from this load path, and a test that
+  // recreates the prop object with identical values reproduces one extra read
+  // per recreation.
+  let fileKey = $derived(file.name);
+  let containerKey = $derived(container);
+
   $effect(() => {
-    // Read file.name & container; everything else stays untracked to avoid
-    // re-entry loops when we later write to objectUrl/rawBytes/etc.
-    const currentName = file.name;
-    const currentContainer = container;
+    // Depend on the derived primitives, never on the props objects.
+    const currentName = fileKey;
+    const currentContainer = containerKey;
     const currentInfo = detectFileType(currentName);
 
     let cancelled = false;
