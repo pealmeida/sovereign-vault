@@ -416,6 +416,11 @@ impl<R: Runtime> ApprovalState<R> {
                             import_summary: request.import_summary.clone(),
                         };
                         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
+                        notify_once(
+                            &self.app,
+                            NotificationKind::Approval,
+                            NOTIFICATION_APPROVAL_BODY,
+                        );
                     }
 
                     Err(
@@ -506,6 +511,11 @@ impl<R: Runtime> ApprovalState<R> {
             import_summary: request.import_summary.clone(),
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
+        notify_once(
+            &self.app,
+            NotificationKind::Approval,
+            NOTIFICATION_APPROVAL_BODY,
+        );
         Err(
             "otp_required: a one-time code is shown on the Sovereign Vault desktop. \
              Resend this exact request with the `otp` argument set to that code."
@@ -566,6 +576,11 @@ impl<R: Runtime> ApprovalState<R> {
             import_summary: request.import_summary.clone(),
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
+        notify_once(
+            &self.app,
+            NotificationKind::Approval,
+            NOTIFICATION_APPROVAL_BODY,
+        );
 
         match tokio::time::timeout(Duration::from_secs(APPROVAL_TIMEOUT_SECS), rx).await {
             Ok(Ok(true)) => Ok(()),
@@ -602,6 +617,105 @@ impl<R: Runtime> ApprovalState<R> {
             .send(approved)
             .map_err(|_| "approval request already closed".to_string())
     }
+}
+
+/// OS notifications (notifications step 1: plain notifications, no actions —
+/// the plugin's Actions API is mobile-only). The text is deliberately fixed:
+/// an OS notification is written to the notification-centre history and may
+/// appear on a lock screen, so no request field — not even a resource name —
+/// is ever interpolated into it. This includes hidden notification metadata,
+/// which is not private.
+const NOTIFICATION_TITLE: &str = "Sovereign Vault";
+const NOTIFICATION_APPROVAL_BODY: &str =
+    "An access request needs your review. Open Sovereign Vault to respond.";
+const NOTIFICATION_WAKE_BODY: &str = "A local application requested your attention.";
+
+/// Minimum interval between OS notifications. Deliberately shares the value of
+/// [`WAKE_NOTIFICATION_COOLDOWN_SECS`]: the wake queue already coalesces
+/// arrivals per request signature, and this bounds the notification stream
+/// itself so a request storm cannot become a notification storm.
+const OS_NOTIFICATION_COOLDOWN_SECS: u64 = WAKE_NOTIFICATION_COOLDOWN_SECS;
+
+/// Master switch and coalescing state for OS notifications. Kept out of
+/// `VaultState` so it is not generic over the Tauri runtime and can be read
+/// from any emitter. In tests there is no managed state, so [`notify_once`]
+/// silently does nothing and never fires an OS notification.
+struct NotificationState {
+    enabled: AtomicBool,
+    /// Instant of the last OS notification of each kind, for coalescing. A std
+    /// lock (not tokio): the check is non-blocking and the notification path
+    /// must never wait on it.
+    last_sent: std::sync::Mutex<LastSent>,
+}
+
+/// Last-sent instants, tracked per notification kind.
+#[derive(Default)]
+struct LastSent {
+    approval: Option<Instant>,
+    wake: Option<Instant>,
+}
+
+/// Which notification is being raised. Determines the cooldown slot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NotificationKind {
+    /// An agent is blocked waiting on a human decision.
+    Approval,
+    /// Some local process asked for attention (ADR-0021).
+    Wake,
+}
+
+impl NotificationState {
+    fn new() -> Self {
+        Self {
+            // On by default: the fixed text is designed to be safe to show,
+            // and the setting exists so the user can turn the signal off.
+            enabled: AtomicBool::new(true),
+            last_sent: std::sync::Mutex::new(LastSent::default()),
+        }
+    }
+}
+
+/// Show one OS notification, coalesced. Best-effort and never blocking: if the
+/// switch is off, the cooldown has not elapsed, the state lock is contended,
+/// or the OS call fails, the notification is skipped. The in-app queue remains
+/// the authoritative path to a pending request; a failed notification must
+/// never fail the underlying approval or wake flow.
+fn notify_once<R: Runtime>(app: &AppHandle<R>, kind: NotificationKind, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
+
+    let Some(state) = app.try_state::<NotificationState>() else {
+        return;
+    };
+    if !state.enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    // Cooldowns are per kind, not global. A wake says "some local process wants
+    // your attention"; an approval says "an agent is blocked waiting on your
+    // decision". Sharing one window lets the weaker signal suppress the
+    // stronger one, so an approval could go unannounced because an anonymous
+    // wake arrived first. Both are still individually coalesced, which is what
+    // the storm requirement asks for.
+    let Ok(mut last) = state.last_sent.try_lock() else {
+        return;
+    };
+    let slot = match kind {
+        NotificationKind::Approval => &mut last.approval,
+        NotificationKind::Wake => &mut last.wake,
+    };
+    let now = Instant::now();
+    if let Some(sent) = *slot {
+        if now.duration_since(sent) < Duration::from_secs(OS_NOTIFICATION_COOLDOWN_SECS) {
+            return;
+        }
+    }
+    *slot = Some(now);
+    drop(last);
+    let _ = app
+        .notification()
+        .builder()
+        .title(NOTIFICATION_TITLE)
+        .body(body)
+        .show();
 }
 
 /// Per-agent and global rate-limit state for wake requests.
@@ -642,6 +756,10 @@ trait WakeEmitter: Send + Sync + 'static {
 impl<R: Runtime> WakeEmitter for AppHandle<R> {
     fn emit_wake(&self, prompt: WakePrompt) {
         let _ = self.emit(WAKE_EVENT, prompt);
+        // The wake queue already gates this call behind
+        // WAKE_NOTIFICATION_COOLDOWN_SECS per signature; notify_once applies
+        // the global OS-notification cooldown on top.
+        notify_once(self, NotificationKind::Wake, NOTIFICATION_WAKE_BODY);
     }
     fn emit_cancel(&self, id: u64) {
         let _ = self.emit(WAKE_CANCEL_EVENT, WakeCancel { id });
@@ -3904,6 +4022,19 @@ async fn session_set_limits(
     Ok(())
 }
 
+/// Enable or disable OS notifications. A deliberate human action in the
+/// settings page, so it counts as human activity.
+#[tauri::command]
+async fn notifications_set_enabled(
+    state: State<'_, VaultState>,
+    notifications: State<'_, NotificationState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.touch_human_activity();
+    notifications.enabled.store(enabled, Ordering::Relaxed);
+    Ok(())
+}
+
 #[tauri::command]
 async fn agent_create(
     app: AppHandle,
@@ -4191,9 +4322,11 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             app.manage(VaultState::new(app.handle().clone()));
+            app.manage(NotificationState::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -4228,6 +4361,7 @@ pub fn run() {
             mcp_status,
             session_status,
             session_set_limits,
+            notifications_set_enabled,
             agent_create,
             agent_list,
             agent_revoke,

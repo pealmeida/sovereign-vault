@@ -1,0 +1,21 @@
+[package]
+name        = "sv-exposure"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace= true
+license.workspace     = true
+repository.workspace  = true
+description = "Sovereign Vault exposure classification: determine whether a discovered credential appears in git history and how urgently it must be rotated."
+
+[dependencies]
+sv-scan    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+chrono     = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -93,6 +93,46 @@ The setting is offered during agent setup and uses the following copy:
 > Sovereign Vault must be running. Enable **Start at sign-in** to keep wake
 > requests available after login.
 
+### 4b. Endpoint lifetime and ownership
+
+**The endpoint runs for the application's lifetime, not only while locked.**
+
+An earlier draft made it the inverse of the MCP listeners — start on lock, stop
+on unlock. That was wrong, and the reasoning matters: the endpoint can only
+request attention, never enqueue an approval or authorize anything, so its
+being available while unlocked is harmless. Running it always removes the
+start/stop sequencing against `perform_vault_lock` and `start_servers`
+entirely, and with it the race on the endpoint name during a fast
+lock–unlock–lock cycle. `perform_vault_lock` must **not** stop it.
+
+Response semantics stay independent of lock state. In particular `DISABLED`
+means the user disabled the feature; it must never be repurposed to signal
+"unlocked".
+
+Wake-state transitions serialize through one short-held mutex. That mutex is
+never held across socket I/O, notification delivery, or an audit write. Bound
+concurrent connections and set read/write deadlines: a fixed-length protocol
+does not by itself prevent slow-client exhaustion.
+
+**Endpoint ownership.** `tauri-plugin-single-instance` being present is not a
+demonstrated ownership guarantee for the endpoint name, so ownership is
+established explicitly:
+
+- **Unix:** an owner-only directory; take an exclusive lock on a stable lock
+  file, then inspect the socket path. Reject symlinks, unexpected ownership,
+  and non-socket objects. Only the lock holder may unlink a stale socket and
+  bind. Hold the lock through shutdown, unlink the socket before releasing it,
+  and never unlink the lock file. A failed connection alone does not establish
+  staleness.
+- **Windows:** there is no unlink. Create the first pipe instance with
+  `FILE_FLAG_FIRST_PIPE_INSTANCE`, the intended ACL, and remote clients
+  rejected. Treat a collision as failure — never as permission to attach to
+  another server. Surviving client handles can delay restart; use bounded
+  retry and report failure rather than working around it.
+
+These coordinate legitimate instances. They do not defeat same-user malware,
+and must not be described as if they did.
+
 ### 5. Audit qualification
 
 The audit HMAC key derives from the live handle (ADR-0007), which does not exist
@@ -103,6 +143,22 @@ The implementation records the receipt **after unlock**, explicitly qualified as
 "received while locked; recorded on unlock". A product whose central claim is a
 verifiable append-only log must not quietly insert entries it could not
 authenticate when they happened.
+
+Observation time and recording time are recorded as **different claims**, never
+merged. The protocol carries no client timestamp; a server-captured receipt time
+is locally observed and can be affected by wall-clock changes. So the entry
+written at unlock is an aggregate:
+
+- `recorded_at` — when the entry entered the chain (authenticated)
+- `observed_first_at` — optional, when the first wake was observed (unauthenticated)
+- `count` — how many were coalesced
+- the qualification: *"Buffered in volatile memory while locked; authenticated
+  only when recorded."*
+
+**The chain entry is never backdated.** And two limits are acknowledged rather
+than papered over: a crash loses buffered receipts entirely, and chain
+verification establishes integrity *after* append — not completeness, and not
+independently verified timing, for anything that happened while locked.
 
 ### 6. Unlock does not approve
 
