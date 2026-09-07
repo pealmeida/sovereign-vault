@@ -128,8 +128,17 @@ fn scan_staged(repo: &Path, paths: &[String]) -> Result<bool, String> {
 
     if findings.is_empty() {
         println!(
-            "[precommit] {scanned} staged file(s) scanned in {:.2}s; no findings.",
+            "[precommit] {scanned} staged file(s) scanned in {:.2}s; no credentials found.",
             elapsed.as_secs_f64()
+        );
+        // Say what was checked, not just that nothing turned up. This gate
+        // looks for credentials; it does not look for personal data, which
+        // would flag every email and IP address in a fixture and get the hook
+        // uninstalled. A user who reads "no findings" and infers "nothing
+        // sensitive here" has been told something this scan did not check.
+        println!(
+            "[precommit] (credential patterns only; personal data is not checked here \
+             — run `sovereign-vault scan` for that.)"
         );
         for note in &not_examined {
             println!("[precommit] not examined: {note}");
