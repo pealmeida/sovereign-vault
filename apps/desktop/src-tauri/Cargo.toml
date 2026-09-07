@@ -28,6 +28,10 @@ serde_json            = { workspace = true }
 tokio                 = { workspace = true }
 tauri                 = { version = "2", features = [] }
 tauri-plugin-dialog   = "2"
+# notify-rust, pulled in transitively on Linux, requires Rust 1.89 from 4.18.0
+# and the workspace MSRV is 1.88, so the lockfile pins it to 4.17.0. Raising the
+# MSRV for an OS-notification convenience is the wrong trade; if that pin is
+# ever lifted, the MSRV job fails before anything else does.
 tauri-plugin-notification = "2"
 tauri-plugin-opener   = "2"
 tauri-plugin-single-instance = "2"
