@@ -4595,8 +4595,13 @@ name = "sv-exposure"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hex",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "subtle",
+ "sv-crypto",
  "sv-scan",
  "tempfile",
  "thiserror 2.0.20",
