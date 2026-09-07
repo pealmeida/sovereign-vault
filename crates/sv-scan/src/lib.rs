@@ -28,11 +28,13 @@ mod rules;
 mod types;
 mod walk;
 
-pub use detect::{detect_jurisdiction, detect_pii, detect_secrets, mask, scan_project};
+pub use detect::{
+    detect_jurisdiction, detect_pii, detect_secrets, mask, mask_opaque, scan_project,
+};
 pub use rules::{Alphabet, SecretRule, RULES, SECRET_KEYWORDS};
 pub use types::{
-    Confidence, Coverage, FindingKind, ScanConfig, ScanFinding, ScanReport, SkipReason, Skipped,
-    Suppressed, SuppressionReason, ALWAYS_SCAN, DEFAULT_EXCLUDES,
+    matched_fingerprint, Confidence, Coverage, FindingKind, PreviewMode, ScanConfig, ScanFinding,
+    ScanReport, SkipReason, Skipped, Suppressed, SuppressionReason, ALWAYS_SCAN, DEFAULT_EXCLUDES,
 };
 pub use walk::{walk, ScannedFile};
 

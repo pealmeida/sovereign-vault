@@ -12,6 +12,14 @@
   let revealPhrase = $state(false);
   let recoveryData = $state<string | null>(null);
 
+  // Session limits in minutes for the UI controls.
+  let idleMinutes = $state(15);
+  let absoluteMinutes = $state(8 * 60);
+
+  // Defaults match the Rust constants: 15 min idle, 8 h absolute.
+  const DEFAULT_IDLE_MINUTES = 15;
+  const DEFAULT_ABSOLUTE_MINUTES = 8 * 60;
+
   let newAgentName = $state('');
   let newAgentToken = $state<string | null>(null);
 
@@ -141,6 +149,9 @@
   onMount(async () => {
     try {
       appVersion = await vaultStore.appVersion();
+      await vaultStore.refreshSession();
+      // Reflect current backend limits in the controls if known.
+      // Defaults are already set; backend sends remaining seconds, not limits.
       await mcpStore.refresh();
       if (vaultStore.status?.unlocked) {
         await agentsStore.refresh();
@@ -171,6 +182,17 @@
   async function openAuditFolder() {
     try {
       await vaultStore.openAuditFolder();
+    } catch (e) {
+      toastStore.setError(e);
+    }
+  }
+
+  async function saveSessionLimits() {
+    const idleSecs = Math.max(1, Math.round(idleMinutes * 60));
+    const absoluteSecs = Math.max(1, Math.round(absoluteMinutes * 60));
+    try {
+      await vaultStore.setLimits(idleSecs, absoluteSecs);
+      toastStore.setNotice('Session limits updated.');
     } catch (e) {
       toastStore.setError(e);
     }
@@ -427,6 +449,59 @@
           <input class="text-input" placeholder="Path prefix (e.g. /v1)" bind:value={newBrokerPathPrefix} />
           <input class="text-input" placeholder="Methods (comma-separated, e.g. GET,POST)" bind:value={newBrokerMethods} />
           <button class="primary-button" onclick={createBrokerSecret}>Create brokered secret</button>
+        </div>
+      {/if}
+    </article>
+
+    <!-- Session limits -->
+    <article class="panel-card">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Session</p>
+          <h3>Auto-lock limits</h3>
+        </div>
+      </div>
+
+      {#if !vaultStore.status?.unlocked}
+        <div class="empty-state">Unlock the vault to change session limits.</div>
+      {:else}
+        <div class="settings-stack">
+          <label class="detail-row" style="align-items:flex-start;flex-direction:column;gap:0.5rem">
+            <span>Idle timeout (minutes)</span>
+            <input
+              class="text-input"
+              type="number"
+              min="1"
+              max="1440"
+              bind:value={idleMinutes}
+              autocorrect="off"
+              spellcheck="false"
+            />
+          </label>
+          <p style="font-size:0.8rem;opacity:0.7;margin:0.25rem 0 0">
+            Lock after this many minutes of no human activity in the desktop GUI. Agent activity does not count.
+          </p>
+
+          <label class="detail-row" style="align-items:flex-start;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
+            <span>Maximum unlocked session (minutes)</span>
+            <input
+              class="text-input"
+              type="number"
+              min="1"
+              max="1440"
+              bind:value={absoluteMinutes}
+              autocorrect="off"
+              spellcheck="false"
+            />
+          </label>
+          <p style="font-size:0.8rem;opacity:0.7;margin:0.25rem 0 0">
+            Hard cap on how long a single unlock can last, regardless of activity. Not refreshed by use.
+          </p>
+
+          <div style="display:flex;gap:0.5rem;margin-top:0.75rem">
+            <button class="primary-button" onclick={saveSessionLimits}>Save limits</button>
+            <button class="ghost-button" onclick={() => { idleMinutes = DEFAULT_IDLE_MINUTES; absoluteMinutes = DEFAULT_ABSOLUTE_MINUTES; }}>Reset defaults</button>
+          </div>
         </div>
       {/if}
     </article>

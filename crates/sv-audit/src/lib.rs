@@ -169,6 +169,20 @@ pub enum AuditAction {
     Broker,
     /// Query vault metadata (version, custody mode, container count).
     VaultInfo,
+    /// Run a project scan for secrets and personal data.
+    ScanRun,
+    /// Store a scan report or remediation plan in the vault.
+    ScanStore,
+    /// Reveal a stored finding preview under explicit consent.
+    ScanReveal,
+    /// Create a remediation plan from a scan report.
+    PlanCreate,
+    /// Approve a remediation plan (human decision).
+    PlanApprove,
+    /// Execute an approved remediation plan.
+    PlanExecute,
+    /// Restore original content from a stored redaction.
+    RedactionRestore,
 }
 
 /// Final outcome for an audited action.
@@ -1502,6 +1516,28 @@ mod tests {
             let decoded: AuditEvent = serde_json::from_slice(&encoded).unwrap();
             assert_eq!(decoded.action, action);
             assert_eq!(decoded.decision, AuditDecision::Attempted);
+        }
+    }
+
+    #[test]
+    fn scan_and_plan_actions_round_trip_through_serde() {
+        for (action, name) in [
+            (AuditAction::ScanRun, "scan_run"),
+            (AuditAction::ScanStore, "scan_store"),
+            (AuditAction::ScanReveal, "scan_reveal"),
+            (AuditAction::PlanCreate, "plan_create"),
+            (AuditAction::PlanApprove, "plan_approve"),
+            (AuditAction::PlanExecute, "plan_execute"),
+            (AuditAction::RedactionRestore, "redaction_restore"),
+        ] {
+            let event = AuditEvent::new(action, AuditDecision::Attempted, "test");
+            let encoded = serde_json::to_vec(&event).unwrap();
+            let decoded: AuditEvent = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded.action, action);
+            assert_eq!(
+                serde_json::to_value(action).unwrap(),
+                serde_json::Value::String(name.to_string())
+            );
         }
     }
 

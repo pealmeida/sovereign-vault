@@ -33,9 +33,10 @@ pub mod types;
 pub use error::{Result, RuntimeError};
 pub use types::{
     AuditIntent, CanonicalDestination, ConsentBinding, ConsentMode, ConsentRequirement,
-    DataFragment, DecisionEffect, Destination, DestinationSelector, EffectiveLimits,
-    ExecutionConstraint, ExposureClass, FragmentId, FragmentRole, InternalResourceId, MediaType,
-    MediationPlan, MediationRequest, Operation, OperationKind, Origin, PolicyVersion,
-    PreparedFragment, Principal, PrincipalId, PrincipalKind, Provenance, ReferenceUse, RequestId,
-    ScalarValue, Scope, SensitiveBytes, SessionId, TransformationPlan, TransportKind,
+    DataFragment, DecisionEffect, Destination, DestinationSelector, DiscoveryPolicy,
+    EffectiveLimits, ExecutionConstraint, ExposureClass, FragmentId, FragmentRole,
+    InternalResourceId, MediaType, MediationPlan, MediationRequest, Operation, OperationKind,
+    Origin, PolicyVersion, PreparedFragment, Principal, PrincipalId, PrincipalKind, Provenance,
+    ReferenceUse, RequestId, ScalarValue, Scope, SensitiveBytes, SessionId, TransformationPlan,
+    TransportKind,
 };

@@ -144,9 +144,18 @@ jobs:
       - name: Install cargo-audit
         uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
         with:
-          tool: cargo-audit
+          # Pinned, matching release.yml.
+          tool: cargo-audit@0.22.2
       - name: cargo audit (fail only on vulnerabilities)
-        run: cargo audit
+        # `--format json` avoids cargo-audit's *terminal presenter*, which
+        # panics at presenter.rs:145 with "failed to find dependency:
+        # thiserror 2.0.19" while rendering the dependency tree for the
+        # unmaintained GTK3 advisories above. Two thiserror majors are in the
+        # tree (the GTK3 stack pins 1.x), and the presenter cannot resolve the
+        # disambiguated `name version` form Cargo writes for that. The scan
+        # itself is unaffected: the same lockfile audits cleanly, and a real
+        # vulnerability still fails the job. Revisit if the presenter is fixed.
+        run: cargo audit --format json
       - name: cargo deny (bans, sources, licenses)
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:

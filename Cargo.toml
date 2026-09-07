@@ -13,6 +13,7 @@ members = [
     "crates/sv-core",
     "crates/sv-scan",
     "crates/sv-patterns",
+    "crates/sv-remediate",
     "apps/cli",
     "apps/desktop/src-tauri",
     "apps/thesis-eval",
@@ -44,6 +45,7 @@ sv-mcp       = { path = "crates/sv-mcp",       version = "0.1.0" }
 sv-runtime   = { path = "crates/sv-runtime",   version = "0.1.0" }
 sv-scan      = { path = "crates/sv-scan",      version = "0.1.0" }
 sv-patterns  = { path = "crates/sv-patterns",  version = "0.1.0" }
+sv-remediate = { path = "crates/sv-remediate", version = "0.1.0" }
 sv-http      = { path = "crates/sv-http",      version = "0.1.0" }
 sv-core      = { path = "crates/sv-core",      version = "0.1.0" }
 
@@ -75,6 +77,7 @@ fs4          = "1.1"
 atomicwrites = "0.4.4"
 ignore       = "0.4"
 regex        = "1.11"
+hex          = "0.4"
 toml         = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 
 [profile.release]

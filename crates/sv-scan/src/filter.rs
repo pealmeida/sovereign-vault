@@ -554,6 +554,7 @@ mod tests {
             },
             confidence: Confidence::Medium,
             preview: "src-****".to_string(),
+            matched_fingerprint: String::new(),
         };
         assert!(!plausible_openai_key(bare, &finding));
 

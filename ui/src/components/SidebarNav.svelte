@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { FolderLock, Files, Settings2, ShieldCheck, Lock } from '@lucide/svelte';
+  import { FolderLock, Files, Settings2, ScrollText, Radar, ShieldCheck, Lock } from '@lucide/svelte';
   import { router, push } from 'svelte-spa-router';
   import { vaultStore } from '../stores/vault.svelte';
   import { toastStore } from '../stores/toast.svelte';
@@ -7,6 +7,8 @@
   const items = [
     { path: '/vault', label: 'Vault', icon: FolderLock },
     { path: '/files', label: 'Files', icon: Files },
+    { path: '/scans', label: 'Scans', icon: Radar },
+    { path: '/logs', label: 'Logs', icon: ScrollText },
     { path: '/settings', label: 'Settings', icon: Settings2 },
   ] as const;
 

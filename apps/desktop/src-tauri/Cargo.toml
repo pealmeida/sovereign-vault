@@ -19,6 +19,8 @@ sv-core               = { workspace = true }
 sv-mcp                = { workspace = true }
 sv-http               = { workspace = true }
 sv-audit              = { workspace = true }
+sv-scan               = { workspace = true }
+chrono                = { workspace = true }
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
 tokio                 = { workspace = true }
@@ -30,6 +32,8 @@ async-trait           = "0.1"
 subtle                = { workspace = true }
 tempfile              = { workspace = true }
 atomicwrites           = { workspace = true }
+sha2                  = { workspace = true }
+hex                   = { workspace = true }
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-shell = "2"

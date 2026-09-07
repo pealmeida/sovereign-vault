@@ -13,7 +13,9 @@
 //!   its own.
 //!
 //! Two invariants hold across the whole module: nothing is ever written, and
-//! no finding ever carries the matched value — only a masked [`mask`] preview.
+//! no finding ever carries the matched value — only a preview built by
+//! [`mask_opaque`] (the default) or, when explicitly opted into via
+//! [`PreviewMode`], by [`mask`], which reveals a four-character prefix.
 //! Already-redacted markers (`[REDACTED:…]`, `[SV:LOC:…]`) on the same line are
 //! never re-flagged, so scanning an already-remediated tree is idempotent.
 
@@ -22,11 +24,15 @@ use std::path::Path;
 use sv_privacy::Policy;
 
 use crate::rules::{SecretRule, PEM_RULE_ID, RULES, SECRET_KEYWORDS};
-use crate::types::{Confidence, FindingKind, ScanFinding};
+use crate::types::{matched_fingerprint, Confidence, FindingKind, PreviewMode, ScanFinding};
 use crate::{walk, ScanConfig, ScanError, ScanReport};
 
-/// Minimum plausible Shannon entropy (bits per byte) for a token match. Below
-/// this, an otherwise-matching token is suspicious and is demoted one step.
+/// Process-local fingerprint of the matched bytes for this scan only.
+///
+/// Salted with the per-scan `config.fingerprint_salt` so identical values in
+/// different files or projects are not linkable and so the fingerprint is not
+/// a brute-force oracle for small-domain values. This is NOT a security
+/// boundary and is never serialized.
 const ENTROPY_DEMOTE_THRESHOLD: f64 = 2.0;
 
 /// The visible tail kept by [`mask`] is this many asterisks, fixed so the true
@@ -38,14 +44,20 @@ const MASK_STARS: &str = "********";
 /// Runs every rule in [`RULES`] over `content`, resolves overlapping matches
 /// (higher confidence wins, then the longer span, then the rule id), and
 /// returns findings ordered by start offset. Never panics on multi-byte UTF-8
-/// and never emits the raw matched value.
-pub fn detect_secrets(content: &str, path: &Path) -> Vec<ScanFinding> {
+/// and never emits the raw matched value; previews are built according to
+/// `mode`.
+pub fn detect_secrets(
+    content: &str,
+    path: &Path,
+    mode: PreviewMode,
+    fingerprint_salt: [u8; 32],
+) -> Vec<ScanFinding> {
     let mut candidates: Vec<ScanFinding> = Vec::new();
     for rule in RULES {
         if rule.id == PEM_RULE_ID {
-            scan_pem(content, path, rule, &mut candidates);
+            scan_pem(content, path, rule, mode, fingerprint_salt, &mut candidates);
         } else {
-            scan_rule(content, path, rule, &mut candidates);
+            scan_rule(content, path, rule, mode, fingerprint_salt, &mut candidates);
         }
     }
     dedup_overlaps(candidates)
@@ -56,8 +68,15 @@ pub fn detect_secrets(content: &str, path: &Path) -> Vec<ScanFinding> {
 /// Checksum-validated identifiers (CPF, CNPJ, credit card) are reported at
 /// [`Confidence::High`]; structurally-validated categories (email, IPv4, phone,
 /// SSN) at [`Confidence::Medium`]. Already-redacted markers are skipped so
-/// re-scanning a processed tree stays idempotent. The preview is masked.
-pub fn detect_pii(content: &str, path: &Path, policy: &Policy) -> Vec<ScanFinding> {
+/// re-scanning a processed tree stays idempotent. The preview is masked
+/// according to `mode`.
+pub fn detect_pii(
+    content: &str,
+    path: &Path,
+    policy: &Policy,
+    mode: PreviewMode,
+    fingerprint_salt: [u8; 32],
+) -> Vec<ScanFinding> {
     sv_privacy::scan(content, policy)
         .into_iter()
         .filter(|f| !is_inside_marker(content, f.start))
@@ -68,7 +87,8 @@ pub fn detect_pii(content: &str, path: &Path, policy: &Policy) -> Vec<ScanFindin
             end: f.end,
             confidence: pii_confidence(f.category),
             kind: FindingKind::Pii(f.category),
-            preview: mask(&content[f.start..f.end]),
+            preview: preview_with(mode, &content[f.start..f.end]),
+            matched_fingerprint: matched_fingerprint(&content[f.start..f.end], fingerprint_salt),
         })
         .collect()
 }
@@ -87,6 +107,8 @@ pub fn detect_jurisdiction(
     path: &Path,
     packs: &[sv_patterns::ValidatedPack],
     budget: &sv_patterns::MatchBudget,
+    mode: PreviewMode,
+    fingerprint_salt: [u8; 32],
 ) -> (Vec<ScanFinding>, bool) {
     if packs.is_empty() {
         return (Vec::new(), false);
@@ -106,7 +128,8 @@ pub fn detect_jurisdiction(
                 sv_patterns::RuleConfidence::Medium => Confidence::Medium,
                 sv_patterns::RuleConfidence::Low => Confidence::Low,
             },
-            preview: mask(&content[m.start..m.end]),
+            preview: preview_with(mode, &content[m.start..m.end]),
+            matched_fingerprint: matched_fingerprint(&content[m.start..m.end], fingerprint_salt),
             kind: FindingKind::Jurisdiction {
                 pack_id: m.pack_id,
                 pack_version: m.pack_version,
@@ -118,9 +141,14 @@ pub fn detect_jurisdiction(
     (findings, outcome.truncated)
 }
 
-/// Mask a matched value for safe display: keep at most the first 4 characters,
-/// replace the rest with a fixed number of asterisks so the true length is not
-/// disclosed. A value of 4 characters or fewer is masked entirely.
+/// Mask a matched value by REVEALING a prefix: keep at most the first 4
+/// characters of the input, then append a fixed number of asterisks so the
+/// true length is not disclosed. A value of 4 characters or fewer is masked
+/// entirely.
+///
+/// Unlike [`mask_opaque`], this function reveals part of the input. It is
+/// therefore never the default: it runs only when the caller explicitly
+/// opted into [`PreviewMode::RevealPrefix`] for interactive review.
 pub fn mask(value: &str) -> String {
     let mut chars = value.chars();
     let first4: String = chars.by_ref().take(4).collect();
@@ -131,6 +159,26 @@ pub fn mask(value: &str) -> String {
     let mut out = first4;
     out.push_str(MASK_STARS);
     out
+}
+
+/// Mask a matched value completely: return only [`MASK_STARS`], never any byte
+/// of the input.
+///
+/// This is the default preview ([`PreviewMode::Opaque`]). A scan report is
+/// written to disk and handed to agents (ADR-0017), and that report is only
+/// safe to persist if it cannot carry secret material — not even a short
+/// prefix, which for many token formats identifies the credential type and
+/// shortens an offline guess.
+pub fn mask_opaque(_value: &str) -> String {
+    MASK_STARS.to_string()
+}
+
+/// Build a preview of a matched value according to `mode`.
+fn preview_with(mode: PreviewMode, value: &str) -> String {
+    match mode {
+        PreviewMode::Opaque => mask_opaque(value),
+        PreviewMode::RevealPrefix => mask(value),
+    }
 }
 
 /// Walk `root` and scan every readable text file for secrets and PII.
@@ -149,11 +197,13 @@ pub fn scan_project(root: &Path, config: &ScanConfig) -> Result<ScanReport, Scan
     let budget = sv_patterns::MatchBudget::default();
 
     let mut findings: Vec<ScanFinding> = Vec::new();
+    let mode = config.preview_mode;
+    let salt = config.fingerprint_salt;
     for file in &files {
-        let mut candidates = detect_secrets(&file.content, &file.path);
-        candidates.extend(detect_pii(&file.content, &file.path, &policy));
+        let mut candidates = detect_secrets(&file.content, &file.path, mode, salt);
+        candidates.extend(detect_pii(&file.content, &file.path, &policy, mode, salt));
         let (jurisdiction, truncated) =
-            detect_jurisdiction(&file.content, &file.path, &packs, &budget);
+            detect_jurisdiction(&file.content, &file.path, &packs, &budget, mode, salt);
         if truncated {
             // Budget exhaustion is incomplete coverage, not a clean file.
             coverage.record_skip(file.path.clone(), crate::SkipReason::BudgetExhausted);
@@ -191,7 +241,11 @@ pub fn scan_project(root: &Path, config: &ScanConfig) -> Result<ScanReport, Scan
     findings.sort_by(|a, b| a.path.cmp(&b.path).then(a.start.cmp(&b.start)));
     coverage.suppressed.sort_by_key(|s| s.reason);
 
-    Ok(ScanReport { findings, coverage })
+    Ok(ScanReport {
+        findings,
+        coverage,
+        config_salt: salt,
+    })
 }
 
 /// Load and validate every requested jurisdiction pack.
@@ -223,7 +277,14 @@ fn load_packs(ids: &[String]) -> Result<Vec<sv_patterns::ValidatedPack>, ScanErr
 /// rule's `exact_len`/`len_range`. All matching is on byte offsets along char
 /// boundaries: prefix bytes are ASCII, and the consumed body is ASCII, so the
 /// matched span is always a valid `&str` slice.
-fn scan_rule(content: &str, path: &Path, rule: &SecretRule, out: &mut Vec<ScanFinding>) {
+fn scan_rule(
+    content: &str,
+    path: &Path,
+    rule: &SecretRule,
+    mode: PreviewMode,
+    fingerprint_salt: [u8; 32],
+    out: &mut Vec<ScanFinding>,
+) {
     let Some(prefix) = rule.prefix else { return };
     let prefix = prefix.as_bytes();
     let bytes = content.as_bytes();
@@ -243,7 +304,11 @@ fn scan_rule(content: &str, path: &Path, rule: &SecretRule, out: &mut Vec<ScanFi
                 && content.is_char_boundary(end);
             if matched {
                 // Entropy may demote this token: it is a random-looking secret.
-                push_secret(out, content, path, rule, i, end, true);
+                if let Some(finding) =
+                    secret_finding(content, path, rule, mode, fingerprint_salt, i, end, true)
+                {
+                    out.push(finding);
+                }
                 // Skip past the consumed run; nested prefixes are re-examined on
                 // the rules that follow this one.
                 i = end.max(i + 1);
@@ -260,7 +325,14 @@ fn scan_rule(content: &str, path: &Path, rule: &SecretRule, out: &mut Vec<ScanFi
 /// `PRIVATE KEY-----`; the span covers the header line only, never the key
 /// body. Entropy demotion is disabled here: a header line is a fixed-format
 /// marker, not a random credential, so low entropy is expected, not suspicious.
-fn scan_pem(content: &str, path: &Path, rule: &SecretRule, out: &mut Vec<ScanFinding>) {
+fn scan_pem(
+    content: &str,
+    path: &Path,
+    rule: &SecretRule,
+    mode: PreviewMode,
+    fingerprint_salt: [u8; 32],
+    out: &mut Vec<ScanFinding>,
+) {
     const BEGIN: &[u8] = b"-----BEGIN";
     const HEADER_PREFIX: &str = "-----BEGIN ";
     const END_MARKER: &str = "PRIVATE KEY-----";
@@ -285,7 +357,11 @@ fn scan_pem(content: &str, path: &Path, rule: &SecretRule, out: &mut Vec<ScanFin
             if content.is_char_boundary(i) && content.is_char_boundary(tail) {
                 let line = &content[i..tail];
                 if line.starts_with(HEADER_PREFIX) && line.ends_with(END_MARKER) {
-                    push_secret(out, content, path, rule, i, tail, false);
+                    if let Some(finding) =
+                        secret_finding(content, path, rule, mode, fingerprint_salt, i, tail, false)
+                    {
+                        out.push(finding);
+                    }
                     i = line_end.max(i + 1);
                     continue;
                 }
@@ -308,22 +384,24 @@ fn length_valid(rule: &SecretRule, token_len: usize) -> bool {
 
 /// Build a [`ScanFinding`] for a secret match at `[start, end)`, applying the
 /// keyword-proximity promotion and (unless `entropy_check` is off) the
-/// low-entropy demotion, then append it to `out`.
+/// low-entropy demotion.
 ///
-/// No finding is emitted when the candidate sits inside an already-redacted
-/// `[REDACTED:…]`/`[SV:LOC:…]` marker on its line. The preview is `mask`
-/// applied to the matched value, never the value itself.
-fn push_secret(
-    out: &mut Vec<ScanFinding>,
+/// `None` when the candidate sits inside an already-redacted
+/// `[REDACTED:…]`/`[SV:LOC:…]` marker on its line. The preview is built
+/// according to `mode` — [`mask_opaque`] or [`mask`] — never the value itself.
+#[allow(clippy::too_many_arguments)]
+fn secret_finding(
     content: &str,
     path: &Path,
     rule: &SecretRule,
+    mode: PreviewMode,
+    fingerprint_salt: [u8; 32],
     start: usize,
     end: usize,
     entropy_check: bool,
-) {
+) -> Option<ScanFinding> {
     if is_inside_marker(content, start) {
-        return;
+        return None;
     }
     let value = &content[start..end];
     let mut confidence = rule.confidence;
@@ -333,7 +411,7 @@ fn push_secret(
     if entropy_check && shannon_entropy(value.as_bytes()) < ENTROPY_DEMOTE_THRESHOLD {
         confidence = demote(confidence);
     }
-    out.push(ScanFinding {
+    Some(ScanFinding {
         path: path.to_path_buf(),
         line: line_number(content, start),
         start,
@@ -342,8 +420,9 @@ fn push_secret(
             rule_id: rule.id.to_string(),
         },
         confidence,
-        preview: mask(value),
-    });
+        preview: preview_with(mode, value),
+        matched_fingerprint: matched_fingerprint(value, fingerprint_salt),
+    })
 }
 
 /// Resolve overlapping matches. Candidates are taken best-first (higher
@@ -479,5 +558,39 @@ fn pii_confidence(category: sv_privacy::PiiCategory) -> Confidence {
     match category {
         C::Cpf | C::Cnpj | C::CreditCard => Confidence::High,
         C::Email | C::Ipv4 | C::Phone | C::Ssn => Confidence::Medium,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_opaque_never_returns_any_byte_of_its_input() {
+        let input = "gho_abcd1234";
+        let out = mask_opaque(input);
+        assert_eq!(out, MASK_STARS);
+        for byte in input.bytes() {
+            assert!(
+                !out.as_bytes().contains(&byte),
+                "opaque mask leaked byte {byte:#04x} of its input"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_mode_defaults_to_opaque() {
+        assert_eq!(PreviewMode::default(), PreviewMode::Opaque);
+        assert_eq!(ScanConfig::default().preview_mode, PreviewMode::Opaque);
+    }
+
+    #[test]
+    fn preview_with_routes_each_mode_to_its_mask() {
+        let value = "gho_abcd1234";
+        assert_eq!(preview_with(PreviewMode::Opaque, value), MASK_STARS);
+        assert_eq!(
+            preview_with(PreviewMode::RevealPrefix, value),
+            "gho_********"
+        );
     }
 }

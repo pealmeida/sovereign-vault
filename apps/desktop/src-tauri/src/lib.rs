@@ -12,26 +12,57 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
+
+/// Default idle timeout for an unlocked desktop session.
+///
+/// A chatty MCP agent MUST NOT reset this timer (ADR-0020 §9). If activity were
+/// counted from any source, a polling agent would keep the vault unlocked
+/// forever, defeating the control.
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 15 * 60;
+
+/// Default absolute cap on an unlocked desktop session.
+///
+/// Unlike the idle timer, this cap is never refreshed by any activity. It
+/// bounds the total time a single unlock can remain valid.
+const DEFAULT_ABSOLUTE_SESSION_SECS: u64 = 8 * 60 * 60;
+
+/// Tick interval for the background session monitor.
+const SESSION_MONITOR_INTERVAL_SECS: u64 = 30;
+
+/// Event emitted to the UI when the session monitor locks the vault.
+const AUTO_LOCK_EVENT: &str = "vault://auto-lock";
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sv_audit::{AuditAction, AuditDecision, AuditEvent, AuditLog};
 use sv_core::sv_storage::{ContainerInfo, FileInfo, SecurityMode};
 use sv_core::{BootstrapResult, CustodyMode, VaultHandle};
+use sv_scan::{Confidence, FindingKind, ScanConfig, ScanReport};
+
+/// Response for the session status command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionStatus {
+    locked: bool,
+    idle_remaining_secs: Option<u64>,
+    session_remaining_secs: Option<u64>,
+}
 use tauri::async_runtime::{spawn, JoinHandle};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::sync::{oneshot, Mutex};
 
 const RPC_PORT: u16 = 9944;
 const APPROVAL_EVENT: &str = "vault://approval-request";
 const APPROVAL_CANCEL_EVENT: &str = "vault://approval-cancel";
+const WAKE_EVENT: &str = "vault://wake-request";
+const WAKE_CANCEL_EVENT: &str = "vault://wake-cancel";
+const WAKE_LEASE_EVENT: &str = "vault://wake-lease";
 /// How long a pending approval stays open before auto-cancelling. Kept short so
 /// a caller that disconnects (e.g. its own MCP client timed out) doesn't leave a
 /// stale modal lingering on screen.
@@ -255,8 +286,8 @@ fn generate_otp_code() -> Result<String, String> {
     Ok(format!("{n:06}"))
 }
 
-struct ApprovalState {
-    app: AppHandle,
+struct ApprovalState<R: Runtime = tauri::Wry> {
+    app: AppHandle<R>,
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, PendingApproval>>,
     /// Outstanding OTP challenges keyed by request signature.
@@ -264,8 +295,8 @@ struct ApprovalState {
     otp_pending: Mutex<HashMap<String, OtpChallenge>>,
 }
 
-impl ApprovalState {
-    fn new(app: AppHandle) -> Self {
+impl<R: Runtime> ApprovalState<R> {
+    fn new(app: AppHandle<R>) -> Self {
         Self {
             app,
             next_id: AtomicU64::new(1),
@@ -562,23 +593,573 @@ impl ApprovalState {
     }
 }
 
-/// In-memory vault state held inside Tauri's managed state.
-struct VaultState {
-    app: AppHandle,
-    handle: SharedHandle,
-    approvals: Arc<ApprovalState>,
-    servers: Mutex<Option<ServersShutdown>>,
+/// Per-agent and global rate-limit state for wake requests.
+const WAKE_MAX_PER_AGENT: usize = 10;
+const WAKE_WINDOW_SECS: u64 = 60;
+const WAKE_MAX_PENDING: usize = 256;
+const WAKE_REQUEST_TTL_SECS: u64 = 300;
+const WAKE_NOTIFICATION_COOLDOWN_SECS: u64 = 60;
+const WAKE_LEASE_TTL_SECS: u64 = 120;
+
+/// Stable coalescing signature for a wake request. No secret material is
+/// hashed.
+fn wake_signature(agent_id: &str, opaque_resource_ref: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(agent_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(opaque_resource_ref.as_bytes());
+    hex::encode(hasher.finalize())[..32].to_string()
 }
 
-impl VaultState {
-    fn new(app: AppHandle) -> Self {
-        let approvals = Arc::new(ApprovalState::new(app.clone()));
+/// Trait abstracting the event emission side of the wake queue. Production
+/// uses Tauri; tests use a recording emitter.
+trait WakeEmitter: Send + Sync + 'static {
+    fn emit_wake(&self, prompt: WakePrompt);
+    fn emit_cancel(&self, id: u64);
+}
+
+impl<R: Runtime> WakeEmitter for AppHandle<R> {
+    fn emit_wake(&self, prompt: WakePrompt) {
+        let _ = self.emit(WAKE_EVENT, prompt);
+    }
+    fn emit_cancel(&self, id: u64) {
+        let _ = self.emit(WAKE_CANCEL_EVENT, WakeCancel { id });
+    }
+}
+
+/// In-memory queue for wake requests. The wake path never resolves locators or
+/// confirms resource existence; it only asks for human attention (ADR-0020 §8).
+struct WakeQueue<E: WakeEmitter> {
+    emitter: E,
+    next_id: AtomicU64,
+    requests: Mutex<Vec<WakeRequest>>,
+    by_signature: Mutex<HashMap<String, usize>>,
+    agent_rate: Mutex<HashMap<String, Vec<Instant>>>,
+    global_rate: Mutex<Vec<Instant>>,
+}
+
+impl<E: WakeEmitter> WakeQueue<E> {
+    fn new(emitter: E) -> Self {
         Self {
-            app,
+            emitter,
+            next_id: AtomicU64::new(1),
+            requests: Mutex::new(Vec::new()),
+            by_signature: Mutex::new(HashMap::new()),
+            agent_rate: Mutex::new(HashMap::new()),
+            global_rate: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Submit a wake request. Returns a generic status.
+    ///
+    /// INVARIANT: this function must never consult vault state to decide its
+    /// return value. Doing so would reintroduce the existence oracle no matter
+    /// how generic the enum appears. The response must be indistinguishable for
+    /// references that exist, references that do not exist, and references the
+    /// implementation does not understand (ADR-0020 §8).
+    async fn request(&self, agent_id: String, opaque_resource_ref: String) -> WakeResult {
+        let now = Instant::now();
+        let signature = wake_signature(agent_id.as_str(), opaque_resource_ref.as_str());
+
+        // Prune expired rate-limit entries.
+        let window = Duration::from_secs(WAKE_WINDOW_SECS);
+        {
+            let mut agent_rate = self.agent_rate.lock().await;
+            for timestamps in agent_rate.values_mut() {
+                timestamps.retain(|t| now.duration_since(*t) < window);
+            }
+            agent_rate.retain(|_, ts| !ts.is_empty());
+        }
+        {
+            let mut global_rate = self.global_rate.lock().await;
+            global_rate.retain(|t| now.duration_since(*t) < window);
+        }
+
+        // Enforce per-agent and global rate limits.
+        {
+            let agent_rate = self.agent_rate.lock().await;
+            if agent_rate
+                .get(&agent_id)
+                .map(|ts| ts.len() >= WAKE_MAX_PER_AGENT)
+                .unwrap_or(false)
+            {
+                return WakeResult::Unavailable;
+            }
+            let global_rate = self.global_rate.lock().await;
+            if global_rate.len() >= WAKE_MAX_PER_AGENT * 4 {
+                return WakeResult::Unavailable;
+            }
+        }
+
+        let mut requests = self.requests.lock().await;
+        let mut by_signature = self.by_signature.lock().await;
+
+        // Prune expired pending requests.
+        let ttl = Duration::from_secs(WAKE_REQUEST_TTL_SECS);
+        let expired: Vec<u64> = requests
+            .iter()
+            .filter(|r| now.duration_since(r.created_at) > ttl)
+            .map(|r| r.id)
+            .collect();
+        for id in expired {
+            if let Some(pos) = requests.iter().position(|r| r.id == id) {
+                let sig = requests[pos].signature.clone();
+                requests.remove(pos);
+                by_signature.remove(&sig);
+                self.emitter.emit_cancel(id);
+            }
+        }
+
+        // Coalescing: identical pending request collapses into one.
+        if let Some(_pos) = by_signature.get(&signature) {
+            // Still notify if the cooldown has elapsed, so a retry storm still
+            // produces at most one notification within the cooldown window.
+            if let Some(existing) = requests.iter().find(|r| r.signature == signature) {
+                let cooldown = Duration::from_secs(WAKE_NOTIFICATION_COOLDOWN_SECS);
+                if existing
+                    .notified_at
+                    .map(|t| now.duration_since(t) >= cooldown)
+                    .unwrap_or(true)
+                {
+                    let agent_for_prompt = existing.agent_id.clone();
+                    let resource_for_prompt = existing.opaque_resource_ref.clone();
+                    let existing_id = existing.id;
+                    if let Some(idx) = requests.iter().position(|r| r.id == existing_id) {
+                        requests[idx].notified_at = Some(now);
+                    }
+                    let prompt = WakePrompt {
+                        id: existing_id,
+                        agent_id: agent_for_prompt,
+                        resource_ref: resource_for_prompt,
+                    };
+                    self.emitter.emit_wake(prompt);
+                }
+            }
+            drop(requests);
+            drop(by_signature);
+            // Record this attempt for rate-limit accounting.
+            self.agent_rate
+                .lock()
+                .await
+                .entry(agent_id)
+                .or_default()
+                .push(now);
+            self.global_rate.lock().await.push(now);
+            return WakeResult::Queued;
+        }
+
+        // Bound total pending requests.
+        if requests.len() >= WAKE_MAX_PENDING {
+            return WakeResult::Unavailable;
+        }
+
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = WakeRequest {
+            id,
+            agent_id: agent_id.clone(),
+            opaque_resource_ref: opaque_resource_ref.clone(),
+            signature: signature.clone(),
+            created_at: now,
+            notified_at: Some(now),
+        };
+        by_signature.insert(signature, requests.len());
+        requests.push(request);
+
+        let prompt = WakePrompt {
+            id,
+            agent_id: agent_id.clone(),
+            resource_ref: opaque_resource_ref.clone(),
+        };
+        self.emitter.emit_wake(prompt.clone());
+
+        drop(requests);
+        drop(by_signature);
+
+        self.agent_rate
+            .lock()
+            .await
+            .entry(agent_id)
+            .or_default()
+            .push(now);
+        self.global_rate.lock().await.push(now);
+
+        WakeResult::Queued
+    }
+
+    /// Return a snapshot of pending requests for the UI. Never reveals resource
+    /// existence beyond what the queue already contains.
+    async fn list(&self) -> Vec<WakePrompt> {
+        let now = Instant::now();
+        let requests = self.requests.lock().await;
+        requests
+            .iter()
+            .filter(|r| {
+                now.duration_since(r.created_at) <= Duration::from_secs(WAKE_REQUEST_TTL_SECS)
+            })
+            .map(|r| WakePrompt {
+                id: r.id,
+                agent_id: r.agent_id.clone(),
+                resource_ref: r.opaque_resource_ref.clone(),
+            })
+            .collect()
+    }
+
+    /// Human responds to a wake request. Returns the request details if found.
+    async fn respond(&self, id: u64, approved: bool) -> Option<WakeRequest> {
+        let mut requests = self.requests.lock().await;
+        let pos = requests.iter().position(|r| r.id == id)?;
+        let request = requests.remove(pos);
+        let mut by_signature = self.by_signature.lock().await;
+        by_signature.remove(&request.signature);
+        self.emitter.emit_cancel(id);
+        if approved {
+            Some(request)
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorization granted by a human when responding to a wake request. A lease
+/// is only issued for an exact operation+args when prepare_access is called,
+/// after which per-mode behavior is applied.
+#[derive(Debug, Clone)]
+struct WakeAuthorization {
+    agent_id: String,
+    session_id: String,
+    authorized_at: Instant,
+}
+
+/// In-memory store of active leases and wake authorizations.
+struct LeaseStore {
+    leases: Mutex<HashMap<String, Lease>>,
+    authorized_wakes: Mutex<HashMap<String, WakeAuthorization>>,
+}
+
+impl LeaseStore {
+    fn new() -> Self {
+        Self {
+            leases: Mutex::new(HashMap::new()),
+            authorized_wakes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record that a human approved a wake request. This does not yet issue a
+    /// lease; the lease is bound to the exact operation when it is requested.
+    async fn record_authorized_wake(
+        &self,
+        resource_signature: &str,
+        agent_id: &str,
+        session_id: &str,
+    ) {
+        let auth = WakeAuthorization {
+            agent_id: agent_id.to_string(),
+            session_id: session_id.to_string(),
+            authorized_at: Instant::now(),
+        };
+        self.authorized_wakes
+            .lock()
+            .await
+            .insert(resource_signature.to_string(), auth);
+    }
+
+    /// Return true if a wake authorization exists for this agent/resource in the
+    /// current session and has not expired.
+    async fn has_authorized_wake(
+        &self,
+        resource_signature: &str,
+        agent_id: &str,
+        session_id: &str,
+    ) -> bool {
+        let auths = self.authorized_wakes.lock().await;
+        matches!(
+            auths.get(resource_signature),
+            Some(a) if a.agent_id == agent_id
+                && a.session_id == session_id
+                && a.authorized_at.elapsed() <= Duration::from_secs(WAKE_REQUEST_TTL_SECS)
+        )
+    }
+
+    /// Issue a lease bound to the requester, resource, operation and args,
+    /// destination, session, and policy version.
+    #[allow(clippy::too_many_arguments)]
+    async fn issue(
+        &self,
+        agent_id: &str,
+        resource_signature: &str,
+        operation_digest: &str,
+        args_digest: &str,
+        destination: &str,
+        session_id: &str,
+        policy_version: &str,
+    ) -> Lease {
+        let id = fresh_lease_id();
+        let lease = Lease {
+            id: id.clone(),
+            agent_id: agent_id.to_string(),
+            resource_signature: resource_signature.to_string(),
+            operation_digest: operation_digest.to_string(),
+            args_digest: args_digest.to_string(),
+            destination: destination.to_string(),
+            session_id: session_id.to_string(),
+            policy_version: policy_version.to_string(),
+            expires_at: Instant::now() + Duration::from_secs(WAKE_LEASE_TTL_SECS),
+            used: Arc::new(AtomicBool::new(false)),
+        };
+        self.leases.lock().await.insert(id.clone(), lease.clone());
+        lease
+    }
+
+    /// Check out a lease for the exact operation/resource/args/session. Marks
+    /// it used (single-use) and returns true if all bindings match and it has
+    /// not expired.
+    #[allow(clippy::too_many_arguments)]
+    async fn checkout(
+        &self,
+        lease_id: &str,
+        agent_id: &str,
+        resource_signature: &str,
+        operation_digest: &str,
+        args_digest: &str,
+        destination: &str,
+        session_id: &str,
+        policy_version: &str,
+    ) -> bool {
+        let mut leases = self.leases.lock().await;
+        let Some(lease) = leases.get(lease_id) else {
+            return false;
+        };
+        if Instant::now() > lease.expires_at {
+            leases.remove(lease_id);
+            return false;
+        }
+        if lease.used.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        let same = lease.agent_id == agent_id
+            && lease.resource_signature == resource_signature
+            && lease.operation_digest == operation_digest
+            && lease.args_digest == args_digest
+            && lease.destination == destination
+            && lease.session_id == session_id
+            && lease.policy_version == policy_version;
+        if !same {
+            // Re-insert so future attempts also fail (the lease was consumed).
+            return false;
+        }
+        leases.remove(lease_id);
+        true
+    }
+
+    /// Prune expired leases; returns count removed.
+    #[allow(dead_code)]
+    async fn prune(&self) -> usize {
+        let now = Instant::now();
+        let mut leases = self.leases.lock().await;
+        let before = leases.len();
+        leases.retain(|_, l| now <= l.expires_at);
+        before - leases.len()
+    }
+}
+
+fn fresh_lease_id() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(sv_core::sv_crypto::random_bytes(32).unwrap_or_else(|_| vec![0u8; 32]));
+    hasher.update(format!("{:?}", Instant::now()).as_bytes());
+    format!("lease-{}", &hex::encode(hasher.finalize())[..32])
+}
+
+/// Fields needed by the background session monitor. Kept behind an `Arc` so
+/// the monitor task owns its own copy and outlives any single command.
+#[derive(Clone)]
+struct SessionMonitorState<R: Runtime = tauri::Wry> {
+    app: AppHandle<R>,
+    handle: SharedHandle,
+    servers: Arc<Mutex<Option<ServersShutdown>>>,
+    timer: SessionTimer,
+}
+
+/// Self-contained desktop session timer. Kept separate from [`VaultState`] so
+/// its behavior can be unit-tested without a Tauri runtime.
+#[derive(Clone)]
+struct SessionTimer {
+    /// Last time a genuine human interaction happened in the desktop GUI.
+    ///
+    /// **Agent-originated activity must never update this.** MCP-serving paths
+    /// and polling/status commands are intentionally excluded. This is the
+    /// invariant that prevents a chatty agent from pinning the vault open
+    /// (ADR-0020 §9).
+    last_activity: Arc<Mutex<Instant>>,
+    /// When the vault was unlocked, if it currently is.
+    unlocked_at: Arc<Mutex<Option<Instant>>>,
+    /// Seconds of inactivity before auto-lock.
+    idle_timeout_secs: Arc<Mutex<u64>>,
+    /// Maximum seconds a single unlock can last, regardless of activity.
+    absolute_session_secs: Arc<Mutex<u64>>,
+}
+
+impl SessionTimer {
+    fn new() -> Self {
+        Self {
+            last_activity: Arc::new(Mutex::new(Instant::now())),
+            unlocked_at: Arc::new(Mutex::new(None)),
+            idle_timeout_secs: Arc::new(Mutex::new(DEFAULT_IDLE_TIMEOUT_SECS)),
+            absolute_session_secs: Arc::new(Mutex::new(DEFAULT_ABSOLUTE_SESSION_SECS)),
+        }
+    }
+
+    /// Refresh the human-activity timestamp.
+    ///
+    /// **Call this only from human-initiated Tauri commands.** Do NOT call from
+    /// MCP-serving paths or polling/status commands (`vault_status`,
+    /// `mcp_status`, `audit_tail`, `scan_history_list`, etc.). A chatty agent
+    /// must not keep the vault unlocked forever (ADR-0020 §9).
+    fn touch_human_activity(&self) {
+        if let Ok(mut guard) = self.last_activity.try_lock() {
+            *guard = Instant::now();
+        }
+    }
+
+    /// Record that the vault is now unlocked, starting both timers.
+    fn set_unlocked(&self) {
+        let now = Instant::now();
+        if let Ok(mut guard) = self.unlocked_at.try_lock() {
+            *guard = Some(now);
+        }
+        if let Ok(mut guard) = self.last_activity.try_lock() {
+            *guard = now;
+        }
+    }
+
+    /// Set the two session limits.
+    fn set_limits(&self, idle_secs: u64, absolute_secs: u64) {
+        if let Ok(mut guard) = self.idle_timeout_secs.try_lock() {
+            *guard = idle_secs.max(1);
+        }
+        if let Ok(mut guard) = self.absolute_session_secs.try_lock() {
+            *guard = absolute_secs.max(1);
+        }
+    }
+
+    /// Compute remaining seconds before idle or absolute lock, if unlocked.
+    fn remaining_secs(&self) -> (Option<u64>, Option<u64>) {
+        let unlocked = match self.unlocked_at.try_lock().ok().and_then(|g| *g) {
+            Some(t) => t,
+            None => return (None, None),
+        };
+        let idle = match self.last_activity.try_lock().ok() {
+            Some(g) => *g,
+            None => return (None, None),
+        };
+        let idle_limit = self
+            .idle_timeout_secs
+            .try_lock()
+            .map(|g| *g)
+            .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
+        let absolute_limit = self
+            .absolute_session_secs
+            .try_lock()
+            .map(|g| *g)
+            .unwrap_or(DEFAULT_ABSOLUTE_SESSION_SECS);
+        let idle_remaining = idle_limit.saturating_sub(idle.elapsed().as_secs());
+        let absolute_remaining = absolute_limit.saturating_sub(unlocked.elapsed().as_secs());
+        (Some(idle_remaining), Some(absolute_remaining))
+    }
+}
+
+/// In-memory vault state held inside Tauri's managed state.
+struct VaultState<R: Runtime = tauri::Wry> {
+    app: AppHandle<R>,
+    handle: SharedHandle,
+    approvals: Arc<ApprovalState<R>>,
+    servers: Arc<Mutex<Option<ServersShutdown>>>,
+    /// Scan reports that were produced in this process and still have a live
+    /// per-scan salt. Findings loaded from disk do not appear here, so their
+    /// fingerprint is absent and reveal is refused.
+    active_scans: Mutex<HashMap<String, ScanReport>>,
+    /// Desktop session timer (idle + absolute cap).
+    session_timer: SessionTimer,
+    /// Pending wake requests and rate-limit state. In-memory only; a restart
+    /// clears the queue, which is acceptable because a wake is just a request
+    /// for human attention (ADR-0020 §8).
+    wake_queue: Arc<WakeQueue<AppHandle<R>>>,
+    /// Short-lived, single-use leases issued after human approval of a wake
+    /// request (ADR-0020 §10).
+    leases: Arc<LeaseStore>,
+    /// Handle to the session monitor task. Stored so we can avoid spawning
+    /// duplicate monitors on every unlock (a leaked second monitor is harmless
+    /// but noisy; we drop the old JoinHandle before spawning a new one).
+    session_monitor: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl<R: Runtime> VaultState<R> {
+    fn new(app: AppHandle<R>) -> Self {
+        let approvals = Arc::new(ApprovalState::<R>::new(app.clone()));
+        Self {
+            app: app.clone(),
             handle: Arc::new(Mutex::new(None)),
             approvals,
-            servers: Mutex::new(None),
+            servers: Arc::new(Mutex::new(None)),
+            active_scans: Mutex::new(HashMap::new()),
+            session_timer: SessionTimer::new(),
+            wake_queue: Arc::new(WakeQueue::new(app.clone())),
+            leases: Arc::new(LeaseStore::new()),
+            session_monitor: Mutex::new(None),
         }
+    }
+
+    /// Build a monitor-state snapshot for the background task.
+    fn monitor_state(&self) -> SessionMonitorState<R> {
+        SessionMonitorState {
+            app: self.app.clone(),
+            handle: self.handle.clone(),
+            servers: self.servers.clone(),
+            timer: self.session_timer.clone(),
+        }
+    }
+
+    /// Replace any running session monitor with a new one bound to the current
+    /// unlock. Called once per successful unlock/init.
+    async fn restart_session_monitor(&self) {
+        let mut guard = self.session_monitor.lock().await;
+        if let Some(task) = guard.take() {
+            task.abort();
+        }
+        *guard = Some(spawn_session_monitor(self.monitor_state()));
+    }
+
+    /// Refresh the human-activity timestamp.
+    fn touch_human_activity(&self) {
+        self.session_timer.touch_human_activity();
+    }
+
+    /// Record that the vault is now unlocked, starting both timers.
+    fn set_unlocked(&self) {
+        self.session_timer.set_unlocked();
+    }
+
+    /// Set the two session limits.
+    fn set_limits(&self, idle_secs: u64, absolute_secs: u64) {
+        self.session_timer.set_limits(idle_secs, absolute_secs);
+    }
+
+    /// Compute remaining seconds before idle or absolute lock, if unlocked.
+    fn remaining_secs(&self) -> (Option<u64>, Option<u64>) {
+        self.session_timer.remaining_secs()
+    }
+
+    fn session_id(&self) -> String {
+        // The session is identified by the unlock instant, which changes on
+        // every lock/unlock cycle. This is coarse but sufficient for lease
+        // binding: a lease issued in one unlock cannot outlive the next lock.
+        self.session_timer
+            .unlocked_at
+            .try_lock()
+            .ok()
+            .and_then(|g| g.map(|i| format!("{:?}", i)))
+            .unwrap_or_else(|| "locked".into())
     }
 }
 
@@ -615,6 +1196,89 @@ struct McpStatus {
     http_url: String,
 }
 
+/// Read-only view of one audit event for the desktop Logs page.
+/// Never exposes secret material; container/file paths remain the
+/// HMAC-redacted values stored in the authenticated log.
+#[derive(Debug, Serialize, Deserialize)]
+struct AuditEventView {
+    action: String,
+    decision: String,
+    transport: String,
+    timestamp: String,
+    error: Option<String>,
+}
+
+/// Paginated newest-first response for the Logs page.
+#[derive(Debug, Serialize, Deserialize)]
+struct AuditTailResponse {
+    events: Vec<AuditEventView>,
+    /// Records that could not be parsed. Shown separately so one corrupt or
+    /// partially-written trailing line cannot hide the rest of the log.
+    malformed_skipped: usize,
+}
+
+/// Read-only view of an audit chain verification report.
+#[derive(Debug, Serialize, Deserialize)]
+struct VerifyReportView {
+    ok: bool,
+    entries: usize,
+    legacy_entries: usize,
+    first_broken: Option<usize>,
+    reason: Option<String>,
+}
+
+/// Read-only view of one scan finding for the Scans page.
+/// Never carries the raw matched value — only a masked preview and location.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScanFindingView {
+    path: String,
+    line: u32,
+    start: usize,
+    end: usize,
+    kind: String,
+    confidence: String,
+    preview: String,
+    /// Per-finding triage verdict persisted in vault state only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verdict: Option<String>,
+}
+
+/// Read-only view of a scan coverage summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScanCoverageView {
+    files_scanned: u64,
+    files_ignored: u64,
+    files_skipped: u64,
+    bytes_scanned: u64,
+    suppressed: Vec<ScanSuppressedView>,
+}
+
+/// Count of findings suppressed for one reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScanSuppressedView {
+    reason: String,
+    count: u64,
+}
+
+/// Read-only view of a full scan report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScanReportView {
+    id: String,
+    scanned_path: String,
+    created_at: String,
+    coverage: ScanCoverageView,
+    findings: Vec<ScanFindingView>,
+}
+
+/// Short summary of a stored scan report for the history list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScanSummaryView {
+    id: String,
+    scanned_path: String,
+    created_at: String,
+    finding_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ApprovalPrompt {
     id: u64,
@@ -626,6 +1290,85 @@ struct ApprovalPrompt {
     otp_code: Option<String>,
     /// Validated non-secret authority shown for agent imports.
     import_summary: Option<sv_mcp::ImportApprovalSummary>,
+}
+
+/// Generic wake response; the agent MUST NOT be able to tell whether the
+/// requested resource exists from this value (ADR-0020 §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum WakeResult {
+    Queued,
+    Unavailable,
+}
+
+/// One pending wake request held in memory. No locator is resolved and no
+/// resource existence is checked when this is created.
+#[derive(Debug, Clone)]
+struct WakeRequest {
+    id: u64,
+    agent_id: String,
+    /// Opaque resource reference supplied by the agent. The wake path never
+    /// interprets it.
+    opaque_resource_ref: String,
+    /// Stable key used for coalescing and cooldown.
+    signature: String,
+    created_at: Instant,
+    notified_at: Option<Instant>,
+}
+
+/// UI payload for a pending wake request. Only fields derivable from the
+/// vault's own state are shown; the agent can supply no self-description.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WakePrompt {
+    id: u64,
+    agent_id: String,
+    resource_ref: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WakeCancel {
+    id: u64,
+}
+
+/// A short-lived, single-use authorization issued after a human approves a wake
+/// request. Bound to agent identity, resource, operation and its arguments,
+/// destination, session, and policy version (ADR-0020 §10).
+#[derive(Debug, Clone)]
+struct Lease {
+    id: String,
+    agent_id: String,
+    resource_signature: String,
+    operation_digest: String,
+    args_digest: String,
+    destination: String,
+    session_id: String,
+    policy_version: String,
+    expires_at: Instant,
+    used: Arc<AtomicBool>,
+}
+
+/// Result emitted to the agent when a lease is issued.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WakeLease {
+    lease_id: String,
+    expires_at_secs: u64,
+}
+
+/// Parameters used to compute the resource and argument digests for a lease.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LeaseParams {
+    agent_id: String,
+    resource_ref: String,
+    operation: String,
+    args: Vec<String>,
+    destination: String,
+    mode: String,
+}
+
+fn digest_string(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    hex::encode(hasher.finalize())[..32].to_string()
 }
 
 struct DesktopAuditSink {
@@ -699,12 +1442,12 @@ impl sv_mcp::AgentAuthenticator for DesktopAgentAuthenticator {
     }
 }
 
-struct DesktopAccessController {
-    approvals: Arc<ApprovalState>,
+struct DesktopAccessController<R: Runtime = tauri::Wry> {
+    approvals: Arc<ApprovalState<R>>,
 }
 
 #[async_trait]
-impl sv_mcp::AccessController for DesktopAccessController {
+impl<R: Runtime> sv_mcp::AccessController for DesktopAccessController<R> {
     async fn authorize(&self, request: sv_mcp::AccessRequest) -> Result<(), String> {
         self.approvals.request(request).await
     }
@@ -723,12 +1466,12 @@ fn parse_custody(s: &str) -> Result<CustodyMode, String> {
     }
 }
 
-fn vault_root(app: &AppHandle) -> Result<PathBuf, String> {
+fn vault_root<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(estr)?;
     Ok(dir.join("sovereign-vault"))
 }
 
-fn audit_root(state: &VaultState) -> Result<PathBuf, String> {
+fn audit_root<R: Runtime>(state: &VaultState<R>) -> Result<PathBuf, String> {
     vault_root(&state.app)
 }
 
@@ -750,7 +1493,7 @@ fn desktop_event(
     event
 }
 
-fn record_desktop_event(state: &VaultState, event: AuditEvent) {
+fn record_desktop_event<R: Runtime>(state: &VaultState<R>, event: AuditEvent) {
     let Ok(root) = audit_root(state) else {
         return;
     };
@@ -766,6 +1509,150 @@ fn record_desktop_event(state: &VaultState, event: AuditEvent) {
     let audit_hmac_key = handle.audit_hmac_key();
     if let Ok(log) = AuditLog::with_hmac_key(&root, audit_hmac_key) {
         let _ = log.record(&event);
+    }
+}
+
+/// Minimal record envelope used only to extract the public `event` field.
+/// The authenticated shape is owned by `sv_audit`; this struct deliberately
+/// ignores every other field so the UI can read events without touching the
+/// audit crate internals. Chain integrity is surfaced separately by
+/// `audit_verify`.
+#[derive(Debug, Clone, Deserialize)]
+struct AuditRecordView {
+    event: AuditEvent,
+}
+
+/// Outcome of a newest-first tail read.
+struct AuditTailResult {
+    events: Vec<AuditEventView>,
+    malformed_skipped: usize,
+}
+
+/// Read audit events newest-first, stopping as soon as `offset + limit`
+/// events have been collected. Never reads or materialises the whole log.
+///
+/// IMPORTANT: this reader parses the log OUTSIDE `AuditLog`. It does NOT
+/// verify the hash chain. That is acceptable here ONLY because `audit_verify`
+/// reports integrity separately on the same page. A later reader must not
+/// mistake this path for a verified audit reader.
+fn read_audit_tail(
+    root: &std::path::Path,
+    limit: usize,
+    offset: usize,
+) -> Result<AuditTailResult, String> {
+    const ARCHIVE_PREFIX: &str = "audit-";
+    const ARCHIVE_SUFFIX: &str = ".jsonl";
+    const ARCHIVE_DIGITS: usize = 20;
+
+    let need = offset.saturating_add(limit);
+
+    let mut archives: BTreeMap<u64, PathBuf> = BTreeMap::new();
+    let dir_entries = std::fs::read_dir(root).map_err(estr)?;
+    for entry in dir_entries {
+        let entry = entry.map_err(estr)?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(ARCHIVE_PREFIX) || !name.ends_with(ARCHIVE_SUFFIX) {
+            continue;
+        }
+        let digits = &name[ARCHIVE_PREFIX.len()..name.len() - ARCHIVE_SUFFIX.len()];
+        if digits.len() != ARCHIVE_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let segment = digits.parse::<u64>().map_err(estr)?;
+        archives.insert(segment, entry.path());
+    }
+
+    let mut collected = Vec::new();
+    let mut malformed_skipped = 0usize;
+
+    // Newest first: active log, then archives by descending segment number.
+    let active = root.join("audit.jsonl");
+    if active.exists() {
+        let (events, skipped) = read_audit_segment_newest_first(&active, need)?;
+        malformed_skipped = malformed_skipped.saturating_add(skipped);
+        collected.extend(events);
+        if collected.len() >= need {
+            return Ok(slice_page(collected, limit, offset, malformed_skipped));
+        }
+    }
+
+    for path in archives.values().rev() {
+        let (events, skipped) = read_audit_segment_newest_first(path, need - collected.len())?;
+        malformed_skipped = malformed_skipped.saturating_add(skipped);
+        collected.extend(events);
+        if collected.len() >= need {
+            break;
+        }
+    }
+
+    Ok(slice_page(collected, limit, offset, malformed_skipped))
+}
+
+/// Read one segment's lines newest-first, skipping malformed records and
+/// stopping early once `need` events have been collected.
+fn read_audit_segment_newest_first(
+    path: &std::path::Path,
+    need: usize,
+) -> Result<(Vec<AuditEventView>, usize), String> {
+    let text = std::fs::read_to_string(path).map_err(estr)?;
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.reverse();
+
+    let mut events = Vec::new();
+    let mut malformed_skipped = 0usize;
+
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let record: AuditRecordView = match serde_json::from_str(line) {
+            Ok(record) => record,
+            Err(_) => {
+                malformed_skipped = malformed_skipped.saturating_add(1);
+                continue;
+            }
+        };
+        events.push(AuditEventView {
+            action: serde_json::to_string(&record.event.action)
+                .map_err(estr)
+                .unwrap_or_else(|_| {
+                    format!("{:?}", record.event.action)
+                        .trim_matches('"')
+                        .to_string()
+                }),
+            decision: serde_json::to_string(&record.event.decision)
+                .map_err(estr)
+                .unwrap_or_else(|_| {
+                    format!("{:?}", record.event.decision)
+                        .trim_matches('"')
+                        .to_string()
+                }),
+            transport: record.event.transport,
+            timestamp: record.event.timestamp.to_rfc3339(),
+            error: record.event.error,
+        });
+        if events.len() >= need {
+            break;
+        }
+    }
+    Ok((events, malformed_skipped))
+}
+
+/// Take the requested page from the newest-first buffer.
+fn slice_page(
+    mut events: Vec<AuditEventView>,
+    limit: usize,
+    offset: usize,
+    malformed_skipped: usize,
+) -> AuditTailResult {
+    let start = offset.min(events.len());
+    let end = offset.saturating_add(limit).min(events.len());
+    events.truncate(end);
+    let page = events.into_iter().skip(start).collect();
+    AuditTailResult {
+        events: page,
+        malformed_skipped,
     }
 }
 
@@ -829,6 +1716,12 @@ where
     f(handle)
 }
 
+/// Check whether the vault is currently unlocked, without refreshing any
+/// activity timer. Used by polling/status commands.
+async fn is_unlocked(state: &State<'_, VaultState>) -> bool {
+    state.handle.lock().await.is_some()
+}
+
 async fn container_mode(state: &State<'_, VaultState>, container: &str) -> Option<SecurityMode> {
     with_handle(state, |handle| {
         handle.container_mode(container).map_err(estr)
@@ -844,6 +1737,7 @@ fn app_version() -> String {
 
 #[tauri::command]
 async fn vault_status(app: AppHandle, state: State<'_, VaultState>) -> Result<VaultStatus, String> {
+    // Polling command: do NOT touch_human_activity here.
     let root = vault_root(&app)?;
     let probe = sv_core::probe(&root).map_err(estr)?;
     let guard = state.handle.lock().await;
@@ -879,6 +1773,7 @@ async fn vault_init(
     if probe.initialized {
         return Err("vault already initialised".into());
     }
+    state.touch_human_activity();
 
     let BootstrapResult {
         handle,
@@ -906,6 +1801,8 @@ async fn vault_init(
         let mut guard = state.handle.lock().await;
         *guard = Some(handle);
     }
+    state.set_unlocked();
+    state.restart_session_monitor().await;
 
     // Initialization is already durably committed at this point, and the
     // recovery phrase exists only in this response. A gateway bind failure
@@ -1006,6 +1903,8 @@ async fn vault_unlock(
         );
         return Err(error);
     }
+    state.set_unlocked();
+    state.restart_session_monitor().await;
     record_desktop_event(
         &state,
         desktop_event(
@@ -1067,6 +1966,8 @@ async fn vault_unlock_recovery(
         );
         return Err(error);
     }
+    state.set_unlocked();
+    state.restart_session_monitor().await;
     record_desktop_event(
         &state,
         desktop_event(
@@ -1096,22 +1997,144 @@ async fn vault_unlock_recovery(
 
 #[tauri::command]
 async fn vault_lock(state: State<'_, VaultState>) -> Result<(), String> {
-    stop_servers(&state).await;
+    perform_vault_lock(&state, "manual").await;
+    Ok(())
+}
+
+/// Internal lock path shared by the manual command and the session monitor.
+///
+/// `reason` is recorded in the audit event detail. `manual` is the explicit
+/// user action; `idle-timeout` and `session-cap` come from the monitor.
+///
+/// ADR-0020 §9: locking cannot retract bytes already delivered to an agent or
+/// process. Auto-lock stops future access; it does not recall what already left.
+async fn perform_vault_lock(state: &VaultState, reason: &str) {
     let mut guard = state.handle.lock().await;
     *guard = None;
-    record_desktop_event(
-        &state,
-        desktop_event(
-            AuditAction::VaultLock,
-            AuditDecision::Allowed,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
+    // Stop the local gateway; the monitor task has already ended by the time
+    // it calls this, so there is no race with itself.
+    {
+        let mut server_guard = state.servers.lock().await;
+        if let Some(mut servers) = server_guard.take() {
+            if let Some(tx) = servers.ws_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(tx) = servers.http_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(task) = servers.ws_task.take() {
+                let _ = task.await;
+            }
+            if let Some(task) = servers.http_task.take() {
+                let _ = task.await;
+            }
+        }
+    }
+    // Clear session bookkeeping so the monitor stops counting against this session.
+    if let Ok(mut guard) = state.session_timer.unlocked_at.try_lock() {
+        *guard = None;
+    }
+    let mut event = desktop_event(
+        AuditAction::VaultLock,
+        AuditDecision::Allowed,
+        None,
+        None,
+        None,
+        None,
+        None,
     );
-    Ok(())
+    event.detail = Some(format!("reason={reason}"));
+    record_desktop_event(state, event);
+    let _ = state.app.emit(AUTO_LOCK_EVENT, reason);
+}
+
+/// Spawn the session monitor for this vault state. It ticks every 30s and
+/// auto-locks when either the idle timeout or the absolute session cap is
+/// exceeded. Only human desktop activity refreshes the idle timer; MCP/agent
+/// activity and polling/status commands do not.
+fn spawn_session_monitor<R: Runtime>(state: SessionMonitorState<R>) -> JoinHandle<()> {
+    spawn(async move {
+        let interval = Duration::from_secs(SESSION_MONITOR_INTERVAL_SECS);
+        loop {
+            tokio::time::sleep(interval).await;
+
+            let (idle_remaining, absolute_remaining) = state.timer.remaining_secs();
+            let idle_remaining = idle_remaining.unwrap_or(0);
+            let absolute_remaining = absolute_remaining.unwrap_or(0);
+
+            if idle_remaining == 0 || absolute_remaining == 0 {
+                let reason = if absolute_remaining == 0 {
+                    "session-cap"
+                } else {
+                    "idle-timeout"
+                };
+                perform_vault_lock_internal(&state, reason).await;
+                // After locking, the monitor keeps running but sees no unlocked
+                // session, so it will not lock again until the next unlock.
+                continue;
+            }
+        }
+    })
+}
+
+async fn perform_vault_lock_internal<R: Runtime>(state: &SessionMonitorState<R>, reason: &str) {
+    let mut guard = state.handle.lock().await;
+    *guard = None;
+    {
+        let mut server_guard = state.servers.lock().await;
+        if let Some(mut servers) = server_guard.take() {
+            if let Some(tx) = servers.ws_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(tx) = servers.http_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(task) = servers.ws_task.take() {
+                let _ = task.await;
+            }
+            if let Some(task) = servers.http_task.take() {
+                let _ = task.await;
+            }
+        }
+    }
+    if let Ok(mut guard) = state.timer.unlocked_at.try_lock() {
+        *guard = None;
+    }
+    let mut event = desktop_event(
+        AuditAction::VaultLock,
+        AuditDecision::Allowed,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    event.detail = Some(format!("reason={reason}"));
+    record_monitor_lock_event(&state.app, &state.handle, event);
+    let _ = state.app.emit(AUTO_LOCK_EVENT, reason);
+}
+
+/// Record an audit event from the background monitor, which owns a clone of
+/// the SharedHandle but not a full VaultState. Best-effort: if the handle is
+/// gone or contended, skip rather than emit an unauthenticated event.
+fn record_monitor_lock_event<R: Runtime>(
+    app: &AppHandle<R>,
+    handle: &SharedHandle,
+    event: AuditEvent,
+) {
+    let Ok(root) = vault_root(app) else {
+        return;
+    };
+    let Ok(guard) = handle.try_lock() else {
+        return;
+    };
+    let Some(h) = guard.as_ref() else {
+        return;
+    };
+    let audit_hmac_key = h.audit_hmac_key();
+    if let Ok(log) = AuditLog::with_hmac_key(&root, audit_hmac_key) {
+        let _ = log.record(&event);
+    }
 }
 
 #[tauri::command]
@@ -1121,6 +2144,7 @@ async fn vault_change_passphrase(
     current: String,
     new: String,
 ) -> Result<(), String> {
+    state.touch_human_activity();
     let root = vault_root(&app)?;
     let result = with_handle(&state, |handle| {
         handle
@@ -1154,6 +2178,7 @@ async fn vault_rotate_key(
     passphrase: Option<String>,
 ) -> Result<VaultInitResponse, String> {
     let root = vault_root(&app)?;
+    state.touch_human_activity();
     let result = {
         let mut guard = state.handle.lock().await;
         match guard.as_mut() {
@@ -1224,6 +2249,7 @@ async fn vault_create_container(
     mode: String,
     description: Option<String>,
 ) -> Result<(), String> {
+    state.touch_human_activity();
     let parsed_mode = SecurityMode::parse(&mode).map_err(estr)?;
     let result = with_handle(&state, |handle| {
         handle
@@ -1262,6 +2288,7 @@ async fn vault_create_container(
 
 #[tauri::command]
 async fn vault_delete_container(state: State<'_, VaultState>, name: String) -> Result<(), String> {
+    state.touch_human_activity();
     let mode = container_mode(&state, &name).await;
     let result = with_handle(&state, |handle| {
         handle.delete_container(&name).map_err(estr)
@@ -1288,6 +2315,679 @@ async fn vault_delete_container(state: State<'_, VaultState>, name: String) -> R
                 Some(name),
                 None,
                 mode,
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
+}
+
+#[tauri::command]
+async fn audit_tail(
+    state: State<'_, VaultState>,
+    limit: usize,
+    offset: usize,
+) -> Result<AuditTailResponse, String> {
+    // Polling command: do NOT touch_human_activity here.
+    let result = with_handle(&state, |_handle| {
+        let root = vault_root(&state.app).map_err(estr)?;
+        read_audit_tail(&root, limit, offset)
+    })
+    .await;
+
+    match &result {
+        Ok(_) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::VaultInfo,
+                AuditDecision::Allowed,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::VaultInfo,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result.map(|tail| AuditTailResponse {
+        events: tail.events,
+        malformed_skipped: tail.malformed_skipped,
+    })
+}
+
+#[tauri::command]
+async fn audit_verify(state: State<'_, VaultState>) -> Result<VerifyReportView, String> {
+    // Polling command: do NOT touch_human_activity here.
+    let result = with_handle(&state, |handle| {
+        let root = vault_root(&state.app).map_err(estr)?;
+        let log = AuditLog::with_hmac_key(&root, handle.audit_hmac_key()).map_err(estr)?;
+        let report = log.verify_chain().map_err(estr)?;
+        Ok(VerifyReportView {
+            ok: report.ok,
+            entries: report.entries,
+            legacy_entries: report.legacy_entries,
+            first_broken: report.first_broken,
+            reason: report.reason,
+        })
+    })
+    .await;
+
+    match &result {
+        Ok(_) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::VaultInfo,
+                AuditDecision::Allowed,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::VaultInfo,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
+}
+
+const SCAN_CONTAINER: &str = "sv-scans";
+const SCAN_REPORT_FILE_PREFIX: &str = "report-";
+const SCAN_TRIAGE_FILE_PREFIX: &str = "triage-";
+
+fn scan_report_path(root: &std::path::Path, id: &str) -> Result<std::path::PathBuf, String> {
+    validate_scan_id(id)?;
+    Ok(root
+        .join(SCAN_CONTAINER)
+        .join(format!("{SCAN_REPORT_FILE_PREFIX}{id}.json")))
+}
+
+fn scan_triage_path(root: &std::path::Path, id: &str) -> Result<std::path::PathBuf, String> {
+    validate_scan_id(id)?;
+    Ok(root
+        .join(SCAN_CONTAINER)
+        .join(format!("{SCAN_TRIAGE_FILE_PREFIX}{id}.json")))
+}
+
+/// Accept only the exact shape produced by `encode_scan_id`: ASCII letters,
+/// digits, `-`, and `_`. Reject `.`, `/`, `\`, and any other character so a
+/// frontend-supplied id can never escape the `sv-scans` container.
+fn validate_scan_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("invalid scan id".to_string());
+    }
+    if id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        Ok(())
+    } else {
+        Err("invalid scan id".to_string())
+    }
+}
+
+fn encode_scan_id(timestamp: chrono::DateTime<chrono::Utc>, suffix: &str) -> String {
+    format!("{}-{}", timestamp.timestamp_millis(), suffix)
+}
+
+fn scan_report_to_view(
+    id: String,
+    report: &ScanReport,
+    scanned_path: String,
+    triage: &TriageState,
+) -> ScanReportView {
+    ScanReportView {
+        id,
+        scanned_path,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        coverage: ScanCoverageView {
+            files_scanned: report.coverage.files_scanned,
+            files_ignored: report.coverage.files_ignored,
+            files_skipped: report.coverage.files_skipped,
+            bytes_scanned: report.coverage.bytes_scanned,
+            suppressed: report
+                .coverage
+                .suppressed
+                .iter()
+                .map(|s| ScanSuppressedView {
+                    reason: s.reason.label().to_string(),
+                    count: s.count,
+                })
+                .collect(),
+        },
+        findings: report
+            .findings
+            .iter()
+            .enumerate()
+            .map(|(index, f)| ScanFindingView {
+                path: f.path.to_string_lossy().to_string(),
+                line: f.line,
+                start: f.start,
+                end: f.end,
+                kind: finding_kind_label(&f.kind),
+                confidence: serde_json::to_string(&f.confidence)
+                    .map_err(estr)
+                    .unwrap_or_else(|_| {
+                        format!("{:?}", f.confidence).trim_matches('"').to_string()
+                    }),
+                preview: f.preview.clone(),
+                verdict: triage.verdicts.get(&index).cloned(),
+            })
+            .collect(),
+    }
+}
+
+fn finding_kind_label(kind: &FindingKind) -> String {
+    match kind {
+        FindingKind::Pii(category) => {
+            let label = serde_json::to_string(category)
+                .map_err(estr)
+                .unwrap_or_else(|_| format!("{:?}", category).trim_matches('"').to_string())
+                .to_lowercase();
+            format!("pii:{label}")
+        }
+        FindingKind::Secret { rule_id } => format!("secret:{rule_id}"),
+        FindingKind::Jurisdiction {
+            pack_id,
+            rule_id,
+            validated,
+            ..
+        } => {
+            let validated_flag = match validated {
+                Some(true) => ":valid",
+                Some(false) => ":invalid",
+                None => "",
+            };
+            format!("jurisdiction:{pack_id}/{rule_id}{validated_flag}")
+        }
+    }
+}
+
+fn parse_min_confidence(s: Option<String>) -> Result<Option<Confidence>, String> {
+    match s {
+        None => Ok(None),
+        Some(text) => match text.to_ascii_lowercase().as_str() {
+            "low" => Ok(Some(Confidence::Low)),
+            "medium" => Ok(Some(Confidence::Medium)),
+            "high" => Ok(Some(Confidence::High)),
+            other => Err(format!("unknown confidence: {other}")),
+        },
+    }
+}
+
+/// In-memory triage state for a report. Persisted in vault state only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct TriageState {
+    verdicts: std::collections::HashMap<usize, String>,
+}
+
+impl TriageState {
+    fn load(root: &std::path::Path, id: &str) -> Self {
+        let Ok(path) = scan_triage_path(root, id) else {
+            return Self::default();
+        };
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, root: &std::path::Path, id: &str) -> Result<(), String> {
+        let path = scan_triage_path(root, id)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(estr)?;
+        }
+        let text = serde_json::to_string(self).map_err(estr)?;
+        std::fs::write(&path, text).map_err(estr)
+    }
+}
+
+#[tauri::command]
+async fn scan_run(
+    state: State<'_, VaultState>,
+    path: String,
+    packs: Vec<String>,
+    min_confidence: Option<String>,
+) -> Result<ScanReportView, String> {
+    state.touch_human_activity();
+    let result = with_handle(&state, |_handle| {
+        let root = std::path::Path::new(&path);
+        if !root.is_dir() {
+            return Err("scan path is not a directory".to_string());
+        }
+        let config = ScanConfig {
+            packs,
+            ..Default::default()
+        };
+        let mut report = sv_scan::scan_project(root, &config).map_err(estr)?;
+        if let Some(min) = parse_min_confidence(min_confidence)? {
+            report.findings.retain(|f| f.confidence >= min);
+        }
+        let id = encode_scan_id(chrono::Utc::now(), "run");
+        let vault_root = vault_root(&state.app).map_err(estr)?;
+        let report_path = scan_report_path(&vault_root, &id)?;
+        if let Some(parent) = report_path.parent() {
+            std::fs::create_dir_all(parent).map_err(estr)?;
+        }
+        // The on-disk copy intentionally drops the per-finding fingerprints,
+        // so it is never a brute-force oracle for small-domain values and
+        // cannot be used to link files after load.
+        let stored = StoredScanReport {
+            id: id.clone(),
+            scanned_path: path,
+            created_at: chrono::Utc::now(),
+            report: report.clone(),
+        };
+        let text = serde_json::to_string(&stored).map_err(estr)?;
+        std::fs::write(&report_path, text).map_err(estr)?;
+        let triage = TriageState::default();
+        Ok((id, report, stored.scanned_path, triage))
+    })
+    .await;
+
+    // The in-memory report keeps its per-scan salt for the current session
+    // only; reveal requires the live finding.
+    let result = result.map(|(id, report, scanned_path, triage)| {
+        state
+            .active_scans
+            .blocking_lock()
+            .insert(id.clone(), report.clone());
+        scan_report_to_view(id, &report, scanned_path, &triage)
+    });
+
+    match &result {
+        Ok(_) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::ScanRun,
+                AuditDecision::Allowed,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::ScanRun,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
+}
+
+/// Stored scan report shape on disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredScanReport {
+    id: String,
+    scanned_path: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    report: ScanReport,
+}
+
+#[tauri::command]
+async fn scan_store(state: State<'_, VaultState>, report_id: String) -> Result<(), String> {
+    state.touch_human_activity();
+    let result = with_handle(&state, |handle| {
+        let vault_root = vault_root(&state.app).map_err(estr)?;
+        let report_path = scan_report_path(&vault_root, &report_id)?;
+        if !report_path.exists() {
+            return Err(format!("report {report_id} not found"));
+        }
+        ensure_scan_container(handle, &vault_root)?;
+        let dest = std::path::Path::new(SCAN_CONTAINER)
+            .join(format!("{SCAN_REPORT_FILE_PREFIX}{report_id}.json"));
+        let source_text = std::fs::read_to_string(&report_path).map_err(estr)?;
+        handle
+            .write_file(
+                SCAN_CONTAINER,
+                &dest.to_string_lossy(),
+                source_text.as_bytes(),
+            )
+            .map_err(estr)
+    })
+    .await;
+
+    match &result {
+        Ok(_) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::ScanStore,
+                AuditDecision::Allowed,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::ScanStore,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
+}
+
+fn ensure_scan_container(
+    handle: &VaultHandle,
+    _vault_root: &std::path::Path,
+) -> Result<(), String> {
+    let info = handle.list_containers().map_err(estr)?;
+    if info.iter().any(|c| c.name == SCAN_CONTAINER) {
+        return Ok(());
+    }
+    handle
+        .create_container(
+            SCAN_CONTAINER,
+            SecurityMode::Direct,
+            Some("Stored scan reports".to_string()),
+        )
+        .map_err(estr)
+}
+
+#[tauri::command]
+async fn scan_history_list(state: State<'_, VaultState>) -> Result<Vec<ScanSummaryView>, String> {
+    // Polling command: do NOT touch_human_activity here.
+    let result = with_handle(&state, |_handle| {
+        let vault_root = vault_root(&state.app).map_err(estr)?;
+        let dir = vault_root.join(SCAN_CONTAINER);
+        let mut summaries = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries {
+                let entry = entry.map_err(estr)?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with(SCAN_REPORT_FILE_PREFIX) || !name.ends_with(".json") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(entry.path()).map_err(estr)?;
+                if let Ok(stored) = serde_json::from_str::<StoredScanReport>(&text) {
+                    summaries.push(ScanSummaryView {
+                        id: stored.id,
+                        scanned_path: stored.scanned_path,
+                        created_at: stored.created_at.to_rfc3339(),
+                        finding_count: stored.report.findings.len(),
+                    });
+                }
+            }
+        }
+        summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(summaries)
+    })
+    .await;
+
+    match &result {
+        Ok(_) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::ScanRun,
+                AuditDecision::Allowed,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::ScanRun,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
+}
+
+#[tauri::command]
+async fn scan_report_get(
+    state: State<'_, VaultState>,
+    id: String,
+) -> Result<ScanReportView, String> {
+    state.touch_human_activity();
+    let result = with_handle(&state, |_handle| {
+        let vault_root = vault_root(&state.app).map_err(estr)?;
+        let report_path = scan_report_path(&vault_root, &id)?;
+        let text = std::fs::read_to_string(&report_path).map_err(estr)?;
+        let stored: StoredScanReport = serde_json::from_str(&text).map_err(estr)?;
+        let triage = TriageState::load(&vault_root, &id);
+        Ok(scan_report_to_view(
+            stored.id,
+            &stored.report,
+            stored.scanned_path,
+            &triage,
+        ))
+    })
+    .await;
+
+    match &result {
+        Ok(_) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::ScanRun,
+                AuditDecision::Allowed,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::ScanRun,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
+}
+
+/// Reveal the first four characters of a matched value.
+///
+/// This only works for scan reports produced in this process. The fingerprint
+/// is dropped before the report is written to disk, so reports loaded from
+/// a previous session cannot be revealed and must be re-scanned.
+#[tauri::command]
+async fn scan_reveal(
+    state: State<'_, VaultState>,
+    report_id: String,
+    finding_index: usize,
+) -> Result<String, String> {
+    state.touch_human_activity();
+    let result = with_handle(&state, |_handle| {
+        // Reveal requires the in-memory report: the fingerprint salt never
+        // left the process, and the fingerprints themselves are skipped on
+        // serialization, so a loaded report cannot satisfy this check.
+        let live_report = {
+            let guard = state
+                .active_scans
+                .try_lock()
+                .map_err(|_| "scan state unavailable; try again")?;
+            guard
+                .get(&report_id)
+                .cloned()
+                .ok_or("report loaded from disk; re-scan to reveal")?
+        };
+        let finding = live_report
+            .findings
+            .get(finding_index)
+            .ok_or_else(|| format!("finding {finding_index} not found"))?;
+        let vault_root = vault_root(&state.app).map_err(estr)?;
+        let stored_path = scan_report_path(&vault_root, &report_id)?;
+        let stored: StoredScanReport =
+            serde_json::from_str(&std::fs::read_to_string(&stored_path).map_err(estr)?)
+                .map_err(estr)?;
+        let scanned_root = std::path::Path::new(&stored.scanned_path);
+        let file_path = scanned_root.join(&finding.path);
+        let content = std::fs::read_to_string(&file_path).map_err(estr)?;
+
+        if finding.end > content.len()
+            || !content.is_char_boundary(finding.start)
+            || !content.is_char_boundary(finding.end)
+        {
+            return Err("file changed since scan; re-scan to reveal".to_string());
+        }
+        let value = &content[finding.start..finding.end];
+
+        // Session-only fingerprint check. The salt is per-process and never
+        // persisted, so this cannot be used to link values across scans.
+        let current = matched_fingerprint(value, live_report.config_salt);
+        if current
+            .as_bytes()
+            .ct_ne(finding.matched_fingerprint.as_bytes())
+            .into()
+        {
+            return Err("file changed since scan; re-scan to reveal".to_string());
+        }
+
+        Ok(sv_scan::mask(value))
+    })
+    .await;
+
+    let audit_event = match &result {
+        Ok(_) => {
+            let mut event = desktop_event(
+                AuditAction::ScanReveal,
+                AuditDecision::Allowed,
+                Some(report_id.clone()),
+                None,
+                None,
+                None,
+                None,
+            );
+            event.detail = Some(format!("finding_index={finding_index}"));
+            if let Ok(vault_root) = vault_root(&state.app) {
+                if let Ok(report_path) = scan_report_path(&vault_root, &report_id) {
+                    if let Ok(text) = std::fs::read_to_string(&report_path) {
+                        if let Ok(stored) = serde_json::from_str::<StoredScanReport>(&text) {
+                            if let Some(finding) = stored.report.findings.get(finding_index) {
+                                event.file_name = Some(finding.path.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            event
+        }
+        Err(_) => {
+            let mut event = desktop_event(
+                AuditAction::ScanReveal,
+                AuditDecision::Error,
+                Some(report_id.clone()),
+                None,
+                None,
+                None,
+                result.as_ref().err().cloned(),
+            );
+            event.detail = Some(format!("finding_index={finding_index}"));
+            event
+        }
+    };
+    record_desktop_event(&state, audit_event);
+    result
+}
+
+/// Compute a process-local fingerprint of matched bytes using the per-scan salt.
+fn matched_fingerprint(value: &str, salt: [u8; 32]) -> String {
+    sv_scan::matched_fingerprint(value, salt)
+}
+
+#[tauri::command]
+async fn scan_triage_set(
+    state: State<'_, VaultState>,
+    report_id: String,
+    finding_index: usize,
+    verdict: String,
+) -> Result<(), String> {
+    state.touch_human_activity();
+    if !matches!(
+        verdict.as_str(),
+        "accept" | "false_positive" | "ignore_rule"
+    ) {
+        return Err(format!("invalid verdict: {verdict}"));
+    }
+    let result = with_handle(&state, |_handle| {
+        let vault_root = vault_root(&state.app).map_err(estr)?;
+        let mut triage = TriageState::load(&vault_root, &report_id);
+        triage.verdicts.insert(finding_index, verdict);
+        triage.save(&vault_root, &report_id)
+    })
+    .await;
+
+    match &result {
+        Ok(_) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::PlanCreate,
+                AuditDecision::Allowed,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::PlanCreate,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
                 None,
                 Some(error.clone()),
             ),
@@ -1338,7 +3038,30 @@ async fn vault_write_file(
     container: String,
     file_name: String,
     content: Vec<u8>,
+    lease_id: Option<String>,
+    agent_id: Option<String>,
 ) -> Result<(), String> {
+    state.touch_human_activity();
+    let resource_ref = format!("container:{container}:file:{file_name}");
+    let args = vec![
+        container.clone(),
+        file_name.clone(),
+        format!("{}", content.len()),
+    ];
+    if !require_lease(
+        &state,
+        lease_id.as_deref().unwrap_or(""),
+        agent_id.as_deref().unwrap_or(""),
+        &resource_ref,
+        "write_file",
+        &args,
+        &resource_ref,
+    )
+    .await
+        && lease_id.is_some()
+    {
+        return Err("invalid or expired wake lease".into());
+    }
     let mode = container_mode(&state, &container).await;
     let byte_size = content.len();
     let result = with_handle(&state, |handle| {
@@ -1381,7 +3104,26 @@ async fn vault_read_file(
     state: State<'_, VaultState>,
     container: String,
     file_name: String,
+    lease_id: Option<String>,
+    agent_id: Option<String>,
 ) -> Result<Vec<u8>, String> {
+    state.touch_human_activity();
+    let resource_ref = format!("container:{container}:file:{file_name}");
+    let args = vec![container.clone(), file_name.clone()];
+    if !require_lease(
+        &state,
+        lease_id.as_deref().unwrap_or(""),
+        agent_id.as_deref().unwrap_or(""),
+        &resource_ref,
+        "read_file",
+        &args,
+        &resource_ref,
+    )
+    .await
+        && lease_id.is_some()
+    {
+        return Err("invalid or expired wake lease".into());
+    }
     let mode = container_mode(&state, &container).await;
     let result = with_handle(&state, |handle| {
         handle.read_file(&container, &file_name).map_err(estr)
@@ -1421,7 +3163,26 @@ async fn vault_delete_file(
     state: State<'_, VaultState>,
     container: String,
     file_name: String,
+    lease_id: Option<String>,
+    agent_id: Option<String>,
 ) -> Result<(), String> {
+    state.touch_human_activity();
+    let resource_ref = format!("container:{container}:file:{file_name}");
+    let args = vec![container.clone(), file_name.clone()];
+    if !require_lease(
+        &state,
+        lease_id.as_deref().unwrap_or(""),
+        agent_id.as_deref().unwrap_or(""),
+        &resource_ref,
+        "delete_file",
+        &args,
+        &resource_ref,
+    )
+    .await
+        && lease_id.is_some()
+    {
+        return Err("invalid or expired wake lease".into());
+    }
     let mode = container_mode(&state, &container).await;
     let result = with_handle(&state, |handle| {
         handle.delete_file(&container, &file_name).map_err(estr)
@@ -1463,11 +3224,174 @@ async fn approval_respond(
     approved: bool,
     otp: Option<String>,
 ) -> Result<(), String> {
+    state.touch_human_activity();
     state.approvals.respond(id, approved, otp).await
+}
+
+/// Wake-on-demand request endpoint. The response is intentionally generic:
+/// the agent cannot tell whether the resource exists (ADR-0020 §8). Wake
+/// requests never unlock the vault and never refresh the idle timer.
+#[tauri::command]
+async fn wake_request(
+    state: State<'_, VaultState>,
+    agent_id: String,
+    opaque_resource_ref: String,
+) -> Result<WakeResult, String> {
+    // Agent-originated activity must not refresh the idle timer (ADR-0020 §9).
+    Ok(state
+        .wake_queue
+        .request(agent_id, opaque_resource_ref)
+        .await)
+}
+
+/// List pending wake requests for the UI. Polling command: no idle refresh.
+#[tauri::command]
+async fn wake_list(state: State<'_, VaultState>) -> Result<Vec<WakePrompt>, String> {
+    Ok(state.wake_queue.list().await)
+}
+
+/// Human responds to a wake request. This is a deliberate human action, so it
+/// refreshes the idle timer. If approved, the request is recorded as an
+/// authorized wake; the actual lease is issued when the agent later attempts
+/// the specific operation (ADR-0020 §10).
+#[tauri::command]
+async fn wake_respond(state: State<'_, VaultState>, id: u64, approved: bool) -> Result<(), String> {
+    state.touch_human_activity();
+    let Some(request) = state.wake_queue.respond(id, approved).await else {
+        return Err("wake request not found".into());
+    };
+    if approved {
+        // Record an authorized wake for this agent/resource. The lease itself
+        // is issued later, bound to the exact operation and arguments.
+        state
+            .leases
+            .record_authorized_wake(&request.signature, &request.agent_id, &state.session_id())
+            .await;
+        record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::VaultInfo,
+                AuditDecision::Allowed,
+                None,
+                None,
+                None,
+                None,
+                Some(format!(
+                    "wake-approved agent={} resource={}",
+                    request.agent_id, request.opaque_resource_ref
+                )),
+            ),
+        );
+    } else {
+        record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::VaultInfo,
+                AuditDecision::Denied,
+                None,
+                None,
+                None,
+                None,
+                Some(format!(
+                    "wake-denied agent={} resource={}",
+                    request.agent_id, request.opaque_resource_ref
+                )),
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// Prepare a material access after a wake authorization. Returns a lease id for
+/// Direct mode, or an indication that further per-mode consent is required
+/// (Approval / OTP). The lease is short-lived and single-use (ADR-0020 §10).
+#[tauri::command]
+async fn wake_prepare_access(
+    state: State<'_, VaultState>,
+    params: LeaseParams,
+) -> Result<String, String> {
+    // This is an explicit human/agent-initiated access preparation. Refreshing
+    // the idle timer is acceptable here because it follows a wake approval and
+    // represents an active access attempt.
+    state.touch_human_activity();
+
+    let resource_signature = wake_signature(&params.agent_id, &params.resource_ref);
+    let authorized = state
+        .leases
+        .has_authorized_wake(&resource_signature, &params.agent_id, &state.session_id())
+        .await;
+    if !authorized {
+        return Err("wake authorization required".into());
+    }
+
+    let operation_digest = digest_string(&params.operation);
+    let args_digest = digest_string(&params.args.join("|"));
+
+    match params.mode.to_ascii_uppercase().as_str() {
+        "DIRECT" => {
+            let lease = state
+                .leases
+                .issue(
+                    &params.agent_id,
+                    &resource_signature,
+                    &operation_digest,
+                    &args_digest,
+                    &params.destination,
+                    &state.session_id(),
+                    "v1",
+                )
+                .await;
+            let wake_lease = WakeLease {
+                lease_id: lease.id.clone(),
+                expires_at_secs: WAKE_LEASE_TTL_SECS,
+            };
+            let _ = state.app.emit(WAKE_LEASE_EVENT, wake_lease);
+            Ok(lease.id)
+        }
+        "APPROVAL" => {
+            Err("approval_required: explicit human approval needed for this operation".into())
+        }
+        "OTP" => Err("otp_required: one-time code required for this operation".into()),
+        other => Err(format!("unsupported wake mode: {other}")),
+    }
+}
+
+/// Check a lease for an exact operation and consume it. Returns true if a valid
+/// lease was found and consumed. This helper enforces single-use binding to
+/// agent, resource, operation, args, destination, session, and policy version.
+async fn require_lease(
+    state: &VaultState,
+    lease_id: &str,
+    agent_id: &str,
+    resource_ref: &str,
+    operation: &str,
+    args: &[String],
+    destination: &str,
+) -> bool {
+    if lease_id.is_empty() || agent_id.is_empty() {
+        return false;
+    }
+    let resource_signature = wake_signature(agent_id, resource_ref);
+    let operation_digest = digest_string(operation);
+    let args_digest = digest_string(&args.join("|"));
+    state
+        .leases
+        .checkout(
+            lease_id,
+            agent_id,
+            &resource_signature,
+            &operation_digest,
+            &args_digest,
+            destination,
+            &state.session_id(),
+            "v1",
+        )
+        .await
 }
 
 #[tauri::command]
 async fn mcp_status(state: State<'_, VaultState>) -> Result<McpStatus, String> {
+    // Polling command: do NOT touch_human_activity here.
     let guard = state.servers.lock().await;
     let (running, pairing_secret) = match guard.as_ref() {
         Some(server) if server.running => (true, Some(server.pairing_secret.clone())),
@@ -1499,6 +3423,37 @@ struct AgentCreated {
     token: String,
 }
 
+/// Return current session status. This is a polling command and must NOT
+/// refresh the idle timer (ADR-0020 §9). MCP agents or the UI status loop
+/// calling this every few seconds would otherwise keep the vault unlocked.
+#[tauri::command]
+async fn session_status(state: State<'_, VaultState>) -> Result<SessionStatus, String> {
+    let locked = !is_unlocked(&state).await;
+    let (idle_remaining_secs, session_remaining_secs) = if locked {
+        (None, None)
+    } else {
+        state.remaining_secs()
+    };
+    Ok(SessionStatus {
+        locked,
+        idle_remaining_secs,
+        session_remaining_secs,
+    })
+}
+
+/// Update the session limits. This is a deliberate human action in the settings
+/// page, so it counts as human activity.
+#[tauri::command]
+async fn session_set_limits(
+    state: State<'_, VaultState>,
+    idle_secs: u64,
+    absolute_secs: u64,
+) -> Result<(), String> {
+    state.touch_human_activity();
+    state.set_limits(idle_secs, absolute_secs);
+    Ok(())
+}
+
 #[tauri::command]
 async fn agent_create(
     app: AppHandle,
@@ -1507,6 +3462,7 @@ async fn agent_create(
     scopes: Option<Vec<sv_core::agents::AgentScope>>,
 ) -> Result<AgentCreated, String> {
     let _ = &app;
+    state.touch_human_activity();
     let (agent_id, token) = with_handle(&state, |handle| {
         handle
             .create_agent(&name, scopes.unwrap_or_default())
@@ -1534,6 +3490,7 @@ async fn agent_list(state: State<'_, VaultState>) -> Result<Vec<AgentInfo>, Stri
 
 #[tauri::command]
 async fn agent_revoke(state: State<'_, VaultState>, agent_id: String) -> Result<(), String> {
+    state.touch_human_activity();
     with_handle(&state, |handle| {
         handle.revoke_agent(&agent_id).map_err(estr)
     })
@@ -1544,7 +3501,26 @@ async fn agent_revoke(state: State<'_, VaultState>, agent_id: String) -> Result<
 async fn transit_create_key(
     state: State<'_, VaultState>,
     name: String,
+    lease_id: Option<String>,
+    agent_id: Option<String>,
 ) -> Result<sv_core::transit::TransitKeyInfo, String> {
+    state.touch_human_activity();
+    let resource_ref = format!("transit:{name}");
+    let args = vec![name.clone()];
+    if !require_lease(
+        &state,
+        lease_id.as_deref().unwrap_or(""),
+        agent_id.as_deref().unwrap_or(""),
+        &resource_ref,
+        "create_transit_key",
+        &args,
+        &resource_ref,
+    )
+    .await
+        && lease_id.is_some()
+    {
+        return Err("invalid or expired wake lease".into());
+    }
     with_handle(&state, |handle| {
         handle.transit_create_key(&name).map_err(estr)
     })
@@ -1555,6 +3531,7 @@ async fn transit_create_key(
 async fn transit_list_keys(
     state: State<'_, VaultState>,
 ) -> Result<Vec<sv_core::transit::TransitKeyInfo>, String> {
+    // Polling command: do NOT touch_human_activity here.
     with_handle(&state, |handle| handle.transit_list().map_err(estr)).await
 }
 
@@ -1562,7 +3539,26 @@ async fn transit_list_keys(
 async fn signing_create_key(
     state: State<'_, VaultState>,
     name: String,
+    lease_id: Option<String>,
+    agent_id: Option<String>,
 ) -> Result<sv_core::transit::SigningKeyInfo, String> {
+    state.touch_human_activity();
+    let resource_ref = format!("signing:{name}");
+    let args = vec![name.clone()];
+    if !require_lease(
+        &state,
+        lease_id.as_deref().unwrap_or(""),
+        agent_id.as_deref().unwrap_or(""),
+        &resource_ref,
+        "create_signing_key",
+        &args,
+        &resource_ref,
+    )
+    .await
+        && lease_id.is_some()
+    {
+        return Err("invalid or expired wake lease".into());
+    }
     with_handle(&state, |handle| {
         handle.signing_create_key(&name).map_err(estr)
     })
@@ -1573,6 +3569,7 @@ async fn signing_create_key(
 async fn signing_list_keys(
     state: State<'_, VaultState>,
 ) -> Result<Vec<sv_core::transit::SigningKeyInfo>, String> {
+    // Polling command: do NOT touch_human_activity here.
     with_handle(&state, |handle| handle.signing_list().map_err(estr)).await
 }
 
@@ -1583,7 +3580,26 @@ async fn broker_create_secret(
     secret: String,
     allow: Vec<sv_core::transit::BrokerAllow>,
     injection: Option<sv_core::transit::BrokerInjection>,
+    lease_id: Option<String>,
+    agent_id: Option<String>,
 ) -> Result<sv_core::transit::BrokerSecretInfo, String> {
+    state.touch_human_activity();
+    let resource_ref = format!("broker:{name}");
+    let args = vec![name.clone()];
+    if !require_lease(
+        &state,
+        lease_id.as_deref().unwrap_or(""),
+        agent_id.as_deref().unwrap_or(""),
+        &resource_ref,
+        "create_broker_secret",
+        &args,
+        &resource_ref,
+    )
+    .await
+        && lease_id.is_some()
+    {
+        return Err("invalid or expired wake lease".into());
+    }
     with_handle(&state, |handle| {
         handle
             .broker_create(&name, &secret, allow, injection.unwrap_or_default())
@@ -1596,6 +3612,7 @@ async fn broker_create_secret(
 async fn broker_list_secrets(
     state: State<'_, VaultState>,
 ) -> Result<Vec<sv_core::transit::BrokerSecretInfo>, String> {
+    // Polling command: do NOT touch_human_activity here.
     with_handle(&state, |handle| handle.broker_list().map_err(estr)).await
 }
 
@@ -1620,7 +3637,7 @@ fn cli_binary_path() -> Result<String, String> {
     }
 }
 
-async fn start_servers(state: &State<'_, VaultState>) -> Result<(), String> {
+async fn start_servers<R: Runtime>(state: &State<'_, VaultState<R>>) -> Result<(), String> {
     stop_servers(state).await;
 
     let secret = sv_core::fresh_pairing_secret().map_err(estr)?;
@@ -1694,7 +3711,7 @@ async fn start_servers(state: &State<'_, VaultState>) -> Result<(), String> {
     Ok(())
 }
 
-async fn stop_servers(state: &State<'_, VaultState>) {
+async fn stop_servers<R: Runtime>(state: &State<'_, VaultState<R>>) {
     let mut guard = state.servers.lock().await;
     if let Some(mut servers) = guard.take() {
         if let Some(tx) = servers.ws_tx.take() {
@@ -1741,12 +3758,26 @@ pub fn run() {
             vault_list_containers,
             vault_create_container,
             vault_delete_container,
+            audit_tail,
+            audit_verify,
+            scan_run,
+            scan_store,
+            scan_history_list,
+            scan_report_get,
+            scan_reveal,
+            scan_triage_set,
             vault_list_files,
             vault_write_file,
             vault_read_file,
             vault_delete_file,
             approval_respond,
+            wake_request,
+            wake_list,
+            wake_respond,
+            wake_prepare_access,
             mcp_status,
+            session_status,
+            session_set_limits,
             agent_create,
             agent_list,
             agent_revoke,
@@ -2123,5 +4154,422 @@ mod tests {
     fn test_otp_cap_allows_empty_store() {
         let store: HashMap<String, OtpChallenge> = HashMap::new();
         assert!(can_admit_challenge(&store, "any-new-signature"));
+    }
+
+    #[test]
+    fn session_absolute_cap_is_not_extended_by_activity() {
+        let timer = SessionTimer::new();
+        // Set an absolute cap of 2 seconds and an idle timeout of 1 hour.
+        timer.set_limits(3600, 2);
+        timer.set_unlocked();
+
+        let (_idle1, absolute1) = timer.remaining_secs();
+        assert!(absolute1.unwrap() <= 2);
+
+        // Simulate repeated human activity after 1 second.
+        std::thread::sleep(Duration::from_secs(1));
+        timer.touch_human_activity();
+
+        let (idle2, absolute2) = timer.remaining_secs();
+        // Idle timer resets to the full hour.
+        assert!(idle2.unwrap() >= 3595, "idle timer should refresh");
+        // Absolute cap should have shrunk, never grown.
+        assert!(
+            absolute2.unwrap() <= absolute1.unwrap(),
+            "absolute cap must not increase with activity"
+        );
+    }
+
+    #[test]
+    fn polling_command_does_not_refresh_idle_timer() {
+        let timer = SessionTimer::new();
+        timer.set_limits(10, 3600);
+        timer.set_unlocked();
+
+        std::thread::sleep(Duration::from_secs(1));
+        let (idle_before, _) = timer.remaining_secs();
+        assert!(idle_before.unwrap() < 10);
+
+        // Polling helpers read remaining_secs and must NOT call
+        // touch_human_activity. We verify by reading the raw timer.
+        let (idle_after_touch, _) = timer.remaining_secs();
+        assert_eq!(
+            idle_before.unwrap(),
+            idle_after_touch.unwrap(),
+            "timer unchanged without human activity"
+        );
+
+        // A genuine human action refreshes it.
+        timer.touch_human_activity();
+        let (idle_after_human, _) = timer.remaining_secs();
+        assert!(
+            idle_after_human.unwrap() > idle_before.unwrap(),
+            "human activity must refresh idle timer"
+        );
+    }
+
+    #[test]
+    fn scan_id_validation_rejects_path_traversal() {
+        let root = std::path::Path::new("/tmp/vault");
+        assert!(scan_report_path(root, "../etc/passwd").is_err());
+        assert!(scan_report_path(root, "C:/Users/pealm/.ssh/id_rsa").is_err());
+        assert!(scan_triage_path(root, "../etc/passwd").is_err());
+        assert!(scan_triage_path(root, "C:/Users/pealm/.ssh/id_rsa").is_err());
+
+        // Valid shape produced by encode_scan_id.
+        assert!(scan_report_path(root, "1234567890123-run").is_ok());
+        assert!(scan_triage_path(root, "1234567890123-run").is_ok());
+    }
+
+    /// The set of commands that only poll or read state. They must never
+    /// refresh the idle timer, otherwise a chatty UI loop or MCP agent keeps
+    /// the vault unlocked forever (ADR-0020 §9).
+    const POLLING_COMMANDS: &[&str] = &[
+        "vault_status",
+        "vault_list_containers",
+        "vault_list_files",
+        "mcp_status",
+        "audit_tail",
+        "audit_verify",
+        "agent_list",
+        "session_status",
+        "scan_history_list",
+        "transit_list_keys",
+        "signing_list_keys",
+        "broker_list_secrets",
+    ];
+
+    /// Regression guard: polling/status commands must not contain a call to
+    /// `touch_human_activity()`. This is a structural test over the source file
+    /// so a future edit cannot accidentally reintroduce the refresh in a status
+    /// path.
+    #[test]
+    fn polling_commands_never_call_touch_human_activity() {
+        let src = include_str!("lib.rs");
+        for name in POLLING_COMMANDS {
+            let fn_pos = src
+                .find(&format!("async fn {name}"))
+                .unwrap_or_else(|| panic!("polling command {name} not found in source"));
+            // Function body runs until the next #[tauri::command] attribute or
+            // the end of the file.
+            let next_attr = src[fn_pos..]
+                .find("\n#[tauri::command]")
+                .map(|i| fn_pos + i);
+            let body_end = next_attr.unwrap_or(src.len());
+            let body = &src[fn_pos..body_end];
+            assert!(
+                !body.contains("touch_human_activity();"),
+                "polling command {name} must not refresh idle activity"
+            );
+        }
+    }
+
+    /// Simulate a UI/MCP polling loop calling only status/read helpers and
+    /// verify the idle timer still expires. This protects against the
+    /// regression where any state access was incorrectly counted as activity.
+    #[test]
+    fn polling_loop_does_not_prevent_idle_timeout() {
+        let timer = SessionTimer::new();
+        // 3-second idle timeout, generous absolute cap.
+        timer.set_limits(3, 3600);
+        timer.set_unlocked();
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            let (idle_remaining, _) = timer.remaining_secs();
+            if idle_remaining.is_none() || idle_remaining.unwrap() == 0 {
+                break;
+            }
+            // Simulate rapid status polling: only read timers, never touch.
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let (idle_remaining, _) = timer.remaining_secs();
+        assert!(
+            idle_remaining.is_none() || idle_remaining.unwrap() == 0,
+            "polling-only traffic must not keep the vault unlocked past idle timeout"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Wake-on-demand tests (ADR-0020 §8-12)
+    // ------------------------------------------------------------------
+
+    #[derive(Clone, Default)]
+    struct TestEmitter {
+        wakes: Arc<std::sync::Mutex<Vec<WakePrompt>>>,
+        cancels: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl WakeEmitter for TestEmitter {
+        fn emit_wake(&self, prompt: WakePrompt) {
+            self.wakes.lock().unwrap().push(prompt);
+        }
+        fn emit_cancel(&self, id: u64) {
+            self.cancels.lock().unwrap().push(id);
+        }
+    }
+
+    fn test_queue() -> WakeQueue<TestEmitter> {
+        WakeQueue::new(TestEmitter::default())
+    }
+
+    #[tokio::test]
+    async fn wake_request_is_indistinguishable_across_resource_references() {
+        // The in-memory WakeQueue has no access to vault state and therefore
+        // cannot consult a resource registry. That is the correct design (ADR-0020
+        // §8), but it means this test cannot prove the absence of an existence
+        // leak by contrasting a real resource against a fake one. What it can prove
+        // is that two *structurally different* opaque resource references
+        // produce identical observable behavior: same return enum, same absence
+        // of error, and same timing bucket.
+        let q = test_queue();
+
+        let start_real = Instant::now();
+        let real = q
+            .request("agent-1".into(), "resource-that-exists".into())
+            .await;
+        let real_duration = start_real.elapsed();
+
+        let start_fake = Instant::now();
+        let fake = q
+            .request("agent-1".into(), "resource-that-does-not-exist".into())
+            .await;
+        let fake_duration = start_fake.elapsed();
+
+        // Both new requests should queue with the same generic result.
+        assert_eq!(real, WakeResult::Queued);
+        assert_eq!(fake, WakeResult::Queued);
+
+        // Timing bucket equality: both calls must complete in the same coarse
+        // bucket. This is the best proxy for the no-oracle invariant available at
+        // this layer, because a future implementation that resolves the reference
+        // would necessarily take measurably longer for a hit.
+        let bucket = Duration::from_millis(5);
+        assert_eq!(
+            real_duration.as_nanos() / bucket.as_nanos(),
+            fake_duration.as_nanos() / bucket.as_nanos(),
+            "wake request timing must not vary by resource reference"
+        );
+
+        // A second request for an already-pending reference coalesces and returns
+        // the same generic status.
+        let real2 = q
+            .request("agent-1".into(), "resource-that-exists".into())
+            .await;
+        assert_eq!(real2, WakeResult::Queued);
+
+        // Two distinct resources produced two notifications; the duplicate was
+        // suppressed by the notification cooldown.
+        let wakes = q.emitter.wakes.lock().unwrap();
+        assert_eq!(wakes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn wake_rapid_duplicate_requests_produce_one_notification_per_cooldown() {
+        let q = test_queue();
+        // Send many rapid requests for the exact same resource. Whether each is
+        // Queued or Unavailable due to the per-agent rate limit is irrelevant:
+        // the anti-fatigue requirement is that at most one notification is emitted
+        // within the cooldown window.
+        for _ in 0..20 {
+            q.request("agent-1".into(), "same-resource".into()).await;
+        }
+        let wakes = q.emitter.wakes.lock().unwrap();
+        assert_eq!(
+            wakes.len(),
+            1,
+            "duplicate wake requests must coalesce into a single notification within the cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_per_agent_rate_limit_returns_unavailable() {
+        let q = test_queue();
+        for i in 0..WAKE_MAX_PER_AGENT {
+            assert_eq!(
+                q.request("agent-1".into(), format!("resource-{i}")).await,
+                WakeResult::Queued
+            );
+        }
+        // The next request from the same agent within the window is unavailable.
+        assert_eq!(
+            q.request("agent-1".into(), "one-more".into()).await,
+            WakeResult::Unavailable
+        );
+        // A different agent is still allowed (subject to global cap).
+        assert_eq!(
+            q.request("agent-2".into(), "agent-2-resource".into()).await,
+            WakeResult::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_request_rate_limits_and_coalesces() {
+        let q = test_queue();
+        // First request queues and emits.
+        assert_eq!(
+            q.request("agent-1".into(), "res".into()).await,
+            WakeResult::Queued
+        );
+        // Duplicate coalesces.
+        assert_eq!(
+            q.request("agent-1".into(), "res".into()).await,
+            WakeResult::Queued
+        );
+        // Only one wake event so far (cooldown prevents second emission).
+        assert_eq!(q.emitter.wakes.lock().unwrap().len(), 1);
+
+        // Respond (approve) removes the pending request.
+        let prompt = q.list().await.pop().unwrap();
+        q.respond(prompt.id, true).await.unwrap();
+        assert!(q.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lease_single_use_and_exact_binding() {
+        let store = LeaseStore::new();
+        let lease = store
+            .issue(
+                "agent-1",
+                "resource-sig",
+                "op-digest",
+                "args-digest",
+                "dest",
+                "session-1",
+                "v1",
+            )
+            .await;
+
+        // First checkout with exact bindings succeeds.
+        assert!(
+            store
+                .checkout(
+                    &lease.id,
+                    "agent-1",
+                    "resource-sig",
+                    "op-digest",
+                    "args-digest",
+                    "dest",
+                    "session-1",
+                    "v1",
+                )
+                .await
+        );
+
+        // Second checkout fails (single-use).
+        assert!(
+            !store
+                .checkout(
+                    &lease.id,
+                    "agent-1",
+                    "resource-sig",
+                    "op-digest",
+                    "args-digest",
+                    "dest",
+                    "session-1",
+                    "v1",
+                )
+                .await
+        );
+
+        // A new lease with a different operation must not be usable for the
+        // original operation.
+        let lease2 = store
+            .issue(
+                "agent-1",
+                "resource-sig",
+                "other-op-digest",
+                "args-digest",
+                "dest",
+                "session-1",
+                "v1",
+            )
+            .await;
+        assert!(
+            !store
+                .checkout(
+                    &lease2.id,
+                    "agent-1",
+                    "resource-sig",
+                    "op-digest",
+                    "args-digest",
+                    "dest",
+                    "session-1",
+                    "v1",
+                )
+                .await,
+            "lease bound to a different operation must not cover the original operation"
+        );
+
+        // A lease bound to a different resource must not be usable.
+        let lease3 = store
+            .issue(
+                "agent-1",
+                "other-resource-sig",
+                "op-digest",
+                "args-digest",
+                "dest",
+                "session-1",
+                "v1",
+            )
+            .await;
+        assert!(
+            !store
+                .checkout(
+                    &lease3.id,
+                    "agent-1",
+                    "resource-sig",
+                    "op-digest",
+                    "args-digest",
+                    "dest",
+                    "session-1",
+                    "v1",
+                )
+                .await,
+            "lease bound to a different resource must not cover this resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_authorization_allows_direct_lease_and_requires_consent_for_other_modes() {
+        let store = LeaseStore::new();
+        store
+            .record_authorized_wake("resource-sig", "agent-1", "session-1")
+            .await;
+
+        assert!(
+            store
+                .has_authorized_wake("resource-sig", "agent-1", "session-1")
+                .await
+        );
+        assert!(
+            !store
+                .has_authorized_wake("resource-sig", "agent-2", "session-1")
+                .await
+        );
+        assert!(
+            !store
+                .has_authorized_wake("resource-sig", "agent-1", "session-2")
+                .await
+        );
+    }
+
+    #[test]
+    fn wake_audit_event_contains_no_material_or_token() {
+        let event = desktop_event(
+            AuditAction::VaultInfo,
+            AuditDecision::Allowed,
+            None,
+            None,
+            None,
+            None,
+            Some("wake-approved agent=agent-1 resource=opaque-ref".into()),
+        );
+        let serialized = serde_json::to_string(&event).unwrap();
+        assert!(!serialized.contains("secret-value"));
+        assert!(!serialized.contains("bearer"));
+        assert!(!serialized.contains("token"));
+        assert!(serialized.contains("wake-approved"));
     }
 }

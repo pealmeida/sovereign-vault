@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// What kind of sensitive material a finding represents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +65,14 @@ pub struct ScanFinding {
     pub confidence: Confidence,
     /// A masked preview. NEVER the raw matched value.
     pub preview: String,
+    /// Process-local fingerprint of the matched bytes. Used only within the
+    /// same process/session to detect that a file span changed before a UI
+    /// reveal. It is deliberately NOT serialized: an unkeyed or leaked
+    /// fingerprint would be a brute-force oracle for small-domain values and
+    /// would link identical values across files. It is not a security boundary,
+    /// only a safety check for interactive reveal.
+    #[serde(skip)]
+    pub matched_fingerprint: String,
 }
 
 /// Why a file was not examined.
@@ -251,6 +260,13 @@ pub struct ScanReport {
     pub findings: Vec<ScanFinding>,
     /// What was and was not examined.
     pub coverage: Coverage,
+    /// Per-scan salt used to compute process-local fingerprints.
+    ///
+    /// Not serialized. A report loaded from disk will have an all-zero salt
+    /// and empty fingerprints, so reveal operations cannot succeed across
+    /// sessions.
+    #[serde(skip)]
+    pub config_salt: [u8; 32],
 }
 
 /// Files that are scanned even when an ignore rule would exclude them.
@@ -291,6 +307,23 @@ pub const ALWAYS_SCAN: &[&str] = &[
     "**/serviceaccount*.json",
 ];
 
+/// What a finding's `preview` field reveals about the matched value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreviewMode {
+    /// Never include any byte of the matched value: the preview is a fixed
+    /// placeholder (`sv_scan::mask_opaque`). This is the default. A scan
+    /// report is written to disk and handed to agents, and ADR-0017's claim
+    /// that this is safe holds only while the report cannot carry secret
+    /// material — not even a short prefix.
+    #[default]
+    Opaque,
+    /// Reveal at most the first four characters of the matched value
+    /// (`sv_scan::mask`). An explicit opt-in for interactive human review,
+    /// never the default, and not meant for reports that are persisted or
+    /// shared.
+    RevealPrefix,
+}
+
 /// How to walk and what to examine.
 #[derive(Debug, Clone)]
 pub struct ScanConfig {
@@ -315,6 +348,20 @@ pub struct ScanConfig {
     /// decimal check digit, so roughly one arbitrary digit run in ten passes
     /// it. Opt in to the jurisdictions that matter for the data at hand.
     pub packs: Vec<String>,
+    /// What finding previews reveal about the matched value.
+    ///
+    /// [`PreviewMode::Opaque`] (the default) never puts any byte of a matched
+    /// value into the report. [`PreviewMode::RevealPrefix`] keeps the
+    /// historical four-character reveal and exists for interactive review
+    /// only; a report built with it must not be treated as safe to persist or
+    /// share.
+    pub preview_mode: PreviewMode,
+    /// Per-scan salt for process-local matched-value fingerprints.
+    ///
+    /// Never serialized. It is generated fresh for each scan so that two
+    /// identical values in different files or projects are not linkable and
+    /// so that the fingerprint is not a brute-force oracle for the value.
+    pub fingerprint_salt: [u8; 32],
 }
 
 impl Default for ScanConfig {
@@ -327,8 +374,32 @@ impl Default for ScanConfig {
             always_scan: ALWAYS_SCAN.iter().map(|s| s.to_string()).collect(),
             // Baseline detection is always on; packs are opt-in (ADR-0018 §5).
             packs: Vec::new(),
+            // Opaque previews are what makes a report safe to write to disk
+            // and hand to an agent (ADR-0017).
+            preview_mode: PreviewMode::default(),
+            // A new salt per scan kills linkability and brute-force recovery.
+            fingerprint_salt: random_salt(),
         }
     }
+}
+
+fn random_salt() -> [u8; 32] {
+    let mut salt = [0u8; 32];
+    rand::fill(&mut salt);
+    salt
+}
+
+/// Process-local keyed fingerprint of a matched value.
+///
+/// Uses the per-scan `config.fingerprint_salt`. Identical values in different
+/// scans produce different outputs; an attacker with only the report cannot
+/// brute-force small-domain values. This is not a security boundary and is
+/// never persisted.
+pub fn matched_fingerprint(value: &str, salt: [u8; 32]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Glob patterns excluded from every scan in addition to [`ScanConfig::exclude`].
@@ -377,3 +448,53 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "**/*.so",
     "**/*.dylib",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn finding_fingerprint_is_not_serialized() {
+        let salt = [42u8; 32];
+        let finding = ScanFinding {
+            path: PathBuf::from("test.txt"),
+            line: 1,
+            start: 0,
+            end: 4,
+            kind: FindingKind::Secret {
+                rule_id: "api_key".to_string(),
+            },
+            confidence: Confidence::High,
+            preview: "****".to_string(),
+            matched_fingerprint: matched_fingerprint("1234", salt),
+        };
+        let json = serde_json::to_string(&finding).expect("serialize");
+        assert!(
+            !json.contains("matched_fingerprint"),
+            "fingerprint must not appear in serialized JSON: {json}"
+        );
+        assert!(
+            !json.contains(&finding.matched_fingerprint),
+            "fingerprint value must not appear in serialized JSON: {json}"
+        );
+    }
+
+    #[test]
+    fn report_salt_is_not_serialized() {
+        let mut salt = [0u8; 32];
+        salt[0] = 7;
+        let report = ScanReport {
+            config_salt: salt,
+            ..ScanReport::default()
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            !json.contains("config_salt"),
+            "salt must not appear in serialized JSON: {json}"
+        );
+        // Default (all-zero) salt after round-trip proves the salt was skipped.
+        let round: ScanReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round.config_salt, [0u8; 32]);
+    }
+}

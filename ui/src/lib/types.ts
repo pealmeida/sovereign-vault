@@ -29,6 +29,12 @@ export interface VaultStatus {
   has_keyring: boolean;
 }
 
+export interface SessionStatus {
+  locked: boolean;
+  idle_remaining_secs: number | null;
+  session_remaining_secs: number | null;
+}
+
 export interface VaultInitResponse {
   recovery_phrase: string;
   /** Non-sensitive warning when the vault is initialised but local
@@ -113,3 +119,72 @@ export interface BrokerSecretInfo {
   allow: BrokerAllow[];
   injection: BrokerInjection;
 }
+
+export interface AuditEvent {
+  action: string;
+  decision: string;
+  transport: string;
+  timestamp: string;
+  error: string | null;
+}
+
+export interface VerifyReport {
+  ok: boolean;
+  entries: number;
+  legacy_entries: number;
+  first_broken: number | null;
+  reason: string | null;
+}
+
+export interface AuditTailResponse {
+  events: AuditEvent[];
+  malformed_skipped: number;
+}
+
+export interface WakePrompt {
+  id: number;
+  agent_id: string;
+  resource_ref: string;
+}
+
+export interface ScanSuppressed {
+  reason: string;
+  count: number;
+}
+
+export interface ScanCoverage {
+  files_scanned: number;
+  files_ignored: number;
+  files_skipped: number;
+  bytes_scanned: number;
+  suppressed: ScanSuppressed[];
+}
+
+export interface ScanFinding {
+  path: string;
+  line: number;
+  start: number;
+  end: number;
+  kind: string;
+  confidence: string;
+  preview: string;
+  verdict: string | null;
+}
+
+export interface ScanReport {
+  id: string;
+  scanned_path: string;
+  created_at: string;
+  coverage: ScanCoverage;
+  findings: ScanFinding[];
+}
+
+export interface ScanSummary {
+  id: string;
+  scanned_path: string;
+  created_at: string;
+  finding_count: number;
+}
+
+export type ScanVerdict = 'accept' | 'false_positive' | 'ignore_rule';
+export type ScanConfidence = 'low' | 'medium' | 'high';
