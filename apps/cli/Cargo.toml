@@ -16,6 +16,8 @@ sv-core           = { workspace = true }
 sv-mcp            = { workspace = true }
 sv-http           = { workspace = true }
 sv-audit          = { workspace = true }
+sv-scan           = { workspace = true }
+sv-patterns       = { workspace = true }
 subtle            = { workspace = true }
 tokio             = { version = "1.41", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "sync", "time", "signal"] }
 tokio-tungstenite = { workspace = true }

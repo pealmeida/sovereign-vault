@@ -1,0 +1,24 @@
+[package]
+name = "sv-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Transport-independent policy, reference, consent, and audit orchestration for Sovereign Vault."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hkdf = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+getrandom = { workspace = true }
+toml        = { workspace = true }
+
+[lints]
+workspace = true
