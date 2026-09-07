@@ -4093,6 +4093,171 @@ async fn vault_read_file(
     result
 }
 
+/// Reveal the audit log in the OS file manager.
+///
+/// Opens the containing folder with the log selected rather than opening the
+/// file itself, which would hand it to whatever application claims `.jsonl`.
+///
+/// Not gated and not audited: this reveals a location, not vault content. The
+/// audit log is already readable in the app, and the folder is the user's own
+/// application-data directory.
+#[tauri::command]
+async fn open_audit_folder(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+
+    let root = vault_root(&app)?;
+    let active = root.join("audit.jsonl");
+    // Reveal the log when it exists; otherwise fall back to the vault folder,
+    // which does. Revealing a non-existent path fails on some platforms and
+    // succeeds confusingly on others.
+    let target = if active.exists() { active } else { root };
+    app.opener().reveal_item_in_dir(&target).map_err(estr)
+}
+
+/// Decrypt one file and write it to a location the user picks.
+///
+/// # Why this is gated like a read, plus a marker
+///
+/// Export IS a read -- the plaintext is produced exactly as `vault_read_file`
+/// produces it -- so it takes the same container-mode gate (ADR-0023). But it
+/// does one more thing that a read does not: it leaves a decrypted copy
+/// OUTSIDE the vault, where no mode, lock, or audit applies to it ever again.
+/// That copy is the user's to manage and cannot be recalled.
+///
+/// So the audit records `AuditAction::ReadFile` -- which is what happened to
+/// the vault -- with `detail` saying the bytes were exported. `AgentExport`
+/// exists but means bulk export of agent identities; reusing it here would
+/// file this under an unrelated action.
+///
+/// The destination path is NOT audited. It is chosen by the user in a native
+/// dialog, it frequently contains a real name or project, and the audit log is
+/// a durable artifact that gets shared. The fact of the export is what a
+/// reviewer needs; where the user filed it is not.
+///
+/// Returns the destination as a display string for the confirmation toast, or
+/// `None` when the user cancels the dialog.
+#[tauri::command]
+async fn vault_export_file(
+    app: AppHandle,
+    state: State<'_, VaultState>,
+    container: String,
+    file_name: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    state.touch_human_activity();
+    let mode = container_mode(&state, &container).await;
+    // Same gate as a read: this produces the same plaintext.
+    if let Err(denied) = require_desktop_consent(
+        &state,
+        sv_mcp::AccessAction::ReadFile,
+        &container,
+        Some(&file_name),
+        mode,
+    )
+    .await
+    {
+        let mut event = desktop_event(
+            AuditAction::ReadFile,
+            AuditDecision::Denied,
+            Some(container.clone()),
+            Some(file_name.clone()),
+            mode,
+            None,
+            Some(denied.clone()),
+        );
+        event.detail = Some("export to disk".into());
+        record_desktop_event(&state, event);
+        return Err(denied);
+    }
+
+    // Ask for the destination BEFORE decrypting. A cancelled dialog then means
+    // no plaintext was ever produced, rather than a decrypted buffer held in
+    // memory for a save that never happens.
+    let suggested = std::path::Path::new(&file_name);
+    let mut builder = app.dialog().file().set_title("Export file");
+    if let Some(name) = suggested.file_name().and_then(|n| n.to_str()) {
+        builder = builder.set_file_name(name);
+    }
+    if let Some(ext) = suggested.extension().and_then(|e| e.to_str()) {
+        builder = builder.add_filter(format!("{ext} file"), &[ext]);
+    }
+    let Some(dest) = builder.blocking_save_file() else {
+        // User cancelled. Nothing was decrypted and nothing is recorded: no
+        // access to the file's content took place.
+        return Ok(None);
+    };
+    let dest_path = dest
+        .into_path()
+        .map_err(|e| format!("unusable destination path: {e}"))?;
+
+    let bytes = match with_handle(&state, |handle| {
+        handle.read_file(&container, &file_name).map_err(estr)
+    })
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let mut event = desktop_event(
+                AuditAction::ReadFile,
+                AuditDecision::Error,
+                Some(container.clone()),
+                Some(file_name.clone()),
+                mode,
+                None,
+                Some(error.clone()),
+            );
+            event.detail = Some("export to disk".into());
+            record_desktop_event(&state, event);
+            return Err(error);
+        }
+    };
+
+    let byte_size = bytes.len();
+    // Write through a temporary file in the destination directory and rename,
+    // so an interrupted export cannot leave a half-written file that looks
+    // complete. `atomicwrites` is already used elsewhere in this crate.
+    let write_result = {
+        use atomicwrites::{AtomicFile, OverwriteBehavior};
+        use std::io::Write;
+        let file = AtomicFile::new(&dest_path, OverwriteBehavior::AllowOverwrite);
+        file.write(|f| f.write_all(&bytes)).map_err(estr)
+    };
+
+    match write_result {
+        Ok(()) => {
+            let mut event = desktop_event(
+                AuditAction::ReadFile,
+                AuditDecision::Allowed,
+                Some(container.clone()),
+                Some(file_name.clone()),
+                mode,
+                Some(byte_size),
+                None,
+            );
+            // Marks this read as one that left a decrypted copy outside the
+            // vault. The destination is deliberately absent; see the doc above.
+            event.detail = Some("export to disk".into());
+            record_desktop_event(&state, event);
+            Ok(Some(dest_path.display().to_string()))
+        }
+        Err(error) => {
+            let mut event = desktop_event(
+                AuditAction::ReadFile,
+                AuditDecision::Error,
+                Some(container),
+                Some(file_name),
+                mode,
+                Some(byte_size),
+                Some(error.clone()),
+            );
+            event.detail = Some("export to disk".into());
+            record_desktop_event(&state, event);
+            Err(error)
+        }
+    }
+}
+
 #[tauri::command]
 async fn vault_delete_file(
     state: State<'_, VaultState>,
@@ -4767,6 +4932,8 @@ pub fn run() {
             vault_list_files,
             vault_write_file,
             vault_read_file,
+            vault_export_file,
+            open_audit_folder,
             vault_delete_file,
             approval_respond,
             wake_request,
@@ -4841,6 +5008,103 @@ mod tests {
     fn unimplemented_modes_fail_closed() {
         assert!(desktop_consent_required(Some(SecurityMode::Zkp)).is_err());
         assert!(desktop_consent_required(Some(SecurityMode::Native)).is_err());
+    }
+
+    /// Every `invoke(...)` the UI issues must name a registered command.
+    ///
+    /// `vault_export_file` was invoked by two components and never existed in
+    /// Rust, so every Download click failed silently at the IPC boundary. A
+    /// missing command is invisible to `cargo check`, to `svelte-check`, and to
+    /// any test that mocks `invoke` -- which is every UI test -- so it is
+    /// checked here, against the real handler list.
+    #[test]
+    fn every_command_the_ui_invokes_is_registered() {
+        let lib = include_str!("lib.rs");
+        let handler_start = lib
+            .find("tauri::generate_handler![")
+            .expect("generate_handler! must exist");
+        let handler_end = lib[handler_start..]
+            .find(']')
+            .expect("handler list must terminate")
+            + handler_start;
+        let registered = &lib[handler_start..handler_end];
+
+        // Walk the UI sources for `invoke<...>('name'` / `invoke('name'`.
+        let ui_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../ui/src")
+            .canonicalize()
+            .expect("ui/src must exist");
+        let mut invoked: Vec<String> = Vec::new();
+        let mut stack = vec![ui_dir];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("readable ui dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let is_source = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e == "ts" || e == "svelte");
+                if !is_source {
+                    continue;
+                }
+                // Test files mock `invoke` and may name commands that do not
+                // exist, deliberately.
+                if path.to_string_lossy().contains(".test.") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("readable source");
+                for (idx, _) in text.match_indices("invoke") {
+                    let rest = &text[idx..];
+                    let Some(open) = rest.find('(') else { continue };
+                    // Skip a generic parameter list before the call parens.
+                    let head = &rest[..open];
+                    if head.contains(';') || head.contains('\n') {
+                        continue;
+                    }
+                    let after = &rest[open + 1..];
+                    let trimmed = after.trim_start();
+                    let Some(quote) = trimmed.chars().next() else {
+                        continue;
+                    };
+                    if quote != '\'' && quote != '"' && quote != '`' {
+                        continue;
+                    }
+                    let body = &trimmed[1..];
+                    let Some(end) = body.find(quote) else {
+                        continue;
+                    };
+                    let name = &body[..end];
+                    if !name.is_empty()
+                        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        invoked.push(name.to_string());
+                    }
+                }
+            }
+        }
+        invoked.sort();
+        invoked.dedup();
+        assert!(
+            !invoked.is_empty(),
+            "found no invoke() calls in the UI; the scan is broken, not the code"
+        );
+
+        let missing: Vec<&String> = invoked
+            .iter()
+            .filter(|name| {
+                // Match the identifier as a whole list entry.
+                !registered
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|token| token == name.as_str())
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the UI invokes commands that are not registered in generate_handler!: {missing:?}"
+        );
     }
 
     /// Pins the gate at every vault-mutating desktop command. These read and
