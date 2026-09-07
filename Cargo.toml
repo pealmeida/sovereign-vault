@@ -12,6 +12,7 @@ members = [
     "crates/sv-http",
     "crates/sv-core",
     "crates/sv-scan",
+    "crates/sv-exposure",
     "crates/sv-patterns",
     "crates/sv-remediate",
     "apps/cli",
@@ -47,6 +48,7 @@ sv-scan      = { path = "crates/sv-scan",      version = "0.1.0" }
 sv-patterns  = { path = "crates/sv-patterns",  version = "0.1.0" }
 sv-remediate = { path = "crates/sv-remediate", version = "0.1.0" }
 sv-http      = { path = "crates/sv-http",      version = "0.1.0" }
+sv-exposure  = { path = "crates/sv-exposure",  version = "0.1.0" }
 sv-core      = { path = "crates/sv-core",      version = "0.1.0" }
 
 # External — single source of truth for versions

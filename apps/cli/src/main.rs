@@ -4,11 +4,12 @@
 
 mod agent_commands;
 mod mcp_stdio;
+mod precommit_command;
 mod scan_command;
 mod serve;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
@@ -34,6 +35,13 @@ enum Cmd {
     Migrate(MigrateCli),
     /// Scan a project tree for secrets and personal data (read-only).
     Scan(ScanCli),
+    /// Scan only what git has STAGED and block the commit on findings.
+    ///
+    /// For a pre-commit hook: exit 2 means findings present, 1 means the scan
+    /// itself failed, so a hook can fail closed. A hook prevents the NEXT
+    /// leak; if a credential is already exposed, rotate it first — this does
+    /// not help with a key that is already out.
+    Precommit,
 }
 
 /// `sovereign-vault scan` — read-only discovery over a project tree.
@@ -246,6 +254,21 @@ async fn main() -> ExitCode {
             }
             Err(e) => {
                 eprintln!("sovereign-vault scan: {e}");
+                ExitCode::from(1)
+            }
+        },
+        Some(Cmd::Precommit) => match precommit_command::run(Path::new(".")) {
+            // Same contract as scan: 2 = findings (block the commit),
+            // 1 = failure (also block; a hook must fail closed).
+            Ok(found) => {
+                if found {
+                    ExitCode::from(2)
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(e) => {
+                eprintln!("sovereign-vault precommit: {e}");
                 ExitCode::from(1)
             }
         },

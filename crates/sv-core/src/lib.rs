@@ -745,6 +745,19 @@ impl VaultHandle {
         sv_crypto::derive_subkey(&self.identity_root, b"sv-agent-token-v1")
     }
 
+    /// Derive the keyed digest key for remediation plans.
+    ///
+    /// Anchored to the persistent identity root, not the active DEK, so a
+    /// plan built before `rotate_key` still verifies afterwards. A plan whose
+    /// digest cannot be verified is a plan whose file cannot be restored.
+    ///
+    /// The `-v1` suffix is the derivation version. Changing the label strands
+    /// every existing plan; if it ever must change, both keys must be tried
+    /// on verify.
+    pub fn remediation_plan_key(&self) -> [u8; 32] {
+        sv_crypto::derive_subkey(&self.identity_root, b"sv-remediate-plan-v1")
+    }
+
     // ---- agent registry (ADR-0008) ---------------------------------------
 
     /// Mint a new agent identity. Returns `(agent_id, one_time_token)`.
@@ -2566,6 +2579,28 @@ mod tests {
         assert_eq!(handle.custody(), CustodyMode::Passphrase);
         assert!(!root.join(keyring::STAGED_KEYRING_FILE).exists());
         assert!(read_lifecycle(&root).unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// ADR-0019 invariant I3: the remediation plan key is anchored to the
+    /// identity root, so a DEK rotation must not strand an approved plan.
+    #[test]
+    fn remediation_plan_key_survives_key_rotation() {
+        let (root, boot) = bootstrap_passphrase("plan-key-rotation");
+        let mut handle = boot.handle;
+
+        let before = handle.remediation_plan_key();
+        handle.rotate_key(&root, Some(TEST_PASSPHRASE)).unwrap();
+        let after = handle.remediation_plan_key();
+
+        assert_eq!(
+            before, after,
+            "rotate_key must not invalidate existing remediation plans"
+        );
+        assert_eq!(after, handle.remediation_plan_key(), "derivation is stable");
+        // The plan key is its own subkey, not a reuse of the audit key.
+        assert_ne!(before, handle.audit_hmac_key());
+        drop(handle);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1,0 +1,32 @@
+[package]
+name        = "sv-exposure"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace= true
+license.workspace     = true
+repository.workspace  = true
+description = "Sovereign Vault exposure classification: determine whether a discovered credential appears in git history and how urgently it must be rotated."
+
+[dependencies]
+sv-scan    = { workspace = true }
+sv-crypto  = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+chrono     = { workspace = true }
+sha2       = { workspace = true }
+hex        = { workspace = true }
+subtle     = { workspace = true }
+reqwest    = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enables outbound GitHub API calls. This is the only network-touching code in
+# the crate and is off by default.
+github = ["dep:reqwest"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

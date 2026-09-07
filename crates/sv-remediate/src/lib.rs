@@ -66,6 +66,7 @@ pub use plan::{
     RewritePlan, RulePin,
 };
 pub use recovery::{JournalEntry, JournalState, RecoveryRecord, RewriteJournal};
+pub use sv_runtime::DiscoveryPolicy;
 pub use trust::{default_selected, is_never_default};
 pub use verify::{verify_plan_item, VerifyOutcome};
 

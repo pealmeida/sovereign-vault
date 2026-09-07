@@ -188,3 +188,33 @@ export interface ScanSummary {
 
 export type ScanVerdict = 'accept' | 'false_positive' | 'ignore_rule';
 export type ScanConfidence = 'low' | 'medium' | 'high';
+
+// --- Remediation (ADR-0020 / plan P9-P10) -----------------------------------
+
+/** Read-only view of a pending remediation plan, backend-minted. */
+export interface PlanView {
+  plan_id: string;
+  path: string;
+  adapter: string;
+  /** 'wholly-sensitive', or the refusal reason for a partly-sensitive file. */
+  eligibility: string;
+  manifest_path: string;
+  identity_enforced: boolean;
+  /** Machine capability token binding approval to the exact file bytes.
+   *  Never shown to the user as something to verify. */
+  confirm_digest: string;
+}
+
+export type IngestStatus = 'ingested' | 'startup-check-failed' | 'ineligible' | 'failed';
+
+export interface IngestView {
+  status: IngestStatus;
+  manifest: string | null;
+  reason: string | null;
+  identity_enforced: boolean;
+}
+
+export interface RestoreView {
+  restored: boolean;
+  reason: string | null;
+}

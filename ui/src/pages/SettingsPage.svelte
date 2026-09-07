@@ -8,9 +8,35 @@
   import { brokerStore } from '../stores/broker.svelte';
   import { approvalStore } from '../stores/approvals.svelte';
   import { toastStore } from '../stores/toast.svelte';
+  import { invoke } from '../lib/tauri';
   let appVersion = $state('…');
   let revealPhrase = $state(false);
   let recoveryData = $state<string | null>(null);
+
+  // OS notifications (default on). The preference is mirrored to the backend
+  // via notifications_set_enabled and persisted locally so it survives restarts.
+  let notificationsEnabled = $state(true);
+  const NOTIFICATIONS_PREF_KEY = 'sv-notifications-enabled';
+
+  async function syncNotificationsEnabled() {
+    try {
+      await invoke('notifications_set_enabled', { enabled: notificationsEnabled });
+    } catch (e) {
+      toastStore.setError(e);
+    }
+  }
+
+  async function setNotificationsEnabled(value: boolean) {
+    const prev = notificationsEnabled;
+    notificationsEnabled = value;
+    try {
+      await invoke('notifications_set_enabled', { enabled: value });
+      localStorage.setItem(NOTIFICATIONS_PREF_KEY, value ? '1' : '0');
+    } catch (e) {
+      notificationsEnabled = prev;
+      toastStore.setError(e);
+    }
+  }
 
   // Session limits in minutes for the UI controls.
   let idleMinutes = $state(15);
@@ -160,6 +186,13 @@
     } catch (e) {
       toastStore.setError(e);
     }
+    // Re-apply the stored notification preference after a restart: the
+    // backend default is enabled.
+    const stored = localStorage.getItem(NOTIFICATIONS_PREF_KEY);
+    if (stored !== null) {
+      notificationsEnabled = stored === '1';
+    }
+    await syncNotificationsEnabled();
   });
 
   function toggleRecovery() {
@@ -504,6 +537,32 @@
           </div>
         </div>
       {/if}
+    </article>
+
+    <!-- Notifications -->
+    <article class="panel-card">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Notifications</p>
+          <h3>OS notifications</h3>
+        </div>
+      </div>
+
+      <div class="settings-stack">
+        <label class="detail-row" style="align-items:flex-start;gap:0.5rem;cursor:pointer">
+          <input
+            type="checkbox"
+            style="margin-top:0.2rem"
+            checked={notificationsEnabled}
+            onchange={(e) => setNotificationsEnabled(e.currentTarget.checked)}
+          />
+          <span>Notify me when an agent requests access.</span>
+        </label>
+        <p style="font-size:0.8rem;opacity:0.7;margin:0.25rem 0 0">
+          Notifications never show which secret was requested. Open Sovereign Vault to see the
+          request and respond.
+        </p>
+      </div>
     </article>
 
     <!-- About -->

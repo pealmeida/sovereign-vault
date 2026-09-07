@@ -105,7 +105,7 @@ fn counts_by_class(report: &ScanReport) -> Vec<(String, usize)> {
 /// A jurisdiction label names the rule that fired and whether its checksum
 /// passed — evidence the reader can judge. It never asserts that a legal regime
 /// applies to the value (ADR-0018 §6).
-fn class_label(kind: &FindingKind) -> String {
+pub fn class_label(kind: &FindingKind) -> String {
     match kind {
         FindingKind::Secret { rule_id } => format!("secret:{rule_id}"),
         FindingKind::Pii(category) => format!("pii:{}", category.label().to_ascii_lowercase()),
@@ -120,7 +120,7 @@ fn class_label(kind: &FindingKind) -> String {
 }
 
 /// Counts of high, medium, and low confidence findings.
-fn confidence_split(report: &ScanReport) -> (usize, usize, usize) {
+pub fn confidence_split(report: &ScanReport) -> (usize, usize, usize) {
     let mut high = 0;
     let mut medium = 0;
     let mut low = 0;

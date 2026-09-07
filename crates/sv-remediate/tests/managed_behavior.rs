@@ -105,6 +105,7 @@ impl VaultSink for MemSink {
         _adapter: ConsumerAdapter,
         _project_root: &Path,
         _manifest_path: &Path,
+        _consumed_path: &Path,
     ) -> Result<(), ApplyError> {
         if self.fail_startup {
             return Err(ApplyError::Sink(
