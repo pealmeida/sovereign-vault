@@ -18,7 +18,7 @@
     <strong>Wake request:</strong> agent <code>{w.agent_id}</code> asked for <code>{w.resource_ref}</code>
     <div style="display:flex;gap:0.5rem;margin-top:0.5rem">
       <button class="primary-button" onclick={() => approve(w.id)}>Allow</button>
-      <button class="ghost-button" onclick={() => deny(w.id)}>Dismiss</button>
+      <button class="ghost-button" onclick={() => deny(w.id)}>Deny</button>
     </div>
   </div>
 {/each}

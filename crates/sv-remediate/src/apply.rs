@@ -268,12 +268,15 @@ pub trait VaultSink {
     /// demonstrably still work with the file vaulted before the original is
     /// removed. The real probe belongs to the caller — only the caller
     /// knows the toolchain; [`crate::managed::startup_check`] is the
-    /// built-in manifest-based default an implementation may delegate to.
+    /// built-in manifest-based default an implementation may delegate to,
+    /// passing `consumed_path` through so the manifest is verified against
+    /// the plan's file. It MUST NOT spawn a process or run a shell.
     fn startup_check(
         &self,
         adapter: crate::managed::ConsumerAdapter,
         project_root: &Path,
         manifest_path: &Path,
+        consumed_path: &Path,
     ) -> Result<(), ApplyError>;
 }
 

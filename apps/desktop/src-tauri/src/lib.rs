@@ -20,6 +20,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
+use sv_remediate::{
+    managed::{ConsumerAdapter, ManagedFilePlan, ManagedIngestStatus},
+    IdentityAssurance,
+};
+use sv_runtime::DiscoveryPolicy;
+
 /// Default idle timeout for an unlocked desktop session.
 ///
 /// A chatty MCP agent MUST NOT reset this timer (ADR-0020 §9). If activity were
@@ -69,6 +75,11 @@ const WAKE_LEASE_EVENT: &str = "vault://wake-lease";
 const APPROVAL_TIMEOUT_SECS: u64 = 120;
 
 type SharedHandle = Arc<Mutex<Option<VaultHandle>>>;
+
+/// Remediation persistence (plan P8): the desktop `VaultSink` over the
+/// vault handle. P9 wires the plan registry and Tauri commands on top.
+mod remediate;
+use remediate::HandleSink;
 
 /// Shutdown signals for the MCP + HTTP background tasks.
 struct ServersShutdown {
@@ -601,6 +612,15 @@ const WAKE_REQUEST_TTL_SECS: u64 = 300;
 const WAKE_NOTIFICATION_COOLDOWN_SECS: u64 = 60;
 const WAKE_LEASE_TTL_SECS: u64 = 120;
 
+/// How long an unapproved remediation plan stays in the registry.
+///
+/// A plan is an authorization to delete a specific file, bound to that file's
+/// content at plan time. A cancelled confirm dialog leaves one behind with no
+/// UI referencing it, so plans expire rather than accumulate. Ten minutes is
+/// long enough to read a confirm dialog and short enough that a stale
+/// authorization does not sit around; re-planning is cheap.
+const PLAN_TTL_SECS: i64 = 600;
+
 /// Stable coalescing signature for a wake request. No secret material is
 /// hashed.
 fn wake_signature(agent_id: &str, opaque_resource_ref: &str) -> String {
@@ -1088,6 +1108,10 @@ struct VaultState<R: Runtime = tauri::Wry> {
     /// Short-lived, single-use leases issued after human approval of a wake
     /// request (ADR-0020 §10).
     leases: Arc<LeaseStore>,
+    /// Backend-held pending remediation plans (ADR-0020 §2). The renderer only
+    /// sees opaque `plan_id`s; the real path lives here, resolved from the
+    /// stored scan report.
+    pending_plans: Arc<Mutex<HashMap<String, PendingPlan>>>,
     /// Handle to the session monitor task. Stored so we can avoid spawning
     /// duplicate monitors on every unlock (a leaked second monitor is harmless
     /// but noisy; we drop the old JoinHandle before spawning a new one).
@@ -1106,6 +1130,7 @@ impl<R: Runtime> VaultState<R> {
             session_timer: SessionTimer::new(),
             wake_queue: Arc::new(WakeQueue::new(app.clone())),
             leases: Arc::new(LeaseStore::new()),
+            pending_plans: Arc::new(Mutex::new(HashMap::new())),
             session_monitor: Mutex::new(None),
         }
     }
@@ -1277,6 +1302,54 @@ struct ScanSummaryView {
     scanned_path: String,
     created_at: String,
     finding_count: usize,
+}
+
+/// Backend-held pending remediation plan. The renderer only ever receives the
+/// opaque `plan_id`; the path is stored here and resolved from the stored scan
+/// report, so a compromised renderer cannot supply an arbitrary filesystem path.
+#[derive(Debug, Clone)]
+struct PendingPlan {
+    id: String,
+    project_root: PathBuf,
+    plan: ManagedFilePlan,
+    snapshot_digest: sv_remediate::Digest,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Read-only view of a pending remediation plan sent to the UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanView {
+    plan_id: String,
+    path: String,
+    adapter: String,
+    eligibility: String,
+    manifest_path: String,
+    identity_enforced: bool,
+    /// Hex of the plan's snapshot digest, echoed back as `confirm_digest` to
+    /// bind approval to this exact file content (ADR-0019 §2).
+    ///
+    /// Safe to hand to the renderer: it is an HMAC under a key derived from
+    /// the vault identity root, which the renderer never sees, so it is an
+    /// unguessable capability token rather than an oracle for the file's
+    /// bytes. It is not a human-verifiable value and the UI must not present
+    /// it as one.
+    confirm_digest: String,
+}
+
+/// Result of a whole-file ingestion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IngestView {
+    status: String,
+    manifest: Option<String>,
+    reason: Option<String>,
+    identity_enforced: bool,
+}
+
+/// Result of restoring a previously ingested file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RestoreView {
+    restored: bool,
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2011,6 +2084,13 @@ async fn vault_lock(state: State<'_, VaultState>) -> Result<(), String> {
 async fn perform_vault_lock(state: &VaultState, reason: &str) {
     let mut guard = state.handle.lock().await;
     *guard = None;
+    // Pending plans do not survive a lock. A plan is a snapshot-bound
+    // authorization to delete a specific file; carrying one across a lock
+    // would let a decision taken in one session be executed in the next,
+    // after the user deliberately ended their access. Re-planning after
+    // unlock is cheap and re-reads the file, which is the behaviour we want
+    // anyway.
+    state.pending_plans.lock().await.clear();
     // Stop the local gateway; the monitor task has already ended by the time
     // it calls this, so there is no race with itself.
     {
@@ -2425,6 +2505,13 @@ fn scan_report_path(root: &std::path::Path, id: &str) -> Result<std::path::PathB
         .join(format!("{SCAN_REPORT_FILE_PREFIX}{id}.json")))
 }
 
+/// Load a stored scan report by id. The id is validated before use.
+fn load_stored_scan_report(root: &std::path::Path, id: &str) -> Result<StoredScanReport, String> {
+    let path = scan_report_path(root, id)?;
+    let text = std::fs::read_to_string(&path).map_err(estr)?;
+    serde_json::from_str(&text).map_err(estr)
+}
+
 fn scan_triage_path(root: &std::path::Path, id: &str) -> Result<std::path::PathBuf, String> {
     validate_scan_id(id)?;
     Ok(root
@@ -2524,6 +2611,13 @@ fn finding_kind_label(kind: &FindingKind) -> String {
             format!("jurisdiction:{pack_id}/{rule_id}{validated_flag}")
         }
     }
+}
+
+/// Mints a random, opaque plan id. The id carries no path information.
+fn mint_plan_id() -> String {
+    let bytes = sv_core::sv_crypto::random_bytes(16)
+        .expect("random_bytes must never fail in desktop runtime");
+    format!("plan-{}", hex::encode(bytes))
 }
 
 fn parse_min_confidence(s: Option<String>) -> Result<Option<Confidence>, String> {
@@ -2779,6 +2873,362 @@ async fn scan_history_list(state: State<'_, VaultState>) -> Result<Vec<ScanSumma
                 None,
                 None,
                 Some(error.clone()),
+            ),
+        ),
+    }
+    result
+}
+
+#[tauri::command]
+async fn remediate_plan_file(
+    state: State<'_, VaultState>,
+    scan_id: String,
+    finding_path: String,
+    adapter: String,
+) -> Result<PlanView, String> {
+    state.touch_human_activity();
+
+    let adapter_enum =
+        ConsumerAdapter::parse(&adapter).ok_or_else(|| "invalid adapter".to_string())?;
+
+    let result = with_handle(&state, |handle| {
+        let vault_root = vault_root(&state.app).map_err(estr)?;
+        let stored = load_stored_scan_report(&vault_root, &scan_id)?;
+        let project_root = std::path::Path::new(&stored.scanned_path)
+            .canonicalize()
+            .map_err(estr)?;
+        let project_id = stored.id.clone();
+
+        let key = sv_remediate::PlanKey::from_bytes(&handle.remediation_plan_key())
+            .map_err(|error| format!("invalid plan key: {error}"))?;
+
+        let relative = std::path::Path::new(&finding_path);
+        // The manifest lives beside the consumed file with a `.vault-manifest.json`
+        // suffix so consumers never read it as the value.
+        let manifest_name = format!(
+            "{}.vault-manifest.json",
+            relative
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| "invalid finding path".to_string())?
+        );
+        let manifest_path = relative.with_file_name(manifest_name);
+
+        let plan = ManagedFilePlan::build(
+            &project_id,
+            relative,
+            &project_root,
+            adapter_enum,
+            &manifest_path,
+            sv_remediate::managed::SharedBinding::Independent,
+            &key,
+        )
+        .map_err(|error| error.to_string())?;
+
+        // Eligibility refusal comes back as a variant, not an error path.
+        let eligibility = match sv_remediate::managed::check_eligibility(relative) {
+            sv_remediate::managed::Eligibility::WhollySensitive => "wholly-sensitive".to_string(),
+            sv_remediate::managed::Eligibility::PartlySensitive { reason } => reason,
+        };
+
+        let plan_id = mint_plan_id();
+        let snapshot_digest = plan.snapshot_digest;
+        let view = PlanView {
+            plan_id: plan_id.clone(),
+            path: plan.path.to_string_lossy().to_string(),
+            adapter: plan.adapter.as_str().to_string(),
+            eligibility,
+            manifest_path: plan.manifest_path.to_string_lossy().to_string(),
+            identity_enforced: cfg!(unix),
+            confirm_digest: hex::encode(snapshot_digest.as_bytes()),
+        };
+
+        let pending = PendingPlan {
+            id: plan_id,
+            project_root,
+            plan,
+            snapshot_digest,
+            created_at: chrono::Utc::now(),
+        };
+
+        // Holding the pending-plans lock across a synchronous vault call
+        // keeps the registry consistent with the handle lifetime.
+        state
+            .pending_plans
+            .blocking_lock()
+            .insert(pending.id.clone(), pending);
+
+        Ok(view)
+    })
+    .await;
+
+    match &result {
+        Ok(_) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::PlanCreate,
+                AuditDecision::Allowed,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ),
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::PlanCreate,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
+}
+
+#[tauri::command]
+async fn remediate_plan_list(state: State<'_, VaultState>) -> Result<Vec<PlanView>, String> {
+    // Polling command: do NOT touch_human_activity here.
+    let plans = state.pending_plans.lock().await;
+    Ok(plans
+        .values()
+        .map(|p| PlanView {
+            plan_id: p.id.clone(),
+            path: p.plan.path.to_string_lossy().to_string(),
+            adapter: p.plan.adapter.as_str().to_string(),
+            eligibility: "wholly-sensitive".to_string(),
+            manifest_path: p.plan.manifest_path.to_string_lossy().to_string(),
+            identity_enforced: cfg!(unix),
+            confirm_digest: hex::encode(p.snapshot_digest.as_bytes()),
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn remediate_execute(
+    state: State<'_, VaultState>,
+    plan_id: String,
+    confirm_digest: String,
+) -> Result<IngestView, String> {
+    state.touch_human_activity();
+
+    let result = with_handle(&state, |handle| {
+        let vault_root = vault_root(&state.app).map_err(estr)?;
+        let key = sv_remediate::PlanKey::from_bytes(&handle.remediation_plan_key())
+            .map_err(|error| format!("invalid plan key: {error}"))?;
+
+        let plan = {
+            let mut plans = state.pending_plans.blocking_lock();
+            // Drop everything past its TTL first, so an expired plan is
+            // indistinguishable from one that never existed.
+            let now = chrono::Utc::now();
+            plans.retain(|_, p| (now - p.created_at).num_seconds() < PLAN_TTL_SECS);
+            let pending = plans
+                .get(&plan_id)
+                .ok_or_else(|| "unknown plan id".to_string())?
+                .clone();
+            let expected = hex::encode(pending.snapshot_digest.as_bytes());
+            // `ct_eq` is only constant-time across equal-length slices, and
+            // on unequal lengths it does not compare at all. Reject a
+            // wrong-length input first, so the constant-time path is the
+            // only one that can reach a comparison.
+            if confirm_digest.len() != expected.len()
+                || !bool::from(confirm_digest.as_bytes().ct_eq(expected.as_bytes()))
+            {
+                return Err("plan digest mismatch".to_string());
+            }
+            pending
+        };
+
+        let assurance = if cfg!(unix) {
+            IdentityAssurance::Enforced
+        } else {
+            IdentityAssurance::AcknowledgedUnavailable
+        };
+        let identity_enforced = cfg!(unix);
+
+        let mut sink = HandleSink::new(handle, vault_root);
+        let ingest_status = sv_remediate::managed::ingest_managed_file(
+            &plan.plan,
+            &plan.project_root,
+            &key,
+            assurance,
+            &mut sink,
+        )
+        .map_err(|error| error.to_string())?;
+
+        // Terminal outcome: remove the plan from the registry regardless of
+        // success, so a retry requires rebuilding and re-approving.
+        state.pending_plans.blocking_lock().remove(&plan_id);
+
+        let view = match ingest_status {
+            ManagedIngestStatus::Ingested { manifest } => IngestView {
+                status: "ingested".to_string(),
+                manifest: Some(manifest.to_string_lossy().to_string()),
+                reason: None,
+                identity_enforced,
+            },
+            ManagedIngestStatus::StartupCheckFailed { reason } => IngestView {
+                status: "startup-check-failed".to_string(),
+                manifest: None,
+                reason: Some(reason),
+                identity_enforced,
+            },
+            ManagedIngestStatus::Ineligible { reason } => IngestView {
+                status: "ineligible".to_string(),
+                manifest: None,
+                reason: Some(reason),
+                identity_enforced,
+            },
+            ManagedIngestStatus::Failed { reason } => IngestView {
+                status: "failed".to_string(),
+                manifest: None,
+                reason: Some(reason),
+                identity_enforced,
+            },
+        };
+
+        Ok(view)
+    })
+    .await;
+
+    // The approval moment is its own audited event, separate from the
+    // execution that follows it: a refused confirmation must leave a record
+    // even though nothing was executed. It is emitted here rather than inside
+    // the closure because `record_desktop_event` takes the handle mutex that
+    // `with_handle` still holds in there, and would silently drop the event.
+    record_desktop_event(
+        &state,
+        desktop_event(
+            AuditAction::PlanApprove,
+            match &result {
+                Err(error) if error == "plan digest mismatch" => AuditDecision::Denied,
+                _ => AuditDecision::Allowed,
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    );
+
+    match &result {
+        Ok(view) => {
+            let decision = if view.status == "ingested" {
+                AuditDecision::Allowed
+            } else {
+                AuditDecision::Error
+            };
+            record_desktop_event(
+                &state,
+                desktop_event(
+                    AuditAction::PlanExecute,
+                    decision,
+                    None,
+                    None,
+                    None,
+                    None,
+                    view.reason.clone(),
+                ),
+            );
+        }
+        Err(error) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::PlanExecute,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.clone()),
+            ),
+        ),
+    }
+    result
+}
+
+#[tauri::command]
+async fn remediate_restore(
+    state: State<'_, VaultState>,
+    plan_id_or_ref: String,
+) -> Result<RestoreView, String> {
+    state.touch_human_activity();
+
+    let result = with_handle(&state, |handle| {
+        let vault_root = vault_root(&state.app).map_err(estr)?;
+        let mut sink = HandleSink::new(handle, vault_root.clone());
+
+        // If the argument matches a known plan id, prefer the stored plan
+        // so the renderer cannot point restore at an arbitrary path.
+        let (record, root) =
+            if let Some(pending) = state.pending_plans.blocking_lock().remove(&plan_id_or_ref) {
+                (
+                    sv_remediate::RecoveryRecord {
+                        plan_digest: pending.snapshot_digest,
+                        project_id: pending.plan.project_id,
+                        path: pending.plan.path.clone(),
+                        identity: pending.plan.identity,
+                        snapshot_digest: pending.snapshot_digest,
+                        snapshot_ref: "".to_string(), // unused for spanless restore; ingest has not run
+                        discovery: DiscoveryPolicy::Opaque,
+                        locator: None,
+                        span: None,
+                        replacement: None,
+                        created_at: pending.created_at,
+                    },
+                    pending.project_root,
+                )
+            } else {
+                return Err("unknown plan id".to_string());
+            };
+
+        // Managed-file restore is a full-file rollback. For pending plans we
+        // have not yet ingested, there is nothing to restore; report that.
+        if record.snapshot_ref.is_empty() {
+            return Ok(RestoreView {
+                restored: false,
+                reason: Some("plan has not been executed yet".to_string()),
+            });
+        }
+
+        // Restore expects a recovery record written by the sink. Pending
+        // plans do not have one, so this command cannot run against them.
+        // Real restore requires loading the recovery record from the vault.
+        let _ = (&record, &root, &mut sink);
+        Err("pending plan cannot be restored before execution".to_string())
+    })
+    .await;
+
+    match &result {
+        Ok(RestoreView { restored: true, .. }) => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::PlanExecute,
+                AuditDecision::Allowed,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ),
+        _ => record_desktop_event(
+            &state,
+            desktop_event(
+                AuditAction::PlanExecute,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                result.as_ref().err().cloned(),
             ),
         ),
     }
@@ -3788,6 +4238,10 @@ pub fn run() {
             broker_create_secret,
             broker_list_secrets,
             broker_enabled,
+            remediate_plan_file,
+            remediate_plan_list,
+            remediate_execute,
+            remediate_restore,
             cli_binary_path,
         ])
         .run(tauri::generate_context!())

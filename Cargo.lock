@@ -4443,6 +4443,8 @@ dependencies = [
  "sv-core",
  "sv-http",
  "sv-mcp",
+ "sv-remediate",
+ "sv-runtime",
  "sv-scan",
  "tauri",
  "tauri-build",
@@ -4654,7 +4656,7 @@ dependencies = [
  "sv-runtime",
  "sv-scan",
  "tempfile",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "zeroize",
 ]
 

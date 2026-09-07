@@ -609,7 +609,9 @@ pub fn ingest_managed_file(
 
     // The removal gate: if the adapter cannot demonstrate the project still
     // works, the original stays and the manifest is cleaned up.
-    if let Err(error) = sink.startup_check(plan.adapter, project_root, &plan.manifest_path) {
+    if let Err(error) =
+        sink.startup_check(plan.adapter, project_root, &plan.manifest_path, &plan.path)
+    {
         let _ = fs::remove_file(&manifest_target);
         return Ok(ManagedIngestStatus::StartupCheckFailed {
             reason: error.to_string(),
@@ -671,10 +673,10 @@ fn resolve_target_after_create(root: &Path, relative: &Path) -> Result<PathBuf, 
 /// The built-in, manifest-based startup check (ADR-0020 §2).
 ///
 /// Verifies that the manifest exists, parses, names the selected adapter,
-/// and records the file being ingested. A caller whose toolchain allows a
-/// deeper probe — actually launching the project — should perform it inside
-/// their [`VaultSink::startup_check`] implementation and may use this as
-/// the first step.
+/// and records the same consumed path as the plan. A caller whose toolchain
+/// allows a deeper probe — actually launching the project — should perform
+/// it inside their [`VaultSink::startup_check`] implementation and may use
+/// this as the first step.
 pub fn startup_check(
     adapter: ConsumerAdapter,
     project_root: &Path,

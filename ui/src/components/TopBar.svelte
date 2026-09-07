@@ -6,23 +6,11 @@
   import { fileStore } from '../stores/files.svelte';
   import { mcpStore } from '../stores/mcp.svelte';
   import { toastStore } from '../stores/toast.svelte';
+  import { resolveRouteMeta } from '../lib/routes';
 
   let search = $state('');
 
-  const titleMap = {
-    vault: { eyebrow: 'Agent storage', title: 'Secure data categories' },
-    files: { eyebrow: 'Vault files', title: 'Encrypted file registry' },
-    settings: { eyebrow: 'Preferences', title: 'Storage and runtime' },
-  } satisfies Record<string, { eyebrow: string; title: string }>;
-
-  type PageKey = keyof typeof titleMap;
-
-  let pageKey = $derived<PageKey>(
-    router.location.startsWith('/files') ? 'files'
-    : router.location.startsWith('/settings') ? 'settings'
-    : 'vault'
-  );
-  let meta = $derived(titleMap[pageKey]);
+  let meta = $derived(resolveRouteMeta(router.location));
 
   async function doRefresh() {
     try {

@@ -167,6 +167,7 @@ impl VaultSink for MemSink {
         _adapter: sv_remediate::ConsumerAdapter,
         _project_root: &std::path::Path,
         _manifest_path: &std::path::Path,
+        _consumed_path: &std::path::Path,
     ) -> Result<(), ApplyError> {
         if self.fail_startup {
             return Err(ApplyError::Sink("startup check failed".to_string()));

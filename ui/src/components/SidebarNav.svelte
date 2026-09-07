@@ -1,16 +1,9 @@
 <script lang="ts">
-  import { FolderLock, Files, Settings2, ScrollText, Radar, ShieldCheck, Lock } from '@lucide/svelte';
+  import { ShieldCheck, Lock } from '@lucide/svelte';
   import { router, push } from 'svelte-spa-router';
   import { vaultStore } from '../stores/vault.svelte';
   import { toastStore } from '../stores/toast.svelte';
-
-  const items = [
-    { path: '/vault', label: 'Vault', icon: FolderLock },
-    { path: '/files', label: 'Files', icon: Files },
-    { path: '/scans', label: 'Scans', icon: Radar },
-    { path: '/logs', label: 'Logs', icon: ScrollText },
-    { path: '/settings', label: 'Settings', icon: Settings2 },
-  ] as const;
+  import { routes } from '../lib/routes';
 
   function isActive(path: string): boolean {
     if (path === '/vault') return router.location === '/' || router.location === '/vault';
@@ -39,15 +32,15 @@
   </div>
 
   <nav class="nav-list">
-    {#each items as item}
+    {#each routes as route}
       <button
         class="nav-button"
-        class:active={isActive(item.path)}
+        class:active={isActive(route.path)}
         disabled={!vaultStore.status?.unlocked}
-        onclick={() => push(item.path)}
+        onclick={() => push(route.path)}
       >
-        <svelte:component this={item.icon} size={16} />
-        {item.label}
+        <svelte:component this={route.icon} size={16} />
+        {route.label}
       </button>
     {/each}
   </nav>

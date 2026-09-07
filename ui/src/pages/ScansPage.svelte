@@ -1,20 +1,72 @@
   <script lang="ts">
     import { onMount } from 'svelte';
-    import { Radar, Play, FolderOpen, RefreshCw, Eye, ShieldCheck, AlertTriangle, FileKey } from '@lucide/svelte';
+    import { Radar, Play, FolderOpen, RefreshCw, Eye, ShieldCheck, AlertTriangle, FileKey, X } from '@lucide/svelte';
     import { scansStore } from '../stores/scans.svelte';
     import { vaultStore } from '../stores/vault.svelte';
     import { toastStore } from '../stores/toast.svelte';
+    import { remediateStore } from '../stores/remediate.svelte';
     import type { ScanFinding, ScanVerdict } from '../lib/types';
 
-    interface ManagedFileEntry {
-      path: string;
-      adapter: string;
-      project: string;
+    async function moveToVault(finding: ScanFinding) {
+      const reportId = scansStore.currentReport?.id;
+      if (!reportId) return;
+      try {
+        await remediateStore.planFile(reportId, finding.path, 'env-injection');
+      } catch (e) {
+        toastStore.setError(e);
+      }
     }
 
-    // Populated by the managed-file ingestion flow (ADR-0020); the vault
-    // launch adapter is wired separately. Empty until then.
-    let managedFiles: ManagedFileEntry[] = [];
+    /// Adapter selection inside the dialog replans with the backend, so every
+    /// value the dialog renders stays backend-derived.
+    async function replanPending(findingPath: string, adapter: string) {
+      const reportId = scansStore.currentReport?.id;
+      if (!reportId) return;
+      try {
+        await remediateStore.planFile(reportId, findingPath, adapter);
+      } catch (e) {
+        toastStore.setError(e);
+      }
+    }
+
+    async function executePending() {
+      try {
+        const view = await remediateStore.executePending();
+        if (!view) return;
+        if (view.status === 'ingested') {
+          // Load-bearing copy: the file moved, the credential did not.
+          toastStore.setNotice('File secured. Credential replacement still required.');
+        } else if (view.reason) {
+          toastStore.setError(view.reason);
+        }
+      } catch (e) {
+        toastStore.setError(e);
+      }
+    }
+
+    async function restoreManaged(planId: string) {
+      try {
+        const view = await remediateStore.restore(planId);
+        if (view.restored) {
+          toastStore.setNotice('File restored from the vault copy.');
+        } else {
+          toastStore.setError(
+            view.reason ??
+              'Restore is conflict-checked: the file changed after the rewrite, so nothing was overwritten.'
+          );
+        }
+      } catch (e) {
+        toastStore.setError(e);
+      }
+    }
+
+    // Keep the dialog's adapter select in sync with the backend plan.
+    $effect(() => {
+      if (remediateStore.pendingPlan) {
+        dialogAdapter = remediateStore.pendingPlan.adapter;
+      }
+    });
+    let dialogAdapter = $state('env-injection');
 
 
   onMount(async () => {
@@ -261,6 +313,7 @@
                       <th>Line</th>
                       <th>Confidence</th>
                       <th>Preview</th>
+                      <th>File treatment</th>
                       <th>Triage</th>
                     </tr>
                   </thead>
@@ -293,7 +346,37 @@
                           {/if}
                         </td>
                         <td>
+                          {#if remediateStore.treatmentFor(finding.path) === 'vaulted'}
+                            <span class="mode-pill" style="color:var(--yellow);border-color:rgba(243,201,105,0.35);background:rgba(243,201,105,0.08)">Vaulted</span>
+                            <div style="margin-top:0.35rem;max-width:220px;color:var(--yellow);font-size:0.75rem">
+                              File secured. Credential replacement still required.
+                            </div>
+                          {:else}
+                            <span class="filter-chip">In place</span>
+                          {/if}
+                          {#if remediateStore.refusalFor(finding.path)}
+                            <div style="margin-top:0.35rem;max-width:240px;font-size:0.75rem;color:var(--muted)">
+                              {remediateStore.refusalFor(finding.path)}
+                            </div>
+                            <span class="mode-pill" style="margin-top:0.35rem;display:inline-block;color:var(--muted);border-color:rgba(128,128,128,0.35);background:rgba(128,128,128,0.08)">Review span redaction</span>
+                          {/if}
+                          {#if remediateStore.failureFor(finding.path)}
+                            <div style="margin-top:0.35rem;max-width:240px;font-size:0.75rem;color:var(--muted)">
+                              {remediateStore.failureFor(finding.path)}
+                            </div>
+                          {/if}
+                        </td>
+                        <td>
                           <div style="display:flex;gap:0.35rem;flex-wrap:wrap">
+                            <button
+                              class="ghost-button"
+                              style="padding:0.3rem 0.5rem;font-size:0.72rem"
+                              disabled={remediateStore.treatmentFor(finding.path) === 'vaulted' || remediateStore.busy || remediateStore.refusalFor(finding.path) !== null}
+                              title={remediateStore.refusalFor(finding.path) ? 'Whole-file ingestion was refused for this file.' : undefined}
+                              onclick={() => moveToVault(finding)}
+                            >
+                              <FileKey size={12} /> Move to vault
+                            </button>
                             {#if finding.verdict}
                               <span class="filter-chip {verdictClass(finding.verdict)}">{finding.verdict.replace(/_/g, ' ')}</span>
                             {/if}
@@ -362,7 +445,8 @@
     {/if}
 
     <!-- Managed files (ADR-0020): wholly-sensitive files moved into the
-         vault, with the consumer adapter that serves them at launch. -->
+         vault. Vaulted is NOT resolved: every row carries the rotation
+         reminder, because the credential is still live out there. -->
     <article class="panel-card" style="margin-top:1rem">
       <div class="panel-header compact">
         <div>
@@ -370,7 +454,7 @@
           <h3>Managed files</h3>
         </div>
       </div>
-      {#if managedFiles.length === 0}
+      {#if remediateStore.ingested.length === 0}
         <div class="empty-state">
           <FileKey size={24} />
           <p>No files ingested yet. Wholly-sensitive files (.env, .pem, service-account.json) can move into the vault while an adapter supplies them at launch.</p>
@@ -381,16 +465,40 @@
             <thead>
               <tr>
                 <th>File</th>
-                <th>Adapter</th>
-                <th>Project</th>
+                <th>Manifest</th>
+                <th>Rotation</th>
+                <th>Recover</th>
               </tr>
             </thead>
             <tbody>
-              {#each managedFiles as entry (entry.path + entry.project)}
+              {#each remediateStore.ingested as entry (entry.plan_id)}
                 <tr class="vault-table-row">
                   <td><code style="font-family:var(--font-mono);font-size:0.75rem">{entry.path}</code></td>
-                  <td><span class="filter-chip">{entry.adapter}</span></td>
-                  <td>{entry.project}</td>
+                  <td>
+                    {#if entry.manifest}
+                      <code style="font-family:var(--font-mono);font-size:0.72rem">{entry.manifest}</code>
+                    {:else}
+                      <span class="filter-chip">—</span>
+                    {/if}
+                  </td>
+                  <td>
+                    <span class="mode-pill" style="color:var(--yellow);border-color:rgba(243,201,105,0.35);background:rgba(243,201,105,0.08)">Unverified → rotate or revoke</span>
+                  </td>
+                  <td>
+                    <button
+                      class="ghost-button"
+                      style="padding:0.3rem 0.5rem;font-size:0.72rem"
+                      disabled={remediateStore.busy}
+                      onclick={() => restoreManaged(entry.plan_id)}
+                    >
+                      Restore (conflict-checked)
+                    </button>
+                    {#if !entry.identity_enforced}
+                      <div style="margin-top:0.35rem;font-size:0.72rem;color:var(--muted)">
+                        Identity was not enforced on this platform.
+                      </div>
+                    {/if}
+                  </td>
                 </tr>
               {/each}
             </tbody>
@@ -398,8 +506,70 @@
         </div>
       {/if}
       <p class="supporting-copy" style="margin-top:0.75rem;font-style:italic">
-        Removal of the original only happens after the consumer adapter passes its startup check. Re-created plaintext is detected at launch, not prevented.
+        A managed file is removed from the project tree, not from Git history. Restoring brings the bytes back and is conflict-checked; it does not make a leaked credential valid again.
       </p>
     </article>
   {/if}
 </section>
+
+{#if remediateStore.pendingPlan}
+  {@const plan = remediateStore.pendingPlan}
+  <div class="modal-shell" role="dialog" aria-modal="true" aria-label="Move file to vault">
+    <div class="modal-card panel-card" style="max-width:480px;width:100%">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Managed file</p>
+          <h3>Move to vault and remove original</h3>
+        </div>
+        <button class="ghost-button" onclick={() => remediateStore.cancelPendingPlan()}>
+          <X size={16} />
+        </button>
+      </div>
+
+      <dl style="font-size:0.88rem;display:grid;grid-template-columns:auto 1fr;gap:0.4rem 1rem">
+        <dt style="color:var(--muted)">File</dt>
+        <dd><code style="font-family:var(--font-mono);font-size:0.78rem">{plan.path}</code></dd>
+        <dt style="color:var(--muted)">Adapter</dt>
+        <dd>
+          <select
+            class="text-input"
+            value={dialogAdapter}
+            onchange={(e) => replanPending(plan.path, e.currentTarget.value)}
+          >
+            <option value="env-injection">env-injection (recommended)</option>
+            <option value="temp-file">temp-file (restricted temp path)</option>
+          </select>
+        </dd>
+        <dt style="color:var(--muted)">Manifest destination</dt>
+        <dd><code style="font-family:var(--font-mono);font-size:0.78rem">{plan.manifest_path}</code></dd>
+      </dl>
+
+      {#if !plan.identity_enforced}
+        <div class="notice-banner" style="margin-top:0.75rem" role="status">
+          <div>
+            <p>Identity was not enforced on this platform. The whole-file digest check still applies.</p>
+          </div>
+        </div>
+      {/if}
+
+      <p class="supporting-copy" style="margin-top:0.75rem">
+        What happens, in order: a recoverable copy is stored in the vault → the project is verified to still start → the original file is removed and a manifest is left behind for the launcher.
+      </p>
+      <p class="supporting-copy" style="font-style:italic">
+        This does not revoke the credential or remove it from Git history.
+      </p>
+      <p class="supporting-copy" style="font-style:italic">
+        Any change to the file cancels execution and requires a fresh review.
+      </p>
+
+      <div class="modal-actions" style="margin-top:1rem">
+        <button class="ghost-button" onclick={() => remediateStore.cancelPendingPlan()}>
+          Cancel
+        </button>
+        <button class="primary-button" disabled={remediateStore.busy} onclick={() => executePending()}>
+          Move to vault and remove original
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
