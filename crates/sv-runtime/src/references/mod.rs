@@ -12,6 +12,12 @@ pub mod token;
 /// Entries, two-phase resolution, and lease settlement.
 pub mod registry;
 
+/// Durable public locators and the exchange contract (ADR-0016).
+pub mod locator;
+
+pub use locator::{
+    LocatorExchangeError, LocatorLedger, LocatorRecord, PublicLocator, ResourceState,
+};
 pub use registry::{
     unsettled_drops, LeaseOutcome, MaterialLease, MaterialUseGrant, ReferenceEntry,
     ReferenceRegistry, ResolutionContext, ResolvedReferenceMetadata, SafeMetadata,

@@ -312,6 +312,16 @@ pre {
   gap: 0.5rem;
 }
 
+.session-timer {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
 .search-shell {
   display: flex;
   align-items: center;

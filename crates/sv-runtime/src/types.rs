@@ -439,6 +439,70 @@ impl Default for ExposureClass {
     }
 }
 
+/// Whether the *existence* of a resource may be disclosed in a rewritten file.
+///
+/// This is a separate axis from [`ExposureClass`], not a refinement of it.
+/// Exposure ranks what **form** material may take when it leaves the vault;
+/// this policy decides whether a resolvable marker naming the resource may be
+/// emitted at all (ADR-0016 §3). Publishing a locator is an existence
+/// disclosure — it tells every reader of the file that a specific protected
+/// resource is registered and can be requested — so the question is answered
+/// explicitly instead of being inferred from a class built to answer a
+/// different one.
+///
+/// Ordered toward the more restrictive policy, so that stacking policies can
+/// only narrow disclosure, never widen it:
+///
+/// ```text
+/// Discoverable < Opaque
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryPolicy {
+    /// A durable public locator (`[SV:LOC:v1:…]`) may be written into the file.
+    Discoverable,
+    /// The file receives the anonymous `[REDACTED:<LABEL>]` form instead; no
+    /// public resolution path exists.
+    ///
+    /// This removes **public** resolution, not **owner** recovery: the rewrite
+    /// pipeline still records an encrypted owner-side recovery record for the
+    /// redaction, so the vault owner can recover the material. What the holder
+    /// of the file cannot do is ask anything of it.
+    Opaque,
+}
+
+impl DiscoveryPolicy {
+    /// Returns the more restrictive of `self` and `other`.
+    pub fn join(self, other: Self) -> Self {
+        core::cmp::max(self, other)
+    }
+
+    /// The discovery policy for a resource of `class`.
+    ///
+    /// [`ExposureClass::NonExportable`] forces [`DiscoveryPolicy::Opaque`]:
+    /// for bytes that may never leave the vault in any form, advertising their
+    /// existence in a file that will be committed and shared is a disclosure
+    /// with no corresponding benefit. The default is encoded here in code, not
+    /// left to callers to remember.
+    pub fn for_exposure_class(class: ExposureClass) -> Self {
+        match class {
+            ExposureClass::NonExportable => DiscoveryPolicy::Opaque,
+            ExposureClass::Raw
+            | ExposureClass::Transformed
+            | ExposureClass::ReferenceOnly
+            | ExposureClass::ExecuteOnly => DiscoveryPolicy::Discoverable,
+        }
+    }
+}
+
+impl Default for DiscoveryPolicy {
+    /// Fails closed: existence disclosure is opt-in, never the fallback for a
+    /// policy that was not written down.
+    fn default() -> Self {
+        DiscoveryPolicy::Opaque
+    }
+}
+
 /// The exposure vocabulary an operator writes in a `[rule.effect]` block.
 ///
 /// This is deliberately a different type from [`ExposureClass`]. §2 of the
@@ -950,5 +1014,45 @@ mod tests {
         let e = RuntimeError::LimitExceeded;
         assert_eq!(e.code(), "limit_exceeded");
         assert!(!e.to_string().contains("CANARY"));
+    }
+
+    /// ADR-0016 §3: `NonExportable` resources default to `Opaque`, encoded in
+    /// code rather than left to callers.
+    #[test]
+    fn nonexportable_resources_default_to_opaque_discovery() {
+        for class in [
+            ExposureClass::Raw,
+            ExposureClass::Transformed,
+            ExposureClass::ReferenceOnly,
+            ExposureClass::ExecuteOnly,
+        ] {
+            assert_eq!(
+                DiscoveryPolicy::for_exposure_class(class),
+                DiscoveryPolicy::Discoverable,
+                "{class:?} should default to Discoverable"
+            );
+        }
+        assert_eq!(
+            DiscoveryPolicy::for_exposure_class(ExposureClass::NonExportable),
+            DiscoveryPolicy::Opaque
+        );
+        // Fail closed: an unset policy discloses nothing.
+        assert_eq!(DiscoveryPolicy::default(), DiscoveryPolicy::Opaque);
+    }
+
+    #[test]
+    fn discovery_join_is_monotonic_and_commutative() {
+        let all = [DiscoveryPolicy::Discoverable, DiscoveryPolicy::Opaque];
+        for a in all {
+            for b in all {
+                assert_eq!(a.join(b), b.join(a), "join must be commutative");
+                assert!(a.join(b) >= a, "join must be monotonic in a");
+                assert!(a.join(b) >= b, "join must be monotonic in b");
+            }
+        }
+        assert_eq!(
+            DiscoveryPolicy::Discoverable.join(DiscoveryPolicy::Opaque),
+            DiscoveryPolicy::Opaque
+        );
     }
 }

@@ -11,8 +11,12 @@ description = "Sovereign Vault project scanner: read-only discovery of secrets a
 sv-privacy  = { workspace = true }
 sv-patterns = { workspace = true }
 serde      = { workspace = true }
+serde_json = { workspace = true }
 thiserror  = { workspace = true }
 ignore     = { workspace = true }
+sha2       = { workspace = true }
+hex        = { workspace = true }
+rand       = { workspace = true }
 
 [dev-dependencies]
 tempfile   = { workspace = true }

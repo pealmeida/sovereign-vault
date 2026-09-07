@@ -4433,13 +4433,17 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "atomicwrites",
+ "chrono",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "subtle",
  "sv-audit",
  "sv-core",
  "sv-http",
  "sv-mcp",
+ "sv-scan",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -4633,6 +4637,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "sv-remediate"
+version = "0.1.0"
+dependencies = [
+ "atomicwrites",
+ "chrono",
+ "fs4",
+ "hex",
+ "hmac 0.13.0",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sv-audit",
+ "sv-patterns",
+ "sv-privacy",
+ "sv-runtime",
+ "sv-scan",
+ "tempfile",
+ "thiserror 2.0.19",
+ "zeroize",
+]
+
+[[package]]
 name = "sv-runtime"
 version = "0.1.0"
 dependencies = [
@@ -4653,8 +4679,12 @@ dependencies = [
 name = "sv-scan"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "ignore",
+ "rand 0.10.2",
  "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "sv-patterns",
  "sv-privacy",
  "tempfile",

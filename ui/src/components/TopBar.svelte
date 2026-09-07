@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Search, RefreshCcw } from '@lucide/svelte';
+  import { Search, RefreshCcw, Lock } from '@lucide/svelte';
   import { router } from 'svelte-spa-router';
   import { vaultStore } from '../stores/vault.svelte';
   import { containerStore } from '../stores/containers.svelte';
@@ -54,6 +54,17 @@
   </div>
 
   <div class="topbar-actions">
+    {#if vaultStore.status?.unlocked && (vaultStore.idleLabel !== null || vaultStore.sessionLabel !== null)}
+      <span class="session-timer" title="Idle / absolute session time remaining">
+        <Lock size={12} />
+        {#if vaultStore.idleLabel !== null}
+          idle {vaultStore.idleLabel}
+        {/if}
+        {#if vaultStore.sessionLabel !== null}
+          · cap {vaultStore.sessionLabel}
+        {/if}
+      </span>
+    {/if}
     <button class="ghost-button" onclick={doRefresh} title="Refresh">
       <RefreshCcw size={15} />
     </button>

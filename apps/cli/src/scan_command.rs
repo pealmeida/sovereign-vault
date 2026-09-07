@@ -328,20 +328,6 @@ mod tests {
         assert!(name.ends_with(".json"));
     }
 
-    #[test]
-    fn min_confidence_filters_lower_findings() {
-        let report = ScanReport {
-            findings: vec![
-                finding(Confidence::Low),
-                finding(Confidence::Medium),
-                finding(Confidence::High),
-            ],
-            coverage: Default::default(),
-        };
-        let filtered = apply_min_confidence(report, Some(Confidence::Medium));
-        assert_eq!(filtered.findings.len(), 2);
-    }
-
     fn finding(confidence: Confidence) -> sv_scan::ScanFinding {
         sv_scan::ScanFinding {
             path: PathBuf::from("a.rs"),
@@ -353,6 +339,22 @@ mod tests {
             },
             confidence,
             preview: "****".to_string(),
+            matched_fingerprint: String::new(),
         }
+    }
+
+    #[test]
+    fn min_confidence_filters_lower_findings() {
+        let report = ScanReport {
+            findings: vec![
+                finding(Confidence::Low),
+                finding(Confidence::Medium),
+                finding(Confidence::High),
+            ],
+            coverage: Default::default(),
+            config_salt: [0u8; 32],
+        };
+        let filtered = apply_min_confidence(report, Some(Confidence::Medium));
+        assert_eq!(filtered.findings.len(), 2);
     }
 }

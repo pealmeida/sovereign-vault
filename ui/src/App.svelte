@@ -8,14 +8,24 @@
   import VaultPage from './pages/VaultPage.svelte';
   import FilesPage from './pages/FilesPage.svelte';
   import SettingsPage from './pages/SettingsPage.svelte';
+  import LogsPage from './pages/LogsPage.svelte';
+  import ScansPage from './pages/ScansPage.svelte';
   import ApprovalModal from './components/ApprovalModal.svelte';
   import OtpModal from './components/OtpModal.svelte';
+  import WakeBanner from './components/WakeBanner.svelte';
   import { vaultStore } from './stores/vault.svelte';
   import { containerStore } from './stores/containers.svelte';
   import { mcpStore } from './stores/mcp.svelte';
   import { approvalStore } from './stores/approvals.svelte';
+  import { wakeStore } from './stores/wake.svelte';
   import { toastStore } from './stores/toast.svelte';
-  import type { ApprovalPrompt } from './lib/types';
+  import type { ApprovalPrompt, WakePrompt } from './lib/types';
+
+  $effect(() => {
+    if (vaultStore.status?.unlocked) {
+      wakeStore.refresh().catch(() => {});
+    }
+  });
 
   const routes = {
     '/': VaultPage,
@@ -23,11 +33,15 @@
     '/files': FilesPage,
     '/files/:container': FilesPage,
     '/settings': SettingsPage,
+    '/logs': LogsPage,
+    '/scans': ScansPage,
   };
 
   onMount(() => {
     let unlisten: (() => void) | undefined;
     let unlistenCancel: (() => void) | undefined;
+    let unlistenWake: (() => void) | undefined;
+    let unlistenWakeCancel: (() => void) | undefined;
 
     (async () => {
       try {
@@ -35,6 +49,7 @@
         if (vaultStore.status?.unlocked) {
           await containerStore.refresh();
           await mcpStore.refresh();
+          await wakeStore.refresh();
         }
       } catch (e) {
         toastStore.setError(e);
@@ -52,9 +67,22 @@
       unlistenCancel = await listen<{ id: number }>('vault://approval-cancel', (ev) => {
         approvalStore.remove(ev.payload.id);
       });
+      // Wake-on-demand notifications arrive while locked or unlocked, but the
+      // UI indicator is only shown after unlock (ADR-0020 §7-8).
+      unlistenWake = await listen<WakePrompt>('vault://wake-request', (ev) => {
+        wakeStore.push(ev.payload);
+      });
+      unlistenWakeCancel = await listen<{ id: number }>('vault://wake-cancel', (ev) => {
+        wakeStore.remove(ev.payload.id);
+      });
     })();
 
-    return () => { unlisten?.(); unlistenCancel?.(); };
+    return () => {
+      unlisten?.();
+      unlistenCancel?.();
+      unlistenWake?.();
+      unlistenWakeCancel?.();
+    };
   });
 
   // Deny a specific request if it is still pending (e.g. modal dismissed
@@ -79,6 +107,7 @@
     {:else if !vaultStore.status.unlocked}
       <LockedCard />
     {:else}
+      <WakeBanner />
       <Router {routes} />
     {/if}
   </main>

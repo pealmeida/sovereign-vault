@@ -6,7 +6,14 @@
 
 use std::path::Path;
 
-use sv_scan::{detect_pii, detect_secrets, mask, scan_project, FindingKind, ScanConfig};
+use sv_scan::{
+    detect_pii, detect_secrets, mask, scan_project, FindingKind, PreviewMode, ScanConfig,
+};
+
+/// A fixed salt for detector tests. It is fine to reuse one salt across tests
+/// because the tests only assert detection/preview behavior, not linkability
+/// or brute-force resistance.
+const SALT: [u8; 32] = [1u8; 32];
 
 /// A path used for in-memory (no filesystem) detector calls.
 const TOML: &str = "config.toml";
@@ -30,7 +37,12 @@ fn fixed(prefix: &str, exact_len: usize, body: &str) -> String {
 #[test]
 fn aws_access_key_id_matches() {
     let token = fixed("AKIA", 20, "IOSFODNN7EXAMPLE");
-    let findings = detect_secrets(&format!("key = {token}"), Path::new(TOML));
+    let findings = detect_secrets(
+        &format!("key = {token}"),
+        Path::new(TOML),
+        PreviewMode::Opaque,
+        SALT,
+    );
     assert!(
         findings.iter().any(|f| matches!(
             &f.kind,
@@ -44,7 +56,7 @@ fn aws_access_key_id_matches() {
 #[test]
 fn github_pat_matches() {
     let token = fixed("ghp_", 40, "aB3dEfGhIjKlMnOp");
-    let findings = detect_secrets(&token, Path::new(TOML));
+    let findings = detect_secrets(&token, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(findings.iter().any(|f| matches!(
         &f.kind,
         FindingKind::Secret { rule_id } if rule_id == "github_pat"
@@ -54,7 +66,7 @@ fn github_pat_matches() {
 #[test]
 fn github_oauth_matches() {
     let token = fixed("gho_", 40, "aB3dEfGhIjKlMnOp");
-    let findings = detect_secrets(&token, Path::new(TOML));
+    let findings = detect_secrets(&token, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(findings.iter().any(|f| matches!(
         &f.kind,
         FindingKind::Secret { rule_id } if rule_id == "github_oauth"
@@ -73,7 +85,7 @@ fn github_fine_grained_pat_matches() {
         "len {}",
         token.len()
     );
-    let findings = detect_secrets(&token, Path::new(TOML));
+    let findings = detect_secrets(&token, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(findings.iter().any(|f| matches!(
         &f.kind,
         FindingKind::Secret { rule_id } if rule_id == "github_fine_grained_pat"
@@ -83,7 +95,7 @@ fn github_fine_grained_pat_matches() {
 #[test]
 fn slack_bot_token_matches() {
     let token = format!("xoxb-{}", "1234567890".repeat(3));
-    let findings = detect_secrets(&token, Path::new(TOML));
+    let findings = detect_secrets(&token, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(findings.iter().any(|f| matches!(
         &f.kind,
         FindingKind::Secret { rule_id } if rule_id == "slack_bot_token"
@@ -93,7 +105,7 @@ fn slack_bot_token_matches() {
 #[test]
 fn slack_user_token_matches() {
     let token = format!("xoxp-{}", "1234567890".repeat(3));
-    let findings = detect_secrets(&token, Path::new(TOML));
+    let findings = detect_secrets(&token, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(findings.iter().any(|f| matches!(
         &f.kind,
         FindingKind::Secret { rule_id } if rule_id == "slack_user_token"
@@ -103,7 +115,7 @@ fn slack_user_token_matches() {
 #[test]
 fn stripe_secret_key_matches() {
     let token = format!("sk_live_{}", "4eC39HqLyjWDarjtT1zdp7dc");
-    let findings = detect_secrets(&token, Path::new(TOML));
+    let findings = detect_secrets(&token, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(findings.iter().any(|f| matches!(
         &f.kind,
         FindingKind::Secret { rule_id } if rule_id == "stripe_secret_key"
@@ -113,7 +125,7 @@ fn stripe_secret_key_matches() {
 #[test]
 fn anthropic_api_key_matches() {
     let token = format!("sk-ant-{}", "aB3dEfGhIjKlMnOpQrStUvWxYz01");
-    let findings = detect_secrets(&token, Path::new(TOML));
+    let findings = detect_secrets(&token, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(findings.iter().any(|f| matches!(
         &f.kind,
         FindingKind::Secret { rule_id } if rule_id == "anthropic_api_key"
@@ -123,7 +135,7 @@ fn anthropic_api_key_matches() {
 #[test]
 fn google_api_key_matches() {
     let token = fixed("AIza", 39, "aB3dEfGhIjKlMnOp_");
-    let findings = detect_secrets(&token, Path::new(TOML));
+    let findings = detect_secrets(&token, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(findings.iter().any(|f| matches!(
         &f.kind,
         FindingKind::Secret { rule_id } if rule_id == "google_api_key"
@@ -133,7 +145,7 @@ fn google_api_key_matches() {
 #[test]
 fn npm_token_matches() {
     let token = fixed("npm_", 40, "aB3dEfGhIjKlMnOp");
-    let findings = detect_secrets(&token, Path::new(TOML));
+    let findings = detect_secrets(&token, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(findings.iter().any(|f| matches!(
         &f.kind,
         FindingKind::Secret { rule_id } if rule_id == "npm_token"
@@ -150,7 +162,7 @@ fn private_key_pem_matches_header_line_only() {
     let end = format!("-----END RSA {} KEY-----", "PRIVATE");
     let content = format!("{begin}\nMIIblahbase64\n{end}");
     let body = begin;
-    let findings = detect_secrets(&content, Path::new(TOML));
+    let findings = detect_secrets(&content, Path::new(TOML), PreviewMode::Opaque, SALT);
     let pem = findings
         .iter()
         .find(
@@ -167,7 +179,7 @@ fn private_key_pem_matches_header_line_only() {
 #[test]
 fn wrong_length_does_not_match() {
     let token = format!("{}{}", "AKIA", "ABCDEFGHIJ"); // 14 bytes, not 20
-    let findings = detect_secrets(&token, Path::new(TOML));
+    let findings = detect_secrets(&token, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(
         findings.is_empty(),
         "wrong length must not match, got {:?}",
@@ -181,7 +193,7 @@ fn wrong_length_does_not_match() {
 fn out_of_alphabet_body_does_not_match() {
     // lowercase letters are not in AWS's UpperAlnum alphabet.
     let token = format!("{}{}", "AKIA", "abcdefghijklmnop");
-    let findings = detect_secrets(&token, Path::new(TOML));
+    let findings = detect_secrets(&token, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(
         findings.is_empty(),
         "out-of-alphabet body must not match, got {:?}",
@@ -213,7 +225,7 @@ fn mask_masks_short_values_entirely() {
 fn preview_is_never_the_raw_value() {
     let token = fixed("AKIA", 20, "IOSFODNN7EXAMPLE");
     let content = format!("aws = {token}");
-    let findings = detect_secrets(&content, Path::new(TOML));
+    let findings = detect_secrets(&content, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(!findings.is_empty());
     for f in &findings {
         assert_ne!(f.preview, token, "preview must be masked, not raw");
@@ -226,8 +238,13 @@ fn preview_is_never_the_raw_value() {
 fn keyword_proximity_promotes_confidence() {
     // stripe_test_key is Medium; `api_key = ` before it should raise it one step.
     let token = format!("sk_test_{}", "4eC39HqLyjWDarjtT1zdp7dc");
-    let bare = detect_secrets(&token, Path::new(TOML));
-    let with_kw = detect_secrets(&format!("api_key = {token}"), Path::new(TOML));
+    let bare = detect_secrets(&token, Path::new(TOML), PreviewMode::Opaque, SALT);
+    let with_kw = detect_secrets(
+        &format!("api_key = {token}"),
+        Path::new(TOML),
+        PreviewMode::Opaque,
+        SALT,
+    );
 
     let conf = |v: &[sv_scan::ScanFinding]| {
         v.iter()
@@ -250,7 +267,7 @@ fn entropy_alone_never_creates_a_finding() {
     // A long, high-entropy alphanumeric string with no rule prefix matches
     // nothing: entropy is supporting evidence only, never a finding on its own.
     let blob = "aB3dEfGhIjKlMnOp".repeat(8);
-    let findings = detect_secrets(&blob, Path::new(TOML));
+    let findings = detect_secrets(&blob, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(
         findings.is_empty(),
         "entropy alone must not create a finding, got {:?}",
@@ -263,7 +280,7 @@ fn entropy_alone_never_creates_a_finding() {
 #[test]
 fn redacted_markers_produce_no_findings() {
     let content = "[REDACTED:EMAIL] and [SV:LOC:v1:abc]";
-    let findings = detect_secrets(content, Path::new(TOML));
+    let findings = detect_secrets(content, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(
         findings.is_empty(),
         "redacted markers must not be flagged, got {:?}",
@@ -275,11 +292,11 @@ fn redacted_markers_produce_no_findings() {
 fn secret_inside_redacted_marker_is_not_flagged() {
     // The same key flagged bare is silently inside a durable locator line.
     let token = fixed("AKIA", 20, "IOSFODNN7EXAMPLE");
-    let bare = detect_secrets(&token, Path::new(TOML));
+    let bare = detect_secrets(&token, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(!bare.is_empty(), "bare token should be flagged");
 
     let inside = format!("[SV:LOC:v1:{token}]");
-    let flagged = detect_secrets(&inside, Path::new(TOML));
+    let flagged = detect_secrets(&inside, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(
         flagged.is_empty(),
         "secret inside locator must not be re-flagged, got {:?}",
@@ -293,7 +310,7 @@ fn secret_inside_redacted_marker_is_not_flagged() {
 fn pii_delegation_finds_email_with_correct_offsets() {
     let content = "contact me at jane.doe+spam@example.co.uk please";
     let policy = sv_privacy::Policy::all();
-    let findings = detect_pii(content, Path::new(TOML), &policy);
+    let findings = detect_pii(content, Path::new(TOML), &policy, PreviewMode::Opaque, SALT);
     let email = findings
         .iter()
         .find(|f| matches!(f.kind, FindingKind::Pii(sv_privacy::PiiCategory::Email)))
@@ -312,7 +329,7 @@ fn pii_delegation_finds_email_with_correct_offsets() {
 fn multibyte_utf8_does_not_panic_and_offsets_are_bytes() {
     let token = fixed("AKIA", 20, "IOSFODNN7EXAMPLE");
     let content = format!("café — clé: {token} e fim ✓");
-    let findings = detect_secrets(&content, Path::new(TOML));
+    let findings = detect_secrets(&content, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert!(!findings.is_empty());
     for f in &findings {
         // Byte offsets must slice valid UTF-8 without panicking.
@@ -325,7 +342,7 @@ fn multibyte_utf8_does_not_panic_and_offsets_are_bytes() {
 fn line_number_counts_by_newlines() {
     let token = fixed("AKIA", 20, "IOSFODNN7EXAMPLE");
     let content = format!("first line\nsecond line with {token}\nthird");
-    let findings = detect_secrets(&content, Path::new(TOML));
+    let findings = detect_secrets(&content, Path::new(TOML), PreviewMode::Opaque, SALT);
     let f = findings
         .iter()
         .find(|f| matches!(&f.kind, FindingKind::Secret { rule_id } if rule_id == "aws_access_key_id"))
@@ -340,8 +357,8 @@ fn line_number_counts_by_newlines() {
 fn findings_are_ordered_by_start_offset_and_repeatable() {
     let token = fixed("AKIA", 20, "IOSFODNN7EXAMPLE");
     let content = format!("a {token} b {token}");
-    let first = detect_secrets(&content, Path::new(TOML));
-    let second = detect_secrets(&content, Path::new(TOML));
+    let first = detect_secrets(&content, Path::new(TOML), PreviewMode::Opaque, SALT);
+    let second = detect_secrets(&content, Path::new(TOML), PreviewMode::Opaque, SALT);
     assert_eq!(first, second, "detection must be repeatable");
     assert!(first.windows(2).all(|w| w[0].start <= w[1].start));
     assert_eq!(first.len(), 2);
@@ -356,7 +373,7 @@ fn overlap_dedup_keeps_higher_confidence_rule() {
     // The Anthropic token also satisfies the raw "sk-" prefix range, so both
     // would match overlapping spans; the High (anthropic) finding must win.
     let token = format!("sk-ant-{}", "aB3dEfGhIjKlMnOpQrStUvWxYz01");
-    let findings = detect_secrets(&token, Path::new(TOML));
+    let findings = detect_secrets(&token, Path::new(TOML), PreviewMode::Opaque, SALT);
     let kinds: Vec<&str> = findings
         .iter()
         .filter_map(|f| match &f.kind {
@@ -425,4 +442,83 @@ fn scan_project_on_missing_root_returns_invalid_root() {
         scan_project(&missing, &ScanConfig::default()),
         Err(sv_scan::ScanError::InvalidRoot)
     ));
+}
+
+// ---- 13. Preview modes ------------------------------------------------------
+
+#[test]
+fn opaque_mode_never_leaks_any_byte_of_the_secret() {
+    let token = fixed("AKIA", 20, "IOSFODNN7EXAMPLE");
+    let findings = detect_secrets(
+        &format!("aws = {token}"),
+        Path::new(TOML),
+        PreviewMode::Opaque,
+        SALT,
+    );
+    assert!(!findings.is_empty());
+    for f in &findings {
+        assert_eq!(
+            f.preview, "********",
+            "opaque preview must be the fixed placeholder"
+        );
+        for byte in token.bytes() {
+            assert!(
+                !f.preview.as_bytes().contains(&byte),
+                "preview leaked byte {byte:#04x} of the secret"
+            );
+        }
+    }
+}
+
+#[test]
+fn reveal_prefix_mode_reveals_only_the_first_four_chars() {
+    let token = fixed("AKIA", 20, "IOSFODNN7EXAMPLE");
+    let findings = detect_secrets(
+        &format!("aws = {token}"),
+        Path::new(TOML),
+        PreviewMode::RevealPrefix,
+        SALT,
+    );
+    assert!(!findings.is_empty());
+    for f in &findings {
+        assert_eq!(f.preview, format!("{}********", &token[..4]));
+        assert_ne!(f.preview, token, "preview must never be the raw value");
+    }
+}
+
+#[test]
+fn scan_project_routes_previews_through_the_configured_mode() {
+    let root = tempfile::tempdir().unwrap();
+    let aws = fixed("AKIA", 20, "IOSFODNN7EXAMPLE");
+    std::fs::write(root.path().join("a.txt"), format!("aws = {aws}")).unwrap();
+
+    // Default configuration: the report is safe to persist, so it must not
+    // carry a single byte of the matched value.
+    let opaque = scan_project(root.path(), &ScanConfig::default()).unwrap();
+    assert!(!opaque.findings.is_empty());
+    for f in &opaque.findings {
+        assert_eq!(f.preview, "********");
+        for byte in aws.bytes() {
+            assert!(
+                !f.preview.as_bytes().contains(&byte),
+                "default-config preview leaked a byte of the secret"
+            );
+        }
+    }
+
+    // Explicit opt-in: the four-character prefix reappears.
+    let reveal_config = ScanConfig {
+        preview_mode: PreviewMode::RevealPrefix,
+        ..ScanConfig::default()
+    };
+    let revealed = scan_project(root.path(), &reveal_config).unwrap();
+    let secrets: Vec<_> = revealed
+        .findings
+        .iter()
+        .filter(|f| matches!(f.kind, FindingKind::Secret { .. }))
+        .collect();
+    assert!(!secrets.is_empty());
+    for f in secrets {
+        assert_eq!(f.preview, format!("{}********", &aws[..4]));
+    }
 }

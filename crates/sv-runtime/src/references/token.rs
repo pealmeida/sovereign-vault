@@ -112,7 +112,7 @@ pub fn id_hash_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// Encodes bytes as unpadded base64url.
-fn base64url_encode(input: &[u8]) -> String {
+pub(crate) fn base64url_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -133,7 +133,7 @@ fn base64url_encode(input: &[u8]) -> String {
 }
 
 /// Decodes unpadded base64url, rejecting padding and any out-of-alphabet byte.
-fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64url_decode(input: &str) -> Option<Vec<u8>> {
     if input.is_empty() {
         return None;
     }

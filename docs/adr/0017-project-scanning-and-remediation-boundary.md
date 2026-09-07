@@ -2,6 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-09-06
+- **Amended:** 2026-09-07 (preview safety in §2 — see the amendment subsection)
 - **Deciders:** pealmeida
 
 ## Context
@@ -81,6 +82,25 @@ Coverage is reported explicitly. Files skipped for size, for being binary, for
 an unreadable encoding, or by ignore rules are counted and surfaced. A scanner
 that silently skips is a scanner that overstates its own coverage; the count of
 what was *not* examined is part of the result.
+
+### Amendment to §2 (2026-09-07): opaque previews are now the default
+
+The claim above was **false as written**. `mask()` kept the first four raw
+characters of the matched value inside `ScanFinding.preview`, and that field is
+serialized into the JSON scan report. For a short secret, four characters can
+be most of the value, so a report could carry usable secret material while
+this section called it safe to write to disk.
+
+The original text is retained unmodified above; the correction is recorded
+here rather than silently substituted. The preview is now **opaque by
+default**: `mask_opaque()` returns only a fixed placeholder, selected through
+`PreviewMode::Opaque`, the default on `ScanConfig`. The four-character reveal
+survives as an explicit opt-in, `PreviewMode::RevealPrefix`, for interactive
+human review. The safety claim in §2 therefore holds **only for reports
+produced in Opaque mode**; a report produced with the reveal opt-in must not
+be persisted, attached to a thesis artifact, or handed to an agent. The trust
+model this correction belongs to is recorded in
+[ADR-0019](0019-remediation-planning-and-trust-model.md).
 
 ### 3. Detection: deterministic first, no model in phase 1
 

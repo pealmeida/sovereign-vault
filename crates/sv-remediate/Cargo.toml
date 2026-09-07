@@ -1,0 +1,40 @@
+[package]
+name        = "sv-remediate"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace= true
+license.workspace     = true
+repository.workspace  = true
+description = "Remediation planning, verification, and dry-run diffing for Sovereign Vault. File mutation exists only behind the non-default `apply` feature."
+
+[dependencies]
+sv-runtime = { workspace = true }
+sv-scan    = { workspace = true }
+sv-privacy = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+chrono     = { workspace = true }
+hmac       = { workspace = true }
+sha2       = { workspace = true }
+zeroize    = { workspace = true }
+hex        = { workspace = true }
+# Destructive path (P6): compiled only with the `apply` feature. Without it
+# the crate cannot write at all — the dependency is not even built.
+atomicwrites = { workspace = true, optional = true }
+fs4          = { workspace = true, optional = true }
+sv-audit     = { workspace = true, optional = true }
+sv-patterns  = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default = []
+# The write path. Dry-run remains the default even with this feature on:
+# `ApplyMode::DryRun` is the `Default` and `execute` takes the mode
+# explicitly. There is no bare function that writes.
+apply = ["dep:atomicwrites", "dep:fs4", "dep:sv-audit", "dep:sv-patterns"]
+
+[lints]
+workspace = true
