@@ -368,6 +368,36 @@ mod tests {
         );
     }
 
+    /// Counting insert SITES is not enough: `request_click` is shared, so a new
+    /// CALLER can reach the one insert site without adding another. That is
+    /// exactly what happened when the desktop consent gate (ADR-0023) landed --
+    /// desktop-raised prompts silently began appearing in the tray, including
+    /// for OTP containers, and the site count stayed at one.
+    ///
+    /// So pin the callers instead. Every call must pass an explicit
+    /// `TrayMirror`, which forces the question to be answered rather than
+    /// inherited.
+    #[test]
+    fn every_request_click_caller_states_its_tray_intent() {
+        let caller = include_str!("lib.rs");
+        let body = caller.split("#[cfg(test)]").next().unwrap();
+        let calls: Vec<&str> = body
+            .match_indices("self.request_click(")
+            .map(|(i, _)| {
+                let rest = &body[i..];
+                let end = rest.find(".await").unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
+        assert!(!calls.is_empty(), "request_click must have callers");
+        for call in &calls {
+            assert!(
+                call.contains("TrayMirror::"),
+                "every request_click caller must state its tray intent explicitly: {call}"
+            );
+        }
+    }
+
     /// Guard the module invariant that the tray never renders request detail.
     ///
     /// Matches FIELD ACCESSES (`.container`, `.file_name`, ...), not bare

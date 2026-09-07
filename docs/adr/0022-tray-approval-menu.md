@@ -76,6 +76,25 @@ registry *before* responding. The desktop carries its own
 both are exhaustive, so a new action must be mapped rather than silently
 audited as something else.
 
+### Only an agent's request is mirrored
+
+`request_click` is shared by the agent path and, since ADR-0023, by the
+desktop consent gate. Only the agent path mirrors to the tray, selected by an
+explicit `TrayMirror` argument at each call site.
+
+A prompt the user raised themselves, in the app, has no absent audience: they
+are already looking at the modal, so a tray row would be a duplicate control
+for a decision in front of them. It also matters for OTP containers --
+ADR-0023 routes a desktop OTP caller through this same click path, and the
+tray renders while the vault is locked, so mirroring it would place an
+OTP-container confirmation on exactly the surface the OTP escalation exists to
+avoid.
+
+This was found when ADR-0023 was merged and this branch rebased onto it: the
+desktop gate began reaching the tray's single insert site through a new
+caller, and the test pinning the *number of insert sites* still passed. The
+guard now pins the *callers* instead, requiring each to state its intent.
+
 ### Lifecycle
 
 - Inserted when a click-approval modal is emitted.

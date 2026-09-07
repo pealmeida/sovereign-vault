@@ -307,6 +307,19 @@ struct ApprovalState<R: Runtime = tauri::Wry> {
     otp_pending: Mutex<HashMap<String, OtpChallenge>>,
 }
 
+/// Whether a click-approval is mirrored into the tray menu.
+///
+/// The tray exists so a user working in another application can answer an
+/// AGENT's request (ADR-0022). A prompt the user raised themselves, in the
+/// app, has no such audience.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayMirror {
+    /// Mirror to the tray: an agent is waiting and the user may be elsewhere.
+    Yes,
+    /// Do not mirror: the user raised this prompt and is looking at it.
+    No,
+}
+
 impl<R: Runtime> ApprovalState<R> {
     fn new(app: AppHandle<R>) -> Self {
         Self {
@@ -536,7 +549,14 @@ impl<R: Runtime> ApprovalState<R> {
     /// agent path, so a desktop prompt behaves like any other and is answerable
     /// from the same surfaces.
     async fn request_click_only(&self, request: sv_mcp::AccessRequest) -> Result<(), String> {
-        self.request_click(request).await
+        // `Tray::No`: this prompt was raised BY the user, in the app, for an
+        // action they just triggered. They are already looking at the modal, so
+        // a tray row would be a duplicate control for a decision in front of
+        // them. It also matters for OTP containers: ADR-0023 routes a desktop
+        // OTP caller through this click path, and the tray renders while the
+        // vault is locked, so mirroring it would put an OTP-container
+        // confirmation on a surface the OTP escalation exists to avoid.
+        self.request_click(request, TrayMirror::No).await
     }
 
     async fn request(&self, request: sv_mcp::AccessRequest) -> Result<(), String> {
@@ -545,13 +565,23 @@ impl<R: Runtime> ApprovalState<R> {
             ApprovalPromptKind::Click => {}
             ApprovalPromptKind::Otp => return self.handle_otp(&request).await,
         }
-        self.request_click(request).await
+        // An agent's request: the user may be in another application, which is
+        // the whole reason the tray menu exists (ADR-0022).
+        self.request_click(request, TrayMirror::Yes).await
     }
 
-    /// The click-approval flow: emit a modal, mirror it to the tray, and wait
-    /// for a decision. Shared by the agent path (after `approval_requirement`
-    /// selects it) and the desktop path.
-    async fn request_click(&self, request: sv_mcp::AccessRequest) -> Result<(), String> {
+    /// The click-approval flow: emit a modal, optionally mirror it to the tray,
+    /// and wait for a decision.
+    ///
+    /// `mirror` decides whether the request also appears in the tray menu. It
+    /// is a parameter rather than an inference from the request, because the
+    /// distinction is about WHO IS WAITING -- an absent user or one already at
+    /// the modal -- which the request itself does not record.
+    async fn request_click(
+        &self,
+        request: sv_mcp::AccessRequest,
+        mirror: TrayMirror,
+    ) -> Result<(), String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let signature = request_signature(&request);
         let (tx, rx) = oneshot::channel();
@@ -604,14 +634,16 @@ impl<R: Runtime> ApprovalState<R> {
         // Mirror this request into the tray menu. Only the click path does
         // this: an OTP request must stay answerable at the desktop only, and
         // `handle_otp` returns before ever reaching here.
-        if let Some(tray_state) = self.app.try_state::<tray::TrayApprovals>() {
-            tray_state.insert(tray::TrayApproval {
-                id,
-                action_label: tray::action_label(&request.action),
-                audit_action: audit_action_for(&request.action),
-            });
+        if mirror == TrayMirror::Yes {
+            if let Some(tray_state) = self.app.try_state::<tray::TrayApprovals>() {
+                tray_state.insert(tray::TrayApproval {
+                    id,
+                    action_label: tray::action_label(&request.action),
+                    audit_action: audit_action_for(&request.action),
+                });
+            }
+            tray::refresh(&self.app);
         }
-        tray::refresh(&self.app);
         notify_once(
             &self.app,
             NotificationKind::Approval,
