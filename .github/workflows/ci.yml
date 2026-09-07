@@ -235,6 +235,10 @@ jobs:
         working-directory: ui
         run: npm run check
 
+      - name: vitest
+        working-directory: ui
+        run: npm test
+
       - name: vite build
         working-directory: ui
         run: npm run build
