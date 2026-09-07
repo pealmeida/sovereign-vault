@@ -42,6 +42,9 @@ pub enum ClassificationError {
     /// The finding is not a secret, so exposure classification does not apply.
     #[error("exposure classification only applies to secret findings")]
     NotASecret,
+    /// Could not obtain randomness for the per-pass fingerprint salt.
+    #[error("cannot derive fingerprint salt: {0}")]
+    FingerprintSalt(String),
 }
 
 /// One commit that contained a matching blob.
@@ -417,10 +420,17 @@ pub fn classify_finding(
         });
     }
 
+    // One fresh salt for this classification pass. The fingerprints it
+    // produces are discarded below -- only the rule id is read -- but a
+    // per-run random salt is the invariant the detector is built on, and a
+    // zero literal here would silently become a linkable, brute-forceable
+    // fingerprint the moment anyone starts comparing them across call sites.
+    let salt = fingerprint_salt()?;
+
     let mut hits: Vec<CommitHit> = Vec::new();
     for blob_oid in index.by_blob.keys() {
         let content = cat_blob(root, blob_oid)?;
-        if blob_contains_finding(finding, &content) {
+        if blob_contains_finding(finding, &content, salt) {
             hits.extend(index.by_blob[blob_oid].iter().cloned());
         }
     }
@@ -498,6 +508,18 @@ fn cat_blob(root: &Path, blob_oid: &str) -> Result<Vec<u8>, GitRunError> {
     Ok(output.stdout)
 }
 
+/// A fresh 32-byte salt for one classification pass.
+///
+/// Fails closed: a scan that cannot obtain randomness does not fall back to a
+/// fixed salt.
+fn fingerprint_salt() -> Result<[u8; 32], ClassificationError> {
+    let bytes = sv_crypto::random_bytes(32)
+        .map_err(|e| ClassificationError::FingerprintSalt(e.to_string()))?;
+    bytes
+        .try_into()
+        .map_err(|_| ClassificationError::FingerprintSalt("short random salt".to_string()))
+}
+
 /// Check whether a blob's bytes contain a match for the same rule as the
 /// finding.
 ///
@@ -507,12 +529,11 @@ fn cat_blob(root: &Path, blob_oid: &str) -> Result<Vec<u8>, GitRunError> {
 /// value equality check, but it never under-rotates: if the credential pattern
 /// existed anywhere in scanned history, rotation should be considered. The UI
 /// join by path+span prevents attaching the result to the wrong occurrence.
-fn blob_contains_finding(finding: &ScanFinding, content: &[u8]) -> bool {
+fn blob_contains_finding(finding: &ScanFinding, content: &[u8], salt: [u8; 32]) -> bool {
     let Ok(text) = str::from_utf8(content) else {
         return false;
     };
 
-    let salt = [0u8; 32];
     let candidates = sv_scan::detect_secrets(
         text,
         &PathBuf::from("blob"),
