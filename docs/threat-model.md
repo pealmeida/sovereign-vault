@@ -111,7 +111,7 @@ The headline threat: an agent the user connected turns hostile or is hijacked.
   crypto libraries provide.
 - **Coercion / rubber-hose** resistance; no duress modes.
 - **Anti-malware / OS hardening.** We assume a reasonably healthy host.
-- The `ANONYMIZED` / `ZKP` / `NATIVE` modes are **reserved but not implemented**
+- The `ZKP` / `NATIVE` modes are **reserved and rejected for live access**. `ANONYMIZED` is implemented for UTF-8 read responses and applies heuristic PII masking; it does not establish anonymization, non-identifiability, or legal compliance
   and are rejected at runtime — do not rely on them.
 
 ## 5. Residual risks & known gaps (track to closure)
