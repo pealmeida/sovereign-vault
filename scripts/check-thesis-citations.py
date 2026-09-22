@@ -49,3 +49,4 @@ for cit, arq, spec in sorted(set(alvo)):
 
 print()
 print("citacoes com faixa invalida:", len(problemas))
+raise SystemExit(1 if problemas else 0)

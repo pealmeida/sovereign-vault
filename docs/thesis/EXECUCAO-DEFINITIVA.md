@@ -339,7 +339,7 @@ SESSION=s01
 CMD="cargo run --release -p thesis-eval -- all --out target/thesis-eval/sessions/$SESSION --iterations 2000 --warmup 200 --seed 1701"
 
 bash docs/thesis/evidence/collect-metadata.sh \
-    target/thesis-eval "$SESSION" "$EVAL_TAG" "$CMD"
+    target/thesis-eval "$SESSION" "$EVAL_TAG" "$POWER_MODE" "$CMD"
 ```
 
 > As bandeiras `--warmup` e `--seed` são suportadas pelo binário atual (§2.6).

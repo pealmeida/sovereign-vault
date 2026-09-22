@@ -13,7 +13,7 @@ E2.wrongsign.C,braco C aleatoria/sem warmup,"53,3",-,%,ARTEFATO,Tab.ablacao,
 E2.wrongsign.D,braco D aleatoria/warmup,"56,7",-,%,ARTEFATO,Tab.ablacao,protocolo corrigido
 E2.armA.median,braco A contrastes que excluem zero (mediana),2/6,-,-,ARTEFATO,4.2 texto,ambos em 128 B
 E2.armA.mean,braco A contrastes que excluem zero (media),4/6,-,-,ARTEFATO,4.2 texto,nao reproduz 6/6
-E2.prov.diff,reescrita do harness apos latency.csv,495,-,linhas,ARTEFATO,4.2 + limitacoes,"418 ins / 81 rem, commit 2fb252b"
+E2.prov.diff,modificacao do harness apos latency.csv,265,-,linhas adicionadas/removidas,ARTEFATO,4.2 + limitacoes,"227 ins / 38 rem em apps/thesis-eval/src/main.rs, commit 2fb252b"
 E2.prov.meta,run-metadata.json da Tabela 5 publicada,AUSENTE,-,-,ARTEFATO,4.2 + limitacoes,sem proveniencia da execucao original
 E3.scope20.128,"enforce_scopes 20 escopos, 128 B","+2,106","[1,656; 2,511]",us,ARTEFATO,Tab.escopos,exclui zero
 E3.scope20.1k,"enforce_scopes 20 escopos, 1 KiB","+2,102","[1,842; 2,346]",us,ARTEFATO,Tab.escopos,exclui zero
@@ -27,7 +27,7 @@ E4c.slope.d1,inclinacao do filtro em densidade=1,"7,395",-,ns/B,ARTEFATO,5.2.2,p
 E4c.slope.d0,inclinacao do filtro em densidade=0,"2,683",-,ns/B,ARTEFATO,5.2.2,documento sem PII
 E4c.share,densidade como fracao da inclinacao marginal,"63,7",-,%,ARTEFATO,5.2.2,"R2=0,99979"
 E4c.xcheck,concordancia do ajuste d=1 com micro.csv publicado,"97,0",-,%,AUDITORIA,5.2.2,"7,395 vs 7,626 ns/B"
-E4c.pct,custo sem PII como fracao do valor publicado,"36,6",-,%,AUDITORIA,5.2.2,"2,683/7,395"
+E4c.pct,inclinacao sem PII como fracao da inclinacao publicada,"35,2",-,%,AUDITORIA,5.2.2,"100 x 2,683 / 7,626"
 E5.cov.old,cobertura da bateria original,5/20,-,-,ARTEFATO,5.x + resumo,25% - CORRIGE o 7/20 anterior
 E5.cov.new,cobertura apos extensao,17/20,-,-,ARTEFATO,5.x + resumo,85%
 E5.match,vereditos que batem com pre-especificacao,11/12,-,-,ARTEFATO,Tab.sondas,C4 e o mismatch
