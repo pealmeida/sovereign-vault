@@ -1,0 +1,19 @@
+{
+ "sv_commit": "788333475d5e1c7414172866cc565b4338347185",
+ "clean_checkout": true,
+ "initial_dependency_resolution": "record Cargo.lock; future builds use --locked",
+ "measurement": "sv_privacy::redact(input, &Policy::all()) sobre 48 casos PII rotulados",
+ "corpus": "SV-datasets-testes-fechamento-v1 / sv-research-closure data/v1/pii.jsonl",
+ "corpus_manifest_sha256": "809bae465d11c68fd135a46c460a75b604b1b736676a60f88efe922b6031b3d0",
+ "bridge_source": "adapters/sv_privacy_bridge.rs (pacote externo, não modificado)",
+ "sv_privacy_identical_to_delivery_commit": "sim — git diff main a09b90f -- crates/sv-privacy/ vazio",
+ "matching": "exact_category_and_span, offset_unit=utf8_byte",
+ "completed": 48,
+ "errors": 0,
+ "not_measured": [
+  "latência do gateway",
+  "privacidade semântica",
+  "documentos reais",
+  "autenticação, auditoria ou política do gateway"
+ ]
+}

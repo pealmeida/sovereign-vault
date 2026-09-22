@@ -1,0 +1,48 @@
+{"case_id":"PII-00-pt","response":{"findings":[{"category":"email","end":37,"start":18}],"output":"Campo sintético: [REDACTED:EMAIL]; fim."},"status":"completed"}
+{"case_id":"PII-00-en","response":{"findings":[{"category":"email","end":36,"start":17}],"output":"Synthetic field: [REDACTED:EMAIL]; fim."},"status":"completed"}
+{"case_id":"PII-01-pt","response":{"findings":[],"output":"Campo sintético: p01 [at] example [dot] invalid; fim."},"status":"completed"}
+{"case_id":"PII-01-en","response":{"findings":[],"output":"Synthetic field: p01 [at] example [dot] invalid; fim."},"status":"completed"}
+{"case_id":"PII-02-pt","response":{"findings":[{"category":"cpf","end":32,"start":18}],"output":"Campo sintético: [REDACTED:CPF]; fim."},"status":"completed"}
+{"case_id":"PII-02-en","response":{"findings":[{"category":"cpf","end":31,"start":17}],"output":"Synthetic field: [REDACTED:CPF]; fim."},"status":"completed"}
+{"case_id":"PII-03-pt","response":{"findings":[{"category":"cpf","end":29,"start":18}],"output":"Campo sintético: [REDACTED:CPF]; fim."},"status":"completed"}
+{"case_id":"PII-03-en","response":{"findings":[{"category":"cpf","end":28,"start":17}],"output":"Synthetic field: [REDACTED:CPF]; fim."},"status":"completed"}
+{"case_id":"PII-04-pt","response":{"findings":[],"output":"Campo sintético: 529.982.247-26; fim."},"status":"completed"}
+{"case_id":"PII-04-en","response":{"findings":[],"output":"Synthetic field: 529.982.247-26; fim."},"status":"completed"}
+{"case_id":"PII-05-pt","response":{"findings":[{"category":"cnpj","end":36,"start":18}],"output":"Campo sintético: [REDACTED:CNPJ]; fim."},"status":"completed"}
+{"case_id":"PII-05-en","response":{"findings":[{"category":"cnpj","end":35,"start":17}],"output":"Synthetic field: [REDACTED:CNPJ]; fim."},"status":"completed"}
+{"case_id":"PII-06-pt","response":{"findings":[{"category":"cnpj","end":32,"start":18}],"output":"Campo sintético: [REDACTED:CNPJ]; fim."},"status":"completed"}
+{"case_id":"PII-06-en","response":{"findings":[{"category":"cnpj","end":31,"start":17}],"output":"Synthetic field: [REDACTED:CNPJ]; fim."},"status":"completed"}
+{"case_id":"PII-07-pt","response":{"findings":[{"category":"credit_card","end":37,"start":18}],"output":"Campo sintético: [REDACTED:CREDIT_CARD]; fim."},"status":"completed"}
+{"case_id":"PII-07-en","response":{"findings":[{"category":"credit_card","end":36,"start":17}],"output":"Synthetic field: [REDACTED:CREDIT_CARD]; fim."},"status":"completed"}
+{"case_id":"PII-08-pt","response":{"findings":[{"category":"credit_card","end":34,"start":18}],"output":"Campo sintético: [REDACTED:CREDIT_CARD]; fim."},"status":"completed"}
+{"case_id":"PII-08-en","response":{"findings":[{"category":"credit_card","end":33,"start":17}],"output":"Synthetic field: [REDACTED:CREDIT_CARD]; fim."},"status":"completed"}
+{"case_id":"PII-09-pt","response":{"findings":[{"category":"ipv4","end":28,"start":18}],"output":"Campo sintético: [REDACTED:IPV4]; fim."},"status":"completed"}
+{"case_id":"PII-09-en","response":{"findings":[{"category":"ipv4","end":27,"start":17}],"output":"Synthetic field: [REDACTED:IPV4]; fim."},"status":"completed"}
+{"case_id":"PII-10-pt","response":{"findings":[],"output":"Campo sintético: 192 . 0 . 2 . 10; fim."},"status":"completed"}
+{"case_id":"PII-10-en","response":{"findings":[],"output":"Synthetic field: 192 . 0 . 2 . 10; fim."},"status":"completed"}
+{"case_id":"PII-11-pt","response":{"findings":[{"category":"phone","end":35,"start":18}],"output":"Campo sintético: [REDACTED:PHONE]; fim."},"status":"completed"}
+{"case_id":"PII-11-en","response":{"findings":[{"category":"phone","end":34,"start":17}],"output":"Synthetic field: [REDACTED:PHONE]; fim."},"status":"completed"}
+{"case_id":"PII-12-pt","response":{"findings":[],"output":"Campo sintético: 2025550147; fim."},"status":"completed"}
+{"case_id":"PII-12-en","response":{"findings":[],"output":"Synthetic field: 2025550147; fim."},"status":"completed"}
+{"case_id":"PII-13-pt","response":{"findings":[{"category":"ssn","end":29,"start":18}],"output":"Campo sintético: [REDACTED:SSN]; fim."},"status":"completed"}
+{"case_id":"PII-13-en","response":{"findings":[{"category":"ssn","end":28,"start":17}],"output":"Synthetic field: [REDACTED:SSN]; fim."},"status":"completed"}
+{"case_id":"PII-14-pt","response":{"findings":[],"output":"Campo sintético: 900123456; fim."},"status":"completed"}
+{"case_id":"PII-14-en","response":{"findings":[],"output":"Synthetic field: 900123456; fim."},"status":"completed"}
+{"case_id":"PII-15-pt","response":{"findings":[],"output":"Campo sintético: Pessoa Fictícia Alfa; fim."},"status":"completed"}
+{"case_id":"PII-15-en","response":{"findings":[],"output":"Synthetic field: Pessoa Fictícia Alfa; fim."},"status":"completed"}
+{"case_id":"PII-16-pt","response":{"findings":[],"output":"Campo sintético: Rua Inventada de Teste, 000; fim."},"status":"completed"}
+{"case_id":"PII-16-en","response":{"findings":[],"output":"Synthetic field: Rua Inventada de Teste, 000; fim."},"status":"completed"}
+{"case_id":"PII-17-pt","response":{"findings":[],"output":"Campo sintético: 31/12/1990; fim."},"status":"completed"}
+{"case_id":"PII-17-en","response":{"findings":[],"output":"Synthetic field: 31/12/1990; fim."},"status":"completed"}
+{"case_id":"PII-18-pt","response":{"findings":[],"output":"Campo sintético: 00000-000; fim."},"status":"completed"}
+{"case_id":"PII-18-en","response":{"findings":[],"output":"Synthetic field: 00000-000; fim."},"status":"completed"}
+{"case_id":"PII-19-pt","response":{"findings":[],"output":"Campo sintético: SV_TEST_ONLY_NOT_A_REAL_KEY_999; fim."},"status":"completed"}
+{"case_id":"PII-19-en","response":{"findings":[],"output":"Synthetic field: SV_TEST_ONLY_NOT_A_REAL_KEY_999; fim."},"status":"completed"}
+{"case_id":"PII-N00","response":{"findings":[],"output":"A etapa 3 terminou."},"status":"completed"}
+{"case_id":"PII-N01","response":{"findings":[],"output":"Build 42 passed."},"status":"completed"}
+{"case_id":"PII-N02","response":{"findings":[],"output":"Versão 1.2 está pronta."},"status":"completed"}
+{"case_id":"PII-N03","response":{"findings":[],"output":"There are 12 rows."},"status":"completed"}
+{"case_id":"PII-N04","response":{"findings":[],"output":"Tarefa pública sem contato."},"status":"completed"}
+{"case_id":"PII-N05","response":{"findings":[],"output":"Public benchmark complete."},"status":"completed"}
+{"case_id":"PII-N06","response":{"findings":[],"output":"O código do produto é ABC."},"status":"completed"}
+{"case_id":"PII-N07","response":{"findings":[],"output":"Latency: 20 ms."},"status":"completed"}
