@@ -34,6 +34,15 @@ E5.match,vereditos que batem com pre-especificacao,11/12,-,-,ARTEFATO,Tab.sondas
 E5.audit,cadeia HMAC verificada,ok,-,-,ARTEFATO,5.x,"12 entradas, verify_chain"
 T5.signtest,teste de sinais na Tabela 5 PUBLICADA,"0,016",-,p,PUBLICADO,4.2 nota metodologica,"6/6, exato unilateral"
 T5.cantelli,limite superior de |z| das 6 diferencas,"11,7-58,5",-,EP,PUBLICADO,4.2 nota metodologica,Cantelli sobre p95-media
+E6.ext.cases,casos totais no corpus sintetico externo,48,-,casos,ARTEFATO,5 limitacoes,observations.jsonl e scores.jsonl; inclui oito controles negativos
+E6.ext.negative,controles negativos no corpus externo,8,-,casos,ARTEFATO,5 limitacoes,scores.jsonl formato negative_control
+E6.ext.canonical,acertos em casos canonicos externos,14/14,-,casos,ARTEFATO,5 limitacoes,dois casos por categoria coberta; correspondencia exata de categoria e span
+E6.ext.fp,achados em controles negativos externos,0/8,-,casos,ARTEFATO,5 limitacoes,nao estima taxa populacional de falso positivo
+E6.ext.person_name,recall externo nome de pessoa,0/2,-,casos,ARTEFATO,5 limitacoes,sem detector correspondente; corpus sintetico
+E6.ext.address,recall externo endereco,0/2,-,casos,ARTEFATO,5 limitacoes,sem detector correspondente; corpus sintetico
+E6.ext.birth_date,recall externo data de nascimento,0/2,-,casos,ARTEFATO,5 limitacoes,sem detector correspondente; corpus sintetico
+E6.ext.postal_code,recall externo CEP,0/2,-,casos,ARTEFATO,5 limitacoes,sem detector correspondente; corpus sintetico
+E6.ext.secret,recall externo segredo generico,0/2,-,casos,ARTEFATO,5 limitacoes,sem detector correspondente; corpus sintetico
 SUP.dens,"densidade = 7,4% da inclinacao","7,4",-,%,SUPERSEDIDO,NAO USAR,"errado por 8,6x; usar E4c.share"
 SUP.robust,"robustez de formato uniforme 0,375","0,375",-,-,SUPERSEDIDO,NAO USAR,usar E4b por categoria
 SUP.pos,efeito de posicao explica ~9% da inversao,9,-,%,SUPERSEDIDO,NAO USAR,estimador nao identificavel em ordem fixa

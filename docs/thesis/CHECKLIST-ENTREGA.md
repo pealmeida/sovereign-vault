@@ -1,7 +1,13 @@
 # Checklist de entrega — TCC MBA em IA e Big Data (USP/ICMC)
 
-**Gerado em:** 04/08/2026 · **Estado do documento auditado:** `docs/thesis/paper.tex`, 48 páginas
+**Gerado em:** 04/08/2026 · **Estado do documento auditado:** `docs/thesis/paper.tex`, 62 páginas numeradas (64 físicas), reconferir após a recompilação final
 **Prazo:** dezembro/2026
+
+> **Estado em 22/09/2026.** As marcações abaixo são verificações históricas de 04/08/2026 e não
+> constituem atestado atual de conformidade, CI verde ou execução definitiva. O estado corrente é o
+> do relatório `REVIEW-ADVERSARIAL-CODEX-2.md` e da triagem correspondente; os itens reverificados
+> nesta data estão atualizados no próprio texto, com o valor apurado.
+
 
 > ## Aviso de procedência das exigências
 >
@@ -68,7 +74,7 @@ camada sobre o `abntex2` com a estrutura de arquivos pré-textual do ICMC
 **Estado (04/08/2026): FEITO.** O pacote foi baixado da Biblioteca do Campus
 (`USPSC-3.2.zip`), a classe e os arquivos de Unidade foram versionados em
 `docs/thesis/uspsc/`, e a variante `docs/thesis/paper-uspsc.tex` **compila
-limpa em 50 páginas, com 0 erros e 0 citações/referências indefinidas**.
+limpa em 62 páginas numeradas (64 físicas), com 0 erros e 0 citações/referências indefinidas**.
 
 Identificação institucional aplicada: `\siglaunidade{ICMC}` +
 `\programa{MBAIAp}`. Isso faz a classe emitir o preâmbulo oficial do programa
@@ -127,12 +133,12 @@ caro o retrabalho. Confirmar com a orientadora antes de executar.
 | Dedicatória | opcional | ausente | decisão do autor |
 | Agradecimentos | opcional | ausente | decisão do autor |
 | Epígrafe | opcional | ausente | decisão do autor |
-| Resumo em português | obrigatório | ✅ ~297 palavras | dentro da faixa 150–500 (NBR 6028) |
+| Resumo em português | obrigatório | ✅ 238 palavras (verificado em 22/09/2026) | dentro da faixa 150–500 (NBR 6028) |
 | Palavras-chave (PT) | obrigatório | ✅ 5 | — |
 | Resumo em inglês (*abstract*) | obrigatório | ✅ presente | — |
 | *Keywords* | obrigatório | ✅ presente | — |
-| Lista de ilustrações | obrigatório se houver | ✅ 4 figuras | — |
-| Lista de tabelas | obrigatório se houver | ✅ 5 tabelas | — |
+| Lista de ilustrações | obrigatório se houver | ✅ 6 figuras (verificado em 22/09/2026) | — |
+| Lista de tabelas | obrigatório se houver | ✅ 10 tabelas (verificado em 22/09/2026) | — |
 | Lista de abreviaturas e siglas | obrigatório se houver | ✅ 21 entradas | — |
 | Lista de símbolos | obrigatório se houver | ausente | há símbolos matemáticos nas equações — **[CONFIRMAR]** se o programa exige |
 | Sumário | obrigatório | ✅ presente | — |
@@ -181,7 +187,7 @@ origem sintética, justificativa LGPD, composição das cargas e limite de valid
 
 | Item | Obrigatoriedade | Estado |
 |---|---|---|
-| Referências | obrigatório | ✅ 23 entradas |
+| Referências | obrigatório | ✅ 27 entradas (verificado em 22/09/2026) |
 | Glossário | opcional | ausente |
 | Apêndice (autoria própria) | opcional | ✅ Apêndice de reprodutibilidade |
 | Anexo (autoria de terceiros) | opcional | ausente |
@@ -201,7 +207,7 @@ Fonte: "Dicas para a Escrita Científica" da disciplina.
 | Estrangeirismos em itálico | ✅ | A4 corrigida; critério auditado (sem tradução corrente → itálico; jargão incorporado, como *gateway*, → redondo) |
 | Evitar parágrafos de uma frase | ✅ | §Considerações Iniciais enriquecida (R10-M4); varredura de 04/08 encontra 1 remanescente em prosa (l. 189, ressalva deliberada de fronteira de alegação) — os demais são chamadas de lista, equações e opções de figura |
 | Não usar inglês havendo tradução | ✅ | *trade-off* → relação de compromisso; siglas expandidas em português |
-| Toda figura/tabela/equação referenciada **e explicada** | ✅ | 0 órfãos: 4 figuras, 5 tabelas, 2 equações |
+| Toda figura/tabela/equação referenciada **e explicada** | ✅ | 0 órfãos: 6 figuras, 10 tabelas, 2 equações; a descrição da Figura de latência foi corrigida em 22/09/2026 |
 | Sem plágio | ⚠️ **[CONFIRMAR]** | ver §7 |
 
 **Pendência real:** os três itens ⚠️ vêm da auditoria
@@ -218,7 +224,7 @@ São de baixo risco individual, mas somam.
 | Sobrenome em versalete/maiúscula | ✅ | conferido nas 23 entradas |
 | Título em itálico | ✅ | conferido |
 | "et al." acima de 3 autores | ✅ | corrigido em `hevner2004` |
-| DOI quando disponível | ✅ | 9 entradas com DOI. As restantes são atas de congresso (NeurIPS), normas RFC, livros e fontes sem identificador persistente atribuído — nenhum DOI foi inventado. Resolver cada DOI contra `doi.org` antes do depósito (R9-7) |
+| DOI quando disponível | ✅ | 13 entradas com DOI (verificado em 22/09/2026). As restantes são atas de congresso (NeurIPS), normas RFC, livros e fontes sem identificador persistente atribuído — nenhum DOI foi inventado. Resolver cada DOI contra `doi.org` antes do depósito (R9-7) |
 | Data de acesso em fonte eletrônica | ✅ | presente nas entradas com URL |
 | Toda citação no texto tem entrada na lista | ✅ | 0 citações indefinidas na compilação |
 
@@ -279,9 +285,9 @@ pesquisa e podem ser cobrados em banca.
 | **DOI / arquivamento permanente** | ❌ **ausente** — ver §8.1 |
 | Evidência versionada e recuperável | ✅ `docs/thesis/evidence/`, resumos SHA-256 conferem |
 | Âncora de proveniência | ✅ tag `thesis-evidence-preliminary` |
-| Citações código↔tese verificáveis | ✅ 13/13 válidas; verificador em `scripts/` |
+| Citações código↔tese verificáveis | ⚠️ 14/14 faixas válidas, mas três citações apontam para conteúdo diferente em `main`; ver relatório de 22/09/2026; verificador em `scripts/` |
 | Instruções de reprodução | ✅ apêndice + `EVALUATION.md` + `EXECUCAO-DEFINITIVA.md` |
-| CI reprodutível | ✅ 12 checagens, 3 plataformas |
+| CI reprodutível | ⚠️ 22/09/2026: 14 checagens, duas falhando (auditoria de dependências Rust e npm). A matriz de três plataformas é dos jobs Rust; o job da tese roda só em Ubuntu e compila só `paper.tex` |
 
 ### 8.1 DOI — recomendado antes da entrega
 
@@ -429,7 +435,7 @@ resolvem na segunda:
 cd docs/thesis && pdflatex -interaction=nonstopmode -halt-on-error paper.tex && pdflatex -interaction=nonstopmode -halt-on-error paper.tex
 ```
 
-> **Estado verificado em 04/08/2026:** compila em 48 páginas, 0 erros, 0
+> **Estado verificado em 04/08/2026:** compila em 62 páginas numeradas (64 físicas), 0 erros, 0
 > citações indefinidas, 0 referências indefinidas, 0 *overfull boxes*
 > (MiKTeX-pdfTeX 4.23). Um `\cite` ou `\ref` órfão gera apenas *warning* — o PDF
 > sai com marcadores `[?]` e a compilação continua "bem-sucedida". Por isso a
