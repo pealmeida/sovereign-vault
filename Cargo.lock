@@ -4659,7 +4659,7 @@ dependencies = [
  "regex",
  "serde",
  "thiserror 2.0.20",
- "toml 0.9.12+spec-1.1.0",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]
@@ -4719,7 +4719,7 @@ dependencies = [
  "sha2 0.11.0",
  "subtle",
  "thiserror 2.0.20",
- "toml 0.9.12+spec-1.1.0",
+ "toml 1.1.2+spec-1.1.0",
  "zeroize",
 ]
 
