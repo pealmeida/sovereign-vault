@@ -1,6 +1,6 @@
 # Checklist de entrega — TCC MBA em IA e Big Data (USP/ICMC)
 
-**Gerado em:** 04/08/2026 · **Estado do documento auditado:** `docs/thesis/paper.tex`, 62 páginas numeradas (64 físicas), reconferir após a recompilação final
+**Gerado em:** 04/08/2026 · **Estado do documento auditado:** `docs/thesis/paper.tex`, 62 páginas numeradas (64 físicas), reconferir após a recompilação final · **Paginação em 22/09/2026:** 67 páginas físicas, última numerada 65 — coerente com os "65 p." da ficha catalográfica; reconferir após cada recompilação
 **Prazo:** dezembro/2026
 
 > **Estado em 22/09/2026.** As marcações abaixo são verificações históricas de 04/08/2026 e não
@@ -40,7 +40,7 @@ Fonte: relatórios "Guia Consolidado e Context Dump para Estruturação de TCC" 
 "Methodology and Project Guidelines for AI and Big Data II", ambos derivados das
 23 fontes das disciplinas.
 
-### 0.1 Ficha catalográfica — OBRIGATÓRIA, ausente
+### 0.1 Ficha catalográfica — OBRIGATÓRIA, inserida (22/09/2026)
 
 > "A ficha catalográfica é elemento obrigatório. Ela deve ser gerada
 > eletronicamente através do sistema da **Biblioteca Achille Bassi (ICMC)**."
@@ -58,8 +58,11 @@ que o bloco cai no **verso da folha de rosto** — página 4 do PDF, imediatamen
 após a folha de rosto na página 3, como a NBR 14724 exige. O bloco atual traz um
 aviso visível `[FICHA CATALOGRÁFICA A GERAR]`.
 
-**Ação restante:** gerar no sistema da Biblioteca e colar o texto retornado no
-lugar do bloco marcado, sem reformatar. Nenhuma mudança estrutural é necessária.
+**Concluído (22/09/2026):** a ficha oficial foi gerada no sistema da Biblioteca e
+inserida — registro `A447a`, com "65 p.", coerente com a última página numerada
+do PDF compilado. O PDF oficial está versionado em
+`docs/thesis/uspsc/fichacatalografica.pdf` e incluído na compilação (página
+física 4, nas duas variantes). Sem ação restante neste item.
 
 ### 0.2 Pacote USPSC 3.2 — OBRIGATÓRIO, não utilizado
 
@@ -260,7 +263,7 @@ um erro caro de descobrir tarde.
 | Item | Estado | Ação |
 |---|---|---|
 | Verificação antiplágio | ⚠️ **[CONFIRMAR]** | O programa exige relatório (Turnitin ou similar)? Se sim, gerar antes da entrega |
-| Declaração de uso de IA | ⚠️ **[CONFIRMAR]** | Muitos programas passaram a exigir declaração de uso de ferramentas de IA. Este trabalho usou assistência de IA extensivamente — **confirmar a política do ICMC e declarar se exigido** |
+| Declaração de uso de IA | ✅ inserida (22/09/2026) | Incluída como **Anexo A** do trabalho e no fragmento USPSC correspondente. **Data e assinatura a preencher pelo aluno** antes do depósito. A política específica do ICMC permanece `[CONFIRMAR]`; a declaração foi adotada voluntariamente |
 | Autoria e coautoria | ✅ | autor único |
 | Licença do texto acadêmico | ⚠️ pendente | declarada apenas por negação ("não é Apache-2.0") |
 
@@ -308,8 +311,8 @@ Agora é viável: existe uma tag no repositório.
 | Resumos criptográficos publicados | ✅ | 3/3 conferem |
 | Comando de reprodução registrado | ✅ | no apêndice |
 | Ambiente registrado | ✅ instrumento pronto | `collect-metadata.sh` exige `power_mode` como argumento obrigatório e falha se qualquer campo de *host* vier vazio ou `n/a`; `aggregate.py` veta `n/a`/*placeholder* em §6.5 |
-| **k ≥ 3 sessões independentes** | ❌ **1 sessão** | **Bloqueante para a versão final** — instrumento pronto; falta executar |
-| **IC de 95% por *bootstrap*** | ❌ ausente | **Bloqueante para a versão final** — `aggregate.py` pronto (bootstrap sobre médias de sessão, B=10.000, semente declarada); emite ressalva de IC indicativo quando k<5 |
+| **k ≥ 3 sessões independentes** | ✅ k=10 sessões (22/09/2026) | Reavaliação E1 v2 sob protocolo corrigido: dez sessões, ordem de célula aleatorizada, 200 chamadas de aquecimento descartadas. Os metadados não documentam intervalo mínimo entre sessões nem bloqueio do modo de energia previstos no protocolo definitivo — pendência registrada nas limitações do trabalho |
+| **IC de 95% por *bootstrap*** | ✅ presente (22/09/2026) | Reavaliação E1 v2 com IC95% *bootstrap* percentílico (B=10.000, reamostragem por sessão) nos seis contrastes pareados e nos demais agregados (`docs/thesis/evidence/v2/`) |
 | Regra de *warmup*/descarte | ✅ instrumento pronto | `--warmup` implementado; documentado como *override* acima de um piso de 1 chamada de *priming* (R9-12) |
 | Separação política × falha de transporte | ✅ | sondas com `transport_error` excluídas do numerador **e** do denominador de ambas as taxas e reportadas à parte (R9-5) |
 | Deriva térmica (§6.2) | ✅ instrumento pronto | Spearman aplicado só com k≥4; em k=3 emite ressalva de "deriva não verificada" em vez de falso positivo (R9-4) |
@@ -365,9 +368,11 @@ Exigência recorrente nas três disciplinas de Metodologia:
    já estão prontos no arquivo local privado da ficha catalográfica, mantido
    fora do repositório público — restam ≈3 minutos de digitação pelo autor,
    pois o envio publica dados pessoais em sistema da USP em seu nome. Ver §0.1.
-2. **Execução definitiva** — k ≥ 3 sessões com IC 95%. Instrumento pronto e
-   ensaiado de ponta a ponta; falta rodar sob as pré-condições do §1 do
-   protocolo (`main` publicada + *host* controlado). Ver §9.
+2. **Execução definitiva** — a reavaliação E1 v2 (22/09/2026) já traz k=10
+   sessões com IC95% *bootstrap*, então "1 sessão sem IC" não é mais o estado.
+   Permanece pendente a execução definitiva do protocolo: controle de energia e
+   intervalo mínimo entre sessões não estão documentados nos metadados coletados
+   (ver §9 e as limitações do trabalho). Ver §9.
 
 > **Fechados em 04/08/2026:**
 > **Pacote USPSC 3.2** (§0.2) — variante `paper-uspsc.tex` compila limpa com a
@@ -395,7 +400,8 @@ Exigência recorrente nas três disciplinas de Metodologia:
 
 6. Relatório antiplágio — as fontes tratam plágio com severidade (anulação do
    projeto, revogação do título), mas não indicam se há verificação formal.
-7. Declaração de uso de IA.
+7. Declaração de uso de IA — inserida como Anexo A (22/09/2026); restam data e
+   assinatura pelo aluno.
 8. `oneside` vs `twoside` — provavelmente resolvido pelo USPSC.
 9. Lista de símbolos.
 10. Conformidade com a **NBR 10520:2023** (citações), atualizada.

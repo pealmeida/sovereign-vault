@@ -38,6 +38,12 @@ cover — so the notification is a pure attention signal. The one-time OTP code
 is **never** included either; the OTP notification only says a code is pending
 and that the user must open the app window to view it.
 
+> **Atualização (22/09/2026).** The current implementation is more restrictive
+> than described above: the notification body no longer carries even the action
+> name. It is a fixed string (`NOTIFICATION_APPROVAL_BODY` /
+> `NOTIFICATION_WAKE_BODY` in `apps/desktop/src-tauri/src/lib.rs`), and no
+> request field — not even a resource name — is ever interpolated into it.
+
 Delivery is best-effort. Notification errors (no daemon, denied permission,
 unsupported platform) are swallowed (`let _ = ...`); the in-app modal remains
 the authoritative consent channel and a missing notification daemon must never
@@ -57,6 +63,16 @@ equal to the bundled `.desktop` basename provides deterministic sender
 identity. macOS/Windows keep the plugin, which already handles those
 platforms' identity rituals correctly.
 
+> **Atualização (22/09/2026).** The current implementation uses
+> `tauri-plugin-notification` on every platform, Linux included, and discards
+> the result of `show()` (`let _ = ...`): delivery is best-effort, the handle
+> is not retained, and there is no cancellation cycle that withdraws a stale
+> notification on `vault://approval-cancel` or `approval_respond`. The
+> `notify-rust` path above is the historical record of how the GNOME Shell
+> banner-suppression problem was first addressed, not a description of the
+> code as it stands. The current code also coalesces notifications per kind
+> with a minimum interval (`OS_NOTIFICATION_COOLDOWN_SECS`).
+
 ## Consequences
 
 - **Positive.** Prompts are noticed when the window is unfocused or minimized,
@@ -72,6 +88,10 @@ platforms' identity rituals correctly.
   of the supply-chain surface governed by `deny.toml`. On macOS, notifications
   require a signed/bundled app to appear, which is consistent with the
   unsigned-builds residual risk already tracked in threat-model §5.
+  **Atualização (22/09/2026):** this paragraph no longer describes the current
+  code — the body is fixed text, so no action name egresses, and the direct
+  `notify-rust` dependency with handle retention has been removed (see the
+  update notes in the Decision section).
 - **Linux transport note.** A missing or mismatched `.desktop` entry still
   degrades attribution in GNOME's notification settings, but it is no longer
   the cause of silent banner suppression — connection lifetime was.
