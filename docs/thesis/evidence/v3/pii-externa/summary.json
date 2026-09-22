@@ -1,0 +1,70 @@
+{
+  "by_category_counts_completed_only": {
+    "address": {
+      "fn": 2,
+      "fp": 0,
+      "tp": 0
+    },
+    "birth_date": {
+      "fn": 2,
+      "fp": 0,
+      "tp": 0
+    },
+    "cnpj": {
+      "fn": 0,
+      "fp": 0,
+      "tp": 4
+    },
+    "cpf": {
+      "fn": 2,
+      "fp": 0,
+      "tp": 4
+    },
+    "credit_card": {
+      "fn": 0,
+      "fp": 0,
+      "tp": 4
+    },
+    "email": {
+      "fn": 2,
+      "fp": 0,
+      "tp": 2
+    },
+    "ipv4": {
+      "fn": 2,
+      "fp": 0,
+      "tp": 2
+    },
+    "person_name": {
+      "fn": 2,
+      "fp": 0,
+      "tp": 0
+    },
+    "phone": {
+      "fn": 2,
+      "fp": 0,
+      "tp": 2
+    },
+    "postal_code": {
+      "fn": 2,
+      "fp": 0,
+      "tp": 0
+    },
+    "secret": {
+      "fn": 2,
+      "fp": 0,
+      "tp": 0
+    },
+    "ssn": {
+      "fn": 2,
+      "fp": 0,
+      "tp": 2
+    }
+  },
+  "claim_scope": "exact span characterization; error cases excluded from counts and reported separately; no semantic privacy claim",
+  "completed": 48,
+  "dataset_manifest_sha256": "809bae465d11c68fd135a46c460a75b604b1b736676a60f88efe922b6031b3d0",
+  "errors": 0,
+  "executable_sha256": "f30dcaf54c5a484370661fd0f32661235d45011bcc1ed663a68d053d2e56c92e",
+  "offset_unit": "utf8_byte"
+}
