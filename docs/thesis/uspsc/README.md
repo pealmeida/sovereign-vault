@@ -41,7 +41,7 @@ mesmo critério de reprodutibilidade que o Capítulo 4 exige da evidência.
 | `USPSC-classe/USPSC1.cls` | variante com cabeçalho distinto em páginas pares/ímpares |
 | `USPSC-classe/ABNT6023-10520.sty` | compatibilização NBR 6023:2018 e 10520:2023 — **não carregado** por exigir `abntex2cite`; ver o comentário em `../paper-uspsc.tex` |
 | `USPSC-classe/*.bst` | estilos BibTeX (alf/num, PT/EN) — para uso futuro, se houver migração para `.bib` |
-| `_body.tex`, `_pretextual-conteudo.tex` | **gerados** por `scripts/sync-uspsc-body.py` a partir de `../paper.tex`; ignorados pelo git |
+| `_body.tex`, `_pretextual-conteudo.tex` | **gerados** por `scripts/sync-uspsc-body.py` a partir de `../paper.tex`; versionados para que o Overleaf compile `paper-uspsc.tex` — regenerar e commitar junto com toda edição de `paper.tex` (a CI reprova divergência) |
 
 Os arquivos `USPSC-unidades.tex`, `USPSC-pre-textual-ICMC.tex` e
 `USPSC-TCC-pre-textual-ICMC.tex` ficam em `../` (raiz de `docs/thesis/`) porque a
