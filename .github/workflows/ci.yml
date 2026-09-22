@@ -181,6 +181,11 @@ jobs:
       - name: Thesis citation ranges resolve
         run: python scripts/check-thesis-citations.py
 
+      # The USPSC fragments are committed so Overleaf can compile them;
+      # they must stay byte-identical to what paper.tex generates.
+      - name: USPSC fragments match paper.tex
+        run: python scripts/sync-uspsc-body.py && git diff --exit-code docs/thesis/uspsc/
+
       - name: collect-metadata.sh parses
         run: bash -n docs/thesis/evidence/collect-metadata.sh
 
