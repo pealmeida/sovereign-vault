@@ -32,7 +32,7 @@ tracing           = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror         = { workspace = true }
 async-trait       = "0.1"
-dirs              = "6.0"
+dirs              = "7.0"
 
 [lints]
 workspace = true
