@@ -1,0 +1,17 @@
+% --- Macros do formulário da Declaração de uso de IA ---------------------------
+% Colar no main.tex, após a área de import de pacotes. Requer \usepackage{tikz}.
+%
+% As três primeiras são as suas. A quarta e a quinta são o complemento necessário:
+% os comandos originais só produzem a caixa VAZIA, e uma declaração assinada tem
+% de mostrar o que foi marcado. Mesma espessura de traço e mesma baseline.
+
+\newcommand{\checkbox}{\tikz[baseline=-0.55ex]\draw[line width=0.35pt] (0,0) rectangle (0.20,0.20);}
+\newcommand{\formline}[1]{\rule{#1}{0.35pt}}
+\newcommand{\choice}[1]{\noindent\checkbox\hspace{0.12cm}#1\par}
+
+\newcommand{\checkedbox}{\tikz[baseline=-0.55ex]{%
+  \draw[line width=0.35pt] (0,0) rectangle (0.20,0.20);
+  \draw[line width=0.35pt] (0.035,0.035) -- (0.165,0.165);
+  \draw[line width=0.35pt] (0.165,0.035) -- (0.035,0.165);}}
+\newcommand{\choicex}[1]{\noindent\checkedbox\hspace{0.12cm}#1\par}
+% ------------------------------------------------------------------------------
