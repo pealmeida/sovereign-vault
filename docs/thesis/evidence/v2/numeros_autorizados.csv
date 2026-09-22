@@ -5,7 +5,7 @@ E1.diff.1k.APP,DIRECT-APPROVAL 1 KiB (mediana),"-0,009","[-0,106; 0,082]",us,ART
 E1.diff.1k.OTP,DIRECT-OTP 1 KiB (mediana),"+0,009","[-0,050; 0,084]",us,ARTEFATO,Tab.5-nova,nao exclui zero
 E1.diff.16k.APP,DIRECT-APPROVAL 16 KiB (mediana),"-0,134","[-0,407; 0,063]",us,ARTEFATO,Tab.5-nova,nao exclui zero
 E1.diff.16k.OTP,DIRECT-OTP 16 KiB (mediana),"-0,032","[-0,090; 0,023]",us,ARTEFATO,Tab.5-nova,nao exclui zero
-E1.P2.mean.16k.OTP,DIRECT-OTP 16 KiB (MEDIA),"+6,005","[5,690; 6,331]",us,ARTEFATO,4.2 texto,exclui zero: inversao FALSA pela media
+E1.P2.mean.16k.OTP,DIRECT-OTP 16 KiB (MEDIA),"+6,005","[5,690; 6,331]",us,ARTEFATO,4.2 texto,exclui zero pela media; estimando distinto da mediana; interpretacao 'inversao FALSA' retirada
 E1.P2.p99.direct.16k,p99 DIRECT 16 KiB entre sessoes,"38,5-61,7",-,us,ARTEFATO,4.2 texto,mediana ~29 us; cauda direita consistente
 E2.wrongsign.A,braco A ordem fixa/sem warmup,"70,0",-,%,ARTEFATO,Tab.ablacao,fracao de sinal invertido (mediana)
 E2.wrongsign.B,braco B ordem fixa/warmup,"73,3",-,%,ARTEFATO,Tab.ablacao,
@@ -32,8 +32,8 @@ E5.cov.old,cobertura da bateria original,5/20,-,-,ARTEFATO,5.x + resumo,25% - CO
 E5.cov.new,cobertura apos extensao,17/20,-,-,ARTEFATO,5.x + resumo,85%
 E5.match,vereditos que batem com pre-especificacao,11/12,-,-,ARTEFATO,Tab.sondas,C4 e o mismatch
 E5.audit,cadeia HMAC verificada,ok,-,-,ARTEFATO,5.x,"12 entradas, verify_chain"
-T5.signtest,teste de sinais na Tabela 5 PUBLICADA,"0,016",-,p,PUBLICADO,4.2 nota metodologica,"6/6, exato unilateral"
-T5.cantelli,limite superior de |z| das 6 diferencas,"11,7-58,5",-,EP,PUBLICADO,4.2 nota metodologica,Cantelli sobre p95-media
+T5.signtest,teste de sinais na Tabela 5 PUBLICADA,"0,016",-,p,PUBLICADO,4.2 nota metodologica,"6/6, exato unilateral; inferencia retirada do texto (nota metodologica 4.2); valor preservado como historico"
+T5.cantelli,limite superior de |z| das 6 diferencas,"11,7-58,5",-,EP,PUBLICADO,4.2 nota metodologica,Cantelli sobre p95-media; inferencia retirada do texto (nota metodologica 4.2); valor preservado como historico
 E6.ext.cases,casos totais no corpus sintetico externo,48,-,casos,ARTEFATO,5 limitacoes,observations.jsonl e scores.jsonl; inclui oito controles negativos
 E6.ext.negative,controles negativos no corpus externo,8,-,casos,ARTEFATO,5 limitacoes,scores.jsonl formato negative_control
 E6.ext.canonical,acertos em casos canonicos externos,14/14,-,casos,ARTEFATO,5 limitacoes,dois casos por categoria coberta; correspondencia exata de categoria e span
