@@ -2123,8 +2123,10 @@ async fn is_unlocked(state: &State<'_, VaultState>) -> bool {
 ///
 /// Returns `Err` when consent is refused, which callers propagate so the
 /// operation does not run.
-/// Whether a desktop-originated action on a container of `mode` needs explicit
-/// human confirmation.
+/// Whether a desktop-originated operation on a container of `mode` needs
+/// explicit human confirmation, independent of the action. The action-aware
+/// entry point is [`desktop_consent_required_for`], which gates ANONYMIZED
+/// reads on top of this mode-only policy.
 ///
 /// Split out from [`require_desktop_consent`] so the policy can be tested
 /// without a live vault or a real prompt.
@@ -2135,6 +2137,9 @@ fn desktop_consent_required(mode: Option<SecurityMode>) -> Result<bool, String> 
         // modeless request, rather than inventing a gate the user never asked
         // for.
         None => Ok(false),
+        // `Anonymized` is ungated HERE because writes and deletes release
+        // nothing; the action-aware layer above gates its READS, which return
+        // plaintext the MCP path would mask.
         Some(SecurityMode::Direct) | Some(SecurityMode::Anonymized) => Ok(false),
         Some(SecurityMode::Approval) | Some(SecurityMode::Otp) => Ok(true),
         // Not implemented for live access anywhere else in the app; fail
@@ -2144,6 +2149,27 @@ fn desktop_consent_required(mode: Option<SecurityMode>) -> Result<bool, String> 
     }
 }
 
+/// Whether a desktop-originated `action` on a container of `mode` needs
+/// explicit human confirmation.
+///
+/// The action-aware layer over [`desktop_consent_required`]. A desktop read of
+/// an ANONYMIZED container returns plaintext that the MCP path would mask
+/// (`sv-mcp` applies its privacy filter to read responses before egress),
+/// so without this gate an agent driving the desktop UI with synthetic input
+/// would obtain more than the MCP channel would give it. Writes and deletes
+/// release nothing and stay ungated, exactly as in a `Direct` container.
+fn desktop_consent_required_for(
+    action: sv_mcp::AccessAction,
+    mode: Option<SecurityMode>,
+) -> Result<bool, String> {
+    if matches!(action, sv_mcp::AccessAction::ReadFile)
+        && matches!(mode, Some(SecurityMode::Anonymized))
+    {
+        return Ok(true);
+    }
+    desktop_consent_required(mode)
+}
+
 async fn require_desktop_consent<R: Runtime>(
     state: &VaultState<R>,
     action: sv_mcp::AccessAction,
@@ -2151,7 +2177,7 @@ async fn require_desktop_consent<R: Runtime>(
     file_name: Option<&str>,
     mode: Option<SecurityMode>,
 ) -> Result<(), String> {
-    if !desktop_consent_required(mode)? {
+    if !desktop_consent_required_for(action, mode)? {
         return Ok(());
     }
 
@@ -4987,10 +5013,55 @@ mod tests {
         );
     }
 
+    /// Writing and deleting never release data, so they stay ungated in a
+    /// `Direct` container and in an `Anonymized` one: that mode's protection
+    /// is masking on read egress, not anything a write or a delete could
+    /// leak. `desktop_consent_required_for` is the action-aware policy;
+    /// [`desktop_consent_required`] remains its mode-only base layer.
     #[test]
-    fn direct_and_anonymized_modes_do_not_prompt() {
+    fn direct_mode_and_anonymized_writes_do_not_prompt() {
         assert!(!desktop_consent_required(Some(SecurityMode::Direct)).unwrap());
-        assert!(!desktop_consent_required(Some(SecurityMode::Anonymized)).unwrap());
+        assert!(!desktop_consent_required_for(
+            sv_mcp::AccessAction::WriteFile,
+            Some(SecurityMode::Anonymized)
+        )
+        .unwrap());
+        assert!(!desktop_consent_required_for(
+            sv_mcp::AccessAction::DeleteFile,
+            Some(SecurityMode::Anonymized)
+        )
+        .unwrap());
+    }
+
+    /// A desktop read of an ANONYMIZED container returns plaintext that the
+    /// MCP path would mask (`sv-mcp` `apply_privacy_filter`). Gate it so an
+    /// agent driving the desktop UI with synthetic input cannot obtain more
+    /// than the MCP channel would give it.
+    #[test]
+    fn anonymized_reads_require_desktop_consent() {
+        assert!(desktop_consent_required_for(
+            sv_mcp::AccessAction::ReadFile,
+            Some(SecurityMode::Anonymized)
+        )
+        .unwrap());
+    }
+
+    /// For every other combination the action-aware policy delegates to the
+    /// mode-only one: ungated in `Direct` and modeless containers, gated for
+    /// `Approval` and `Otp`, fail-closed for the unimplemented modes.
+    #[test]
+    fn consent_for_other_actions_delegates_to_mode_policy() {
+        for action in [
+            sv_mcp::AccessAction::ReadFile,
+            sv_mcp::AccessAction::WriteFile,
+        ] {
+            assert!(!desktop_consent_required_for(action, Some(SecurityMode::Direct)).unwrap());
+            assert!(!desktop_consent_required_for(action, None).unwrap());
+            assert!(desktop_consent_required_for(action, Some(SecurityMode::Approval)).unwrap());
+            assert!(desktop_consent_required_for(action, Some(SecurityMode::Otp)).unwrap());
+            assert!(desktop_consent_required_for(action, Some(SecurityMode::Zkp)).is_err());
+            assert!(desktop_consent_required_for(action, Some(SecurityMode::Native)).is_err());
+        }
     }
 
     /// A container with no recorded mode has no policy set, so inventing a
