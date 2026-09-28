@@ -21,6 +21,7 @@ This lane is for implementation work, verification, and operational hardening.
 
 - Add implementation validation plans and result logs to `docs/testing/`.
 - Add architecture decisions to `docs/adr/` when the system boundary or security model changes.
+- Add feature design specs to `docs/development/specs/` as `YYYY-MM-DD-<topic>-design.md`; each spec links the ADR it motivates, and the ADR links back.
 - Keep transient brainstorming out of the root; move superseded material to `docs/archive/`.
 
 ## Current focus areas
