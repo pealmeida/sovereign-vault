@@ -33,6 +33,31 @@ carrying it (`handle_otp` :356-483, `process_otp_request` :224-275), with the
 same 120 s TTL. Tauri commands are only invocable from the app's own webview,
 so the surfaces that decide are exactly: modal, tray, and the OTP resend.
 
+One premise needs to be stated precisely: `respond()` is the single decision
+point for MCP request approvals — modal, tray, and the desktop consent gate —
+not for every human action the app takes. Remediation originates entirely
+from human UI actions (`scan_run` then `remediate_plan_file`, executed by
+`remediate_execute` under a digest confirmation), and wake requests are
+created only by the `wake_request` Tauri command (lib.rs:4369);
+agent-originated wake entry depends on ADR-0021, which is Proposed and not
+implemented. When this ADR gates those flows, the reason is not their origin
+— it is UI automation: whatever a synthetic click can drive must release no
+more than the agent already has.
+
+There was also an existing gap, in three distinct layers. (a) Historically,
+in an ANONYMIZED container, the desktop commands `vault_read_file`
+(lib.rs:4014; gate only at :4040) and `vault_export_file` (:4140; gate at
+:4151) returned or wrote PLAINTEXT without any consent, because
+`desktop_consent_required` treated Anonymized as ungated (:2139) and the
+desktop did not apply `sv-privacy`; the MCP path returns the same content
+masked (crates/sv-mcp/src/lib.rs:1431-1460). (b) That specific gap is now
+closed by PR #120, which added `desktop_consent_required_for` and put
+ANONYMIZED reads and exports behind a desktop consent click. (c) What
+remains for THIS ADR is the increment: presence in place of that click,
+wherever the platform can attest it. Until (b) landed, driving the desktop
+UI was worth more than the MCP channel — the opposite of the intended
+design.
+
 One workspace rule is deliberately broken here, and only here: first-party
 crates forbid `unsafe` (crates/sv-mcp/src/lib.rs:18) — a thesis claim. The
 Windows backend below needs FFI to the OS consent APIs, so this ADR declares a
@@ -176,6 +201,92 @@ reuses the trait defined here.
     approval — with the declaration that the fake verifier covers the
     coordinator's logic, not the resistance of the OS prompt itself, which
     only the platform-level automation runs exercise.
+14. **Desktop command gates.** The guarantee extends beyond request
+    approvals: on operations classified `protected: true`, driving the
+    Sovereign Vault UI with synthetic input releases nothing the agent would
+    not already get through MCP, and unlocks nothing. The same coordinator
+    gates the app's own privileged commands, each through its distinct
+    integration point. Every gated desktop operation becomes a pending
+    operation with its own identifier, its own deadline, and a `protected`
+    classification that is IMMUTABLE until a terminal state — retries do not
+    re-run `availability()`, the same rule as MCP requests. A mid-attempt
+    failure never falls back; where `availability()` is `Unavailable` BEFORE
+    the attempt the command takes the declared consent click —
+    `protected: false`, never ungated. Two assumptions bound the guarantee:
+    a declared-click gate remains automatable and offers NO guarantee against
+    synthetic input — MCP parity holds only for the DIRECT exception (see the
+    mode table below; on ANONYMIZED a synthetic click through a declared
+    click would still release plaintext the MCP path masks) — and the
+    passphrase/recovery unlock paths assume the agent does not know the
+    credential (keylogging is out of scope). Every container mode is covered
+    explicitly: DIRECT reads and exports are DECLARED UNGATED (author
+    decision, anchored on threat-model §3.B: any same-user process can fetch
+    the pairing secret at /.well-known/mcp-pairing and pair as the unscoped
+    Default agent, reading DIRECT content through MCP, so a desktop read
+    yields no gain; if §3.B ever changes, this point must be revisited);
+    ANONYMIZED reads and exports take the presence gate over the PR #120
+    click; APPROVAL/OTP route through `require_desktop_consent` → `respond`
+    → presence; ZKP/NATIVE fail closed. Gated:
+    - `vault_read_file` and `vault_export_file` on ANONYMIZED containers:
+      presence required, replacing the consent click PR #120 added
+      (`desktop_consent_required_for`); on systems without presence that
+      click remains. `op_digest`: container, file name, operation
+      (read | export), export destination.
+    - `remediate_restore`: `op_digest` = plan id or snapshot ref, relative
+      file path, snapshot digest.
+    - `remediate_execute`: `op_digest` = plan id, snapshot digest, relative
+      path, manifest path, adapter. The existing `confirm_digest` comes from
+      `remediate_plan_list` (the same channel) and proves nothing about
+      presence.
+    - `wake_respond`, only when approving: `op_digest` = wake id, signature,
+      agent id, session id. `wake_prepare_access` carries a derived
+      authorization, not its own gate: the backend must validate the CURRENT
+      wake authorization (`has_authorized_wake`), bound to the request
+      signature, the agent, the session, and the operation. Tests: a direct
+      call with no approval, an expired authorization, and a session or
+      scope switch are all refused.
+    - `agent_create`: `op_digest` = agent name and requested scopes; the
+      token is returned only after presence.
+    - `vault_rotate_key`: `op_digest` = active DEK version; the new recovery
+      phrase is returned only after presence.
+    - `scan_reveal`: `op_digest` = report id and finding id.
+    - `vault_unlock` with OsKeychain custody: `op_digest` = vault identifier
+      plus "unlock". This is the one operation whose verification may START
+      from the locked state; the attempt is invalidated by any vault-state
+      change (another unlock completing, a lock), and the vault's identity
+      and custody are revalidated before the KEK is read from the keychain.
+      Relation to subproject A: presence here is an OS boolean checked
+      before that read; A remains hardware-key unlock.
+    - `vault_init` (author decision): gated where presence exists;
+      `op_digest` = vault root plus "init"; the first recovery phrase is
+      returned only after authentication; without presence, declared click.
+    Declared ungated, with reasons: `vault_unlock` by passphrase and
+    `vault_unlock_recovery` (they depend on knowledge the agent lacks;
+    keylogging is out of scope); `vault_list_files` (names, sizes, dates —
+    metadata); `mcp_status` (the pairing secret is already public through
+    /.well-known/mcp-pairing, threat-model §3.B). `vault_init` is NOT on
+    this list: it is gated (above). Mutating commands verify presence BEFORE
+    any mutation — `agent_create`, `vault_rotate_key`, `vault_init`,
+    `remediate_execute`, and `remediate_restore` — and a refusal must leave
+    observable state unchanged, not merely omit a secret from the response:
+    no agent created, DEK unchanged, no vault created, project not
+    rewritten. Tests: (a) a source-scan test in the pattern of
+    `every_mutating_desktop_command_enforces_mode` compares the COMPLETE
+    Tauri command registry (`invoke_handler`) against a mandatory
+    per-command classification — own gate | derived authorization |
+    justified exception — and a new command without a classification fails
+    the test; beyond the textual scan, the gated paths have executable
+    tests; (b) per command, without a successful verify nothing is released
+    and nothing is mutated — an ANONYMIZED read or export returns no
+    plaintext, restore writes nothing, execute ingests nothing, wake
+    authorizes nothing, agent_create creates no agent, rotate changes no
+    DEK and returns no phrase, scan_reveal reveals nothing, keychain unlock
+    does not unlock, init creates no vault; (c) on a system without
+    presence, an ANONYMIZED read or export requires the consent click; (d)
+    per-gate caveats: a success that arrives after the deadline or after a
+    lock produces no effect, a parameter change during the prompt (a
+    different `op_digest`) denies the attempt, and unavailability between
+    classification and execution denies it.
 
 ## Consequences
 
@@ -189,6 +300,20 @@ reuses the trait defined here.
   commands (`submit_secret`, `submit_secret_direct`). The
   guarantee is per protected request — it is not a blanket claim about macOS
   or Windows, and it does not extend to unprotected (`click`) approvals.
+- **Positive.** The desktop's own command surface is covered (item 14):
+  on operations classified `protected: true`, synthetic input to the
+  Sovereign Vault window no longer yields plaintext
+  ANONYMIZED content, key rotation phrases, agent tokens, wake authorizations,
+  revealed scan findings, or an unlocked keychain-custody vault. The historical
+  gap where desktop ANONYMIZED reads and exports bypassed the masking the MCP
+  path applies was closed by PR #120's consent click, and this ADR replaces
+  that click with presence where the platform can attest it; every gated
+   command records `presence` in the audit like approvals do. As with
+   approvals, the guarantee covers only `protected: true` operations: a
+   declared-click gate remains automatable and offers no guarantee against
+   synthetic input (MCP parity holds only for the DIRECT exception, item 14),
+   and the passphrase and recovery unlock paths rest on the
+   credential-knowledge assumption.
 - **Positive (research).** The audit gains a countable signal: approvals
   split into `device_owner_authenticated` and `click` (unprotected), with the
   modality where the OS reports it. The share of protected approvals is a
@@ -196,7 +321,12 @@ reuses the trait defined here.
 - **Negative.** Linux ships with approvals unprotected, declared; Windows
   below Build 22000 is declared click; on Windows the
   modality is always `unknown`, so the audit cannot distinguish fingerprint
-  from PIN there.
+  from PIN there. The gated surface also grows: roughly ten desktop commands
+   need their own `op_digest` binding and their own release tests, and the
+   consent click PR #120 introduced for ANONYMIZED desktop reads and exports
+   remains the gate on systems without presence — a real usability cost
+   there — while this amendment's increment is presence verification on
+   protected systems.
 - **Negative.** The `unsafe`-forbidden claim now holds "except
   sv-presence-windows". That weakens a stated property of the artifact and
   must not be described as workspace-wide anymore.
@@ -217,6 +347,12 @@ reuses the trait defined here.
   passages affected once this lands are listed for the author's decision:
   docs/thesis/TRACEABILITY.md:34 and :46, docs/thesis/paper.tex:353, :448,
   :456, and :780, and the unsafe claim (AGENTS.md; crates/sv-mcp/src/lib.rs:18).
+  Listed additionally for the author's awareness, in three layers: (a) the
+  evaluated artifact's desktop path in ANONYMIZED containers returned
+  plaintext — a gap of the artifact's desktop layer, not of the evaluated
+  MCP gateway, which masks; (b) PR #120 closed that gap with a consent click
+  (`desktop_consent_required_for`); (c) this ADR's increment is presence in
+  place of that click wherever the platform can attest it.
 
 ## Alternatives considered
 
@@ -258,8 +394,10 @@ reuses the trait defined here.
 ## References
 
 - [ADR-0013](0013-sensitivity-classifier-adaptive-consent.md): the consent
-  policy; this ADR adds a presence check beneath the existing click tier and
-  does not change which actions require consent.
+  policy; this ADR adds a presence check beneath the existing click tier. It
+  does not change the MCP consent tiers; the one desktop-side addition — a
+  consent click for ANONYMIZED reads and exports where presence is
+  unavailable — is recorded in item 14.
 - [ADR-0014](0014-os-notifications-for-consent-prompts.md): the 120 s
   approval window and OS notification, which the native prompt must not
   suspend and which queues behind it.
@@ -273,4 +411,7 @@ reuses the trait defined here.
   before the commit — integrated explicitly, not through `respond()`.
 - `docs/threat-model.md` §3.A–B: the same-user boundary this ADR narrows in
   practice — the new guarantee and the declared limits (Linux, Windows below
-  Build 22000, `unknown` modality) are to be recorded there.
+  Build 22000, `unknown` modality) are to be recorded there, including a new
+  §3 row: an agent driving the Sovereign Vault desktop UI with synthetic
+  input to obtain data or authority beyond MCP — Yes for the gated commands
+  of item 14 on a protected system, with the declared limits otherwise.

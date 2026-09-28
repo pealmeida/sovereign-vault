@@ -8,16 +8,22 @@
 ## 1. Problem
 
 Today an approval proves that *a click happened*, not that *a human clicked*.
-The desktop gate is a single decision point — `ApprovalState::respond`
-(`apps/desktop/src-tauri/src/lib.rs:674`), which removes the pending request
-under a mutex and sends a bool over a oneshot — and every surface routes
-through it: the modal (`request_click`, `lib.rs:580-672`, 120 s
-`APPROVAL_TIMEOUT_SECS`, `lib.rs:75`), the Tauri command `approval_respond`
-(`lib.rs:4355`), the tray (`respond_from_tray`, `lib.rs:1779-1832`, which
-approves **without opening a window**, ADR-0022), and the consent checks
-`require_desktop_consent` (`lib.rs:2147-2179`) and `request_click_only`
-(`lib.rs:551-560`). Tauri commands are only invocable by the webview, but a
-process running as the same OS user can drive the webview with UI
+The desktop gate for **MCP request approvals** is a single decision point —
+`ApprovalState::respond` (`apps/desktop/src-tauri/src/lib.rs:674`), which
+removes the pending request under a mutex and sends a bool over a oneshot —
+and every approval surface routes through it: the modal (`request_click`,
+`lib.rs:580-672`, 120 s `APPROVAL_TIMEOUT_SECS`, `lib.rs:75`), the Tauri
+command `approval_respond` (`lib.rs:4355`), the tray (`respond_from_tray`,
+`lib.rs:1779-1832`, which approves **without opening a window**, ADR-0022),
+and the consent checks `require_desktop_consent` (`lib.rs:2147-2179`) and
+`request_click_only` (`lib.rs:551-560`). `respond` is the gate for
+**approvals of MCP requests** — not for every human action: wake requests
+are created only by the Tauri command `wake_request` (`lib.rs:4369`; the
+agent-facing entry point is ADR-0021, Proposed and not implemented), and the
+remediation chain is 100 % human-originated (`scan_run` → `remediate_plan_file`).
+Those flows are gated later anyway (§7.5) — the reason is **UI automation**,
+not request provenance. Tauri commands are only invocable by the webview,
+but a process running as the same OS user can drive the webview with UI
 automation. The OTP flow has the same shape: the code is generated
 (`generate_otp_code`, `lib.rs:295-299`) and placed in the event
 (`ApprovalPrompt.otp_code`, `lib.rs:517-526`, `handle_otp_fresh`
@@ -25,14 +31,37 @@ automation. The OTP flow has the same shape: the code is generated
 resend it (`handle_otp`, `lib.rs:356-483`; `process_otp_request`,
 `lib.rs:224-275`; TTL 120 s).
 
+An `ANONYMIZED` gap is in scope because it is the same synthetic-input
+attack, and its baseline must be stated precisely in three parts. (a) In
+the **evaluated artifact**, `vault_read_file` (`lib.rs:4014`) and
+`vault_export_file` (`lib.rs:4140`) returned or wrote **cleartext with no
+consent**: `desktop_consent_required` treated `Anonymized` as ungated
+(`lib.rs:2139`) and the desktop never applied `sv-privacy`, while MCP masked
+the same read (`sv-mcp/src/lib.rs:1431-1460`). (b) **PR #120 already fixed
+that** by requiring the ordinary consent click for read-type actions in
+`Anonymized` (`desktop_consent_required_for`, covering `ReadFile`) — both
+commands take their consent gate as `AccessAction::ReadFile`, so the click
+now applies to export too. (c) **This ADR's increment**: on top of that
+baseline, replace the click with a presence verification where the system
+supports it (§7.5), keeping the click as the declared path where it does
+not.
+
 The current threat model treats the same OS user as trusted and agents as
 untrusted; memory scraping, ptrace and keylogging are out of scope. This
 feature closes one specific gap inside that model: an agent running with the
 user's own privileges must not be able to approve its own protected request
-— neither with a synthetic click nor with a screen-scraped OTP. Note that
-`respond` is the gate for **approval requests**; the ADR-0024 secret-entry
-submits are a different kind of action that does not pass through it and is
-wired into the presence coordinator separately (§7.4).
+— neither with a synthetic click nor with a screen-scraped OTP. The
+guarantee is then widened past approvals, which `respond` gates (§7.4 covers
+the ADR-0024 submits, wired into the coordinator separately): **driving the
+Sovereign Vault desktop UI with synthetic input must not release anything
+beyond what the same agent could obtain over MCP, and must not unlock the
+vault — for every operation classified `protected: true`**. The guarantee
+is claimed per protected operation, not absolutely: on a declared system
+the click itself remains automatable (§6.2), and the passphrase/recovery
+unlock exceptions assume the agent does not know the credential
+(keylogging stays an out-of-scope non-goal). Every data- or
+authority-releasing command goes through the same presence coordinator
+(§7.5).
 
 **Subproject A** (biometric vault unlock) comes later and reuses the same
 `PresenceVerifier` trait. This spec is **subproject B**: presence on
@@ -82,6 +111,7 @@ approvals.
 | Vector | Covered | How |
 |---|---|---|
 | Synthetic click (UI automation / accessibility) approving an agent's own request | Yes — for protected requests (`protected: true`, classified at creation) | The approve transition only commits after `PresenceVerifier::verify` succeeds at `ApprovalState::respond` (§6) |
+| Agent drives the SV desktop UI with synthetic input to obtain data or authority beyond MCP (reads, exports, restores, tokens, recovery phrases, wake approvals, unlocks) | Yes — for every gated command on a protected system (§7.5) | The same presence coordinator gates each listed command at its own integration point; the declared exceptions and their reasons are listed in §7.5 (passphrase/recovery unlock, DIRECT reads/exports per threat-model §3.B, list metadata, pairing secret) |
 | Agent reads the OTP from screen/IPC and resends it | Yes — for protected requests | The code is revealed only after a successful verify bound to that request, and a resent code is accepted only while the request is in that authenticated state, in deadline, single-use (§7.3) |
 | Tray approval without a window | Yes | Tray "Approve" opens the request modal instead of responding (revision of ADR-0022, §7.2); tray "Refuse" stays direct |
 | Late or spoofed verification result | Yes | Attempt state machine: the finisher re-checks `Verifying` + `attempt_id` + `op_digest` + deadline under the lock; a late callback is discarded (§6) |
@@ -90,7 +120,7 @@ approvals.
 | polkit agent registered by another same-user process answering prompts (Linux) | **No — Linux is declared unprotected** | Linux backend always reports `Unavailable`; approvals take the declared-click path (§5.3) |
 | No enrolled biometric / Hello disabled by policy | Declared | The classification is made when the request is created: `availability() == Unavailable` → declared-click path with permanent notice, no prompt attempted (§6.2). A `DisabledByPolicy` / `NotConfigured` / `Unavailable` returned by `verify()` mid-attempt **denies** that request — it never degrades to a click (§9.1) |
 | Same-user memory scraping, ptrace, keylogging | **No (declared)** | Existing non-goals of `docs/threat-model.md`; unchanged here |
-| Fully-compromised account, locked-vault states | **No (declared)** | Outside this feature; consistent with threat model §3.B |
+| Fully-compromised account | **No (declared)** | Outside this feature; consistent with threat model §3.B. Note the scope line on locked vaults: "locked" as a general state stays outside, but the locked→unlocked **transition** through keychain custody is now in scope and gated (§7.5 item 9); the knowledge-gated unlock paths (passphrase, recovery phrase) remain declared exceptions |
 
 Refusing is always available without presence: the gate constrains approval
 only.
@@ -339,6 +369,121 @@ The "Approve" button triggers `verify` from the vault window
   at submit time, the submit proceeds `protected: false`, audited and
   noticed like an unprotected approval.
 
+### 7.5 Desktop command gates (extension)
+
+The widened guarantee (§1) — **for every operation classified `protected: true`**:
+synthetic input driving the UI must release nothing beyond the MCP channel
+and must not unlock the vault. These commands are gated by the **same
+presence coordinator**, each at its own integration point. Every gated
+desktop operation becomes a **pending operation** with its own identifier,
+its own deadline, and a `protected` classification that is **immutable until
+a terminal state**: the classification comes from one `availability()` call
+when the operation is created, retries do **not** re-run it — the same rule
+as MCP requests (§6.2) — and there is no fallback during the attempt (§6.2
+applies verbatim: mid-attempt `DisabledByPolicy` / `NotConfigured` /
+`Unavailable` denies the operation).
+Where `availability()` already reported `Unavailable` **before** the
+attempt, the operation degrades to **declared consent-click** — never to
+"no gate" — with `protected: false` audited and the permanent notice. The
+prompt text and digest rules of §6.3 apply to every entry below.
+
+Every container mode is covered explicitly: **DIRECT** reads and exports are
+**declared ungated** — author decision, anchored on threat-model §3.B: any
+same-user process can fetch the pairing secret at `/.well-known/mcp-pairing`
+and pair as the unscoped Default agent, reading DIRECT content through MCP,
+so a desktop read yields no gain for the agent beyond that capability, and
+it is against exactly that capability that the "nothing beyond MCP"
+guarantee is measured; if §3.B ever changes, this point must be revisited.
+**ANONYMIZED** reads and exports take the presence gate over the PR #120
+consent click (item 2). **APPROVAL/OTP** reads and exports already route
+through `require_desktop_consent` → `respond` → presence (§7.4).
+**ZKP/NATIVE** fail closed: nothing is released for those modes.
+
+Gated commands:
+
+1. `approval_respond` and the tray approve path (§§6–7.2) — the base
+   surface of this spec.
+2. `vault_read_file` and `vault_export_file` in **ANONYMIZED** mode: presence
+   is required before cleartext leaves to the renderer or to disk. The
+   baseline separates three layers (§1): (a) historically the desktop
+   returned or wrote cleartext with no consent (`lib.rs:2139` treated
+   `Anonymized` as ungated and the desktop never masked, while MCP masked via
+   sv-privacy, `sv-mcp/src/lib.rs:1431-1460`); (b) **PR #120** already put
+   these reads and exports behind the consent click
+   (`desktop_consent_required_for`, covering `ReadFile`); (c) this gate's
+   increment replaces **that click** with presence. On systems without
+   presence the click remains (`protected: false`, never ungated).
+   `op_digest`: container, file_name, operation
+   (`read` | `export`), export destination.
+3. `remediate_restore`: writes snapshot plaintext back to disk.
+   `op_digest`: plan id or snapshot ref, file relative path,
+   `snapshot_digest`.
+4. `remediate_execute`: ingests the secret and rewrites the project file.
+   `op_digest`: plan id, `snapshot_digest`, file relative path,
+   manifest path, adapter. Its `confirm_digest` is **not** a presence
+   proof — the same webview channel that calls `remediate_execute` can read
+   the digest from `remediate_plan_list` (`lib.rs:3420`); the digest only
+   binds which plan runs.
+5. `wake_respond`, **only when approving** (refusing stays free):
+   `op_digest`: wake request id, signature, agent_id, session id. Today
+   wakes can only be created by the Tauri `wake_request` command
+    (`lib.rs:4369`); the agent-facing entry is ADR-0021 (Proposed, not
+    implemented) — when it lands, this gate already covers it.
+    `wake_prepare_access` carries a **derived authorization**, not its own
+    gate: the backend must validate the **current** wake authorization
+    (`has_authorized_wake`), bound to the request signature, the agent, the
+    session, and the operation. A direct call with no approval, an expired
+    authorization, and a session or scope switch are all refused (§9.2).
+6. `agent_create`: mints a live agent credential. `op_digest`: requested
+   agent name and scopes. The token (`lib.rs:4555-4558`) is returned to the
+   renderer **only after** a successful verification.
+7. `vault_rotate_key`: `op_digest`: the active DEK version. The new recovery
+   phrase is returned only after a successful verification.
+8. `scan_reveal`: `op_digest`: report id and finding index. On a protected
+   system the 4-character preview is released only after verification; on a
+   declared system, after the consent click.
+9. `vault_unlock` with **OsKeychain custody**: `op_digest`: vault identifier
+   plus the literal `unlock`. Presence here is a bare OS boolean asked
+   before the KEK is read from the keychain; it is **not** subproject A.
+   Subproject A remains key-held biometric unlock (wrapping custody material
+   behind the `PresenceVerifier` seam, §4); this gate only stops a synthetic
+   click from turning an auto-unlock keychain into a passwordless master
+   switch. This is the one operation whose verification may **start from the
+   locked state**: the initial locked state is permitted, the attempt is
+   invalidated by any vault-state change (another unlock completing, a lock),
+   and the vault's identity and custody are revalidated before the KEK is
+   read from the keychain.
+10. `vault_init` (author decision): gated where presence exists.
+    `op_digest`: the vault root plus the literal `init`. The vault is
+    created only after verification, and the first recovery phrase is
+    returned **only after** a successful authentication; without presence
+    the operation takes the declared consent click.
+
+Mutating commands verify presence **before any mutation** —
+`agent_create`, `vault_rotate_key`, `vault_init`, `remediate_execute`,
+`remediate_restore` — and a refusal must leave **observable state
+unchanged**, not merely omit a secret or token from the response: no agent
+created, DEK unchanged, no vault created, project not rewritten (§9.2
+asserts this).
+
+Declared **without a gate**, with the reason recorded here and in ADR-0025:
+
+- `vault_unlock` with passphrase custody and `vault_unlock_recovery`: each
+  requires knowledge the agent does not have (passphrase / recovery phrase);
+  stealing that knowledge is keylogging, an existing declared non-goal.
+  The OsKeychain unlock **is** gated (item 9) because it needs no knowledge.
+- `vault_read_file` / `vault_export_file` on **DIRECT** containers: declared
+  ungated (author decision) — the same content is already reachable by any
+  same-user process through MCP pairing at `/.well-known/mcp-pairing`
+  (threat-model §3.B), so gating the desktop command adds nothing; revisit
+  if §3.B changes. The gate applies to ANONYMIZED (item 2).
+- `vault_list_files`: exposes blob sizes and timestamps; metadata class,
+  same standing as on-disk stat for a same-user process. Revisit if size
+  ever becomes content-relevant.
+- `mcp_status`: the pairing secret it returns is already published to every
+  local process by `/.well-known/mcp-pairing` (threat model §3.B); gating
+  the command without closing the endpoint would be theater.
+
 ## 8. Audit
 
 New event fields on approval records:
@@ -414,6 +559,39 @@ prompt; that is covered by the UI-automation cases in §9.3.
   `submit_secret` / `submit_secret_direct` are denied when presence fails,
   and the `op_digest` binds the expected `revision`/`expected_generation`.
 - Tray "Approve" opens the modal and never approves by itself.
+- Desktop command gates (§7.5): a source-scan regression in the style of
+  `every_mutating_desktop_command_enforces_mode` (lib.rs:5115) compares the
+  **complete** Tauri command registry (`invoke_handler`) against a
+  mandatory per-command classification — own gate | derived authorization |
+  justified exception — and a new command **without a classification**
+  fails the test. Beyond the textual scan, every gated path has an
+  executable test.
+- Per gated command, with the fake verifier reporting Protected and no
+  verification performed: `vault_read_file` / `vault_export_file` on
+  ANONYMIZED return nothing and write nothing; `remediate_restore` writes no
+  plaintext; `remediate_execute` ingests nothing and leaves the project file
+  unchanged (a digest match alone is not enough); `wake_respond` records no
+  authorization; `agent_create` returns no token **and creates no agent**;
+  `vault_rotate_key` returns no recovery phrase **and leaves the DEK
+  unchanged**; `scan_reveal` reveals no preview; `vault_unlock` with
+  OsKeychain custody does not unlock; `vault_init` **creates no vault** and
+  returns no recovery phrase. Each denial is audited with
+  `protected: true`. For the mutating commands the assertions check
+  observable state — no agent created, DEK unchanged, no vault created,
+  project not rewritten — not merely the absence of a token or phrase in
+  the response.
+- `wake_prepare_access` (derived authorization, §7.5 item 5): the backend
+  validation of the current wake authorization refuses a direct call with
+  no approval, an expired authorization, and a session or scope switch.
+- Per-gate caveats, for **every** gated command: a verification success
+  arriving after the deadline or after a vault lock produces no effect (no
+  release, no mutation); a parameter change during the prompt (a different
+  `op_digest`) denies the attempt; unavailability between classification
+  and execution denies it.
+- Declared-system behavior: with the fake verifier reporting `Unavailable`,
+  ANONYMIZED `vault_read_file` / `vault_export_file` require the consent
+  click (the PR #120 gate — never ungated) and the approval is audited
+  `protected: false`.
 - macOS adapter (unit-level with a fake robius boundary): a start-level `Ok`
   is not success; missing callback → denial; late callback → discarded.
 - Windows adapter: each `UserConsentVerificationResult` maps per §9.1; only
@@ -437,7 +615,9 @@ prompt; that is covered by the UI-automation cases in §9.3.
 
 - **MVP (§§4–9):** macOS via robius-authentication; Windows via
   `sv-presence-windows`; Linux declared-unprotected; tray revision; OTP
-  reveal-after-verify; audit fields; tests with an injected fake.
+  reveal-after-verify; audit fields; desktop command gates (§7.5) —
+  presence replacing the PR #120 ANONYMIZED consent click; tests with an
+  injected fake.
 - **Out of scope (declared):** biometric vault unlock (subproject A — reuses
   this trait afterwards); cryptographic proof of presence via hardware key;
   OS-suspend-triggered locking; any presence mechanism on Linux.
@@ -463,6 +643,8 @@ prompt; that is covered by the UI-automation cases in §9.3.
 **Docs to update with the implementation:**
 
 - `docs/adr/0025-presence-verified-approvals.md`: the decision; the
+  desktop command gate list and the declared no-gate exceptions with
+  reasons (§7.5); the
   `unsafe` exception for `sv-presence-windows`; the ADR-0022 revision; the
   rejected alternatives with reasons — robius as the Windows backend
   (desktop-window HWND owner, title-based focus tricks, synthetic Alt,
@@ -496,3 +678,15 @@ without an explicit author decision.
 - **Linux declaration:** any thesis text implying desktop approval
   presence across platforms must, if it changes at all, carry the declared
   Linux limitation.
+- **The ANONYMIZED desktop gap (fact for the author):** in the evaluated
+  artifact the *desktop* returned and exported ANONYMIZED container content
+  in cleartext without consent (`lib.rs:2139` treats it ungated; no
+  `sv-privacy` in the desktop), while the *gateway under evaluation* masked
+  the same reads correctly (`sv-mcp/src/lib.rs:1431-1460`). This is an
+  artifact gap in the desktop layer, not a defect of the measured MCP
+  behavior: **PR #120** closed the gap with a consent click
+  (`desktop_consent_required_for`), and this ADR's increment is presence in
+  place of that click wherever the platform can attest it (§7.5) — which
+  changes what the desktop does, and if any thesis passage describes
+  desktop/ANONYMIZED behavior it should be re-read by the author. Nothing
+  in `docs/thesis/` is altered here.
