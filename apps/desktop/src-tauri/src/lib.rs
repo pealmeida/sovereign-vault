@@ -900,29 +900,6 @@ impl<R: Runtime> ApprovalState<R> {
         }
     }
 
-    /// Prompt for explicit human confirmation, always as a click.
-    ///
-    /// Used by the desktop UI path. Unlike [`Self::request`], this never
-    /// consults `approval_requirement` and so never routes to `handle_otp`:
-    /// the caller has already decided that consent is required, and a
-    /// cross-channel OTP is meaningless when the human at the desktop is the
-    /// one asking (see `require_desktop_consent`).
-    ///
-    /// Shares the pending map, the supersede logic, and the timeout with the
-    /// agent path, so a desktop prompt behaves like any other and is answerable
-    /// from the same surfaces.
-    async fn request_click_only(&self, request: sv_mcp::AccessRequest) -> Result<(), String> {
-        // `Tray::No`: this prompt was raised BY the user, in the app, for an
-        // action they just triggered. They are already looking at the modal, so
-        // a tray row would be a duplicate control for a decision in front of
-        // them. It also matters for OTP containers: ADR-0023 routes a desktop
-        // OTP caller through this click path, and the tray renders while the
-        // vault is locked, so mirroring it would put an OTP-container
-        // confirmation on a surface the OTP escalation exists to avoid.
-        self.request_click(ClickRequest::from_access(&request), TrayMirror::No)
-            .await
-    }
-
     async fn request(&self, request: sv_mcp::AccessRequest) -> Result<(), String> {
         match approval_requirement(&request)? {
             ApprovalPromptKind::NotRequired => return Ok(()),
@@ -1859,6 +1836,8 @@ struct SessionMonitorState<R: Runtime = tauri::Wry> {
     servers: Arc<Mutex<Option<ServersShutdown>>>,
     timer: SessionTimer,
     approvals: Arc<ApprovalState<R>>,
+    presence: Arc<sv_presence::PresenceCoordinator>,
+    desktop_ops: Arc<presence::DesktopOps>,
 }
 
 /// Self-contained desktop session timer. Kept separate from [`VaultState`] so
@@ -1974,10 +1953,12 @@ struct VaultState<R: Runtime = tauri::Wry> {
     handle: SharedHandle,
     approvals: Arc<ApprovalState<R>>,
     /// ADR-0025 presence coordinator: one native prompt at a time behind a
-    /// bounded queue. The same Arc reaches approvals (gates of §6–7); this
-    /// reference is read by the desktop command gates (Tasks 11-13).
-    #[allow(dead_code)] // consumed by the command gates added in Tasks 11-13
+    /// bounded queue. Also referenced by approvals (modal/OTP gates); this
+    /// handle is the desktop command gate's (Tasks 11-13).
     presence: Arc<sv_presence::PresenceCoordinator>,
+    /// Registry of pending desktop-gated operations (plan D2): exclusive per
+    /// operation, identity/deadline/classification survive retries.
+    desktop_ops: Arc<presence::DesktopOps>,
     servers: Arc<Mutex<Option<ServersShutdown>>>,
     /// Scan reports that were produced in this process and still have a live
     /// per-scan salt. Findings loaded from disk do not appear here, so their
@@ -2021,6 +2002,7 @@ impl<R: Runtime> VaultState<R> {
             handle: Arc::new(Mutex::new(None)),
             approvals,
             presence,
+            desktop_ops: Arc::new(presence::DesktopOps::default()),
             servers: Arc::new(Mutex::new(None)),
             active_scans: Mutex::new(HashMap::new()),
             session_timer: SessionTimer::new(),
@@ -2053,6 +2035,8 @@ impl<R: Runtime> VaultState<R> {
             servers: self.servers.clone(),
             timer: self.session_timer.clone(),
             approvals: self.approvals.clone(),
+            presence: self.presence.clone(),
+            desktop_ops: self.desktop_ops.clone(),
         }
     }
 
@@ -2920,44 +2904,180 @@ fn desktop_consent_required_for(
     desktop_consent_required(mode)
 }
 
+/// ADR-0025 §7.5: one pending desktop operation. Protected systems go
+/// straight to the OS prompt (plan D3); declared systems take the consent
+/// modal. Classification is fixed when the operation is created (D2), and
+/// the registry makes each operation exclusive (one verification at a time).
+async fn desktop_presence_gate<R: Runtime>(
+    state: &VaultState<R>,
+    click: ClickRequest,
+) -> Result<presence::GatePass, presence::GateDenied> {
+    let epoch = state.session_timer.epoch();
+    let digest = click.op.digest();
+    let attempt = state.presence.begin_attempt();
+    let op = state
+        .desktop_ops
+        .begin(
+            digest,
+            Instant::now() + Duration::from_secs(APPROVAL_TIMEOUT_SECS),
+            || state.presence.classify().is_protected(),
+            attempt.id(),
+        )
+        .await
+        .map_err(|error| presence::GateDenied {
+            protected: true,
+            message: error.to_string(),
+            operation_id: "op-busy".into(),
+        })?;
+    let operation_id = format!("op-{}", op.id);
+    let denied = |protected: bool, message: String| presence::GateDenied {
+        protected,
+        message,
+        operation_id: operation_id.clone(),
+    };
+
+    if !op.protected {
+        let outcome = state.approvals.request_click(click, TrayMirror::No).await;
+        state.desktop_ops.finish(digest, op.id).await;
+        outcome.map_err(|message| denied(false, message))?;
+        if state.session_timer.epoch() != epoch {
+            return Err(denied(
+                false,
+                "vault state changed during confirmation".into(),
+            ));
+        }
+        return Ok(presence::GatePass {
+            presence: sv_audit::PresenceAudit::click().with_operation(operation_id.clone()),
+            digest,
+            epoch,
+            operation_id,
+        });
+    }
+
+    match state
+        .presence
+        .verify(&attempt, &click.op, op.deadline)
+        .await
+    {
+        Ok(verified) => {
+            state.desktop_ops.finish(digest, op.id).await;
+            if verified.digest != digest
+                || Instant::now() > op.deadline
+                || state.session_timer.epoch() != epoch
+            {
+                return Err(denied(
+                    true,
+                    "verification no longer applies to this operation".into(),
+                ));
+            }
+            Ok(presence::GatePass {
+                presence: sv_audit::PresenceAudit::authenticated(presence::audit_modality(
+                    verified.outcome.modality,
+                ))
+                .with_operation(operation_id.clone()),
+                digest,
+                epoch,
+                operation_id,
+            })
+        }
+        // Retryable: the operation stays registered (back to Pending), so a
+        // retry keeps its identity, deadline and classification (D2).
+        Err(denial @ sv_presence::Denial::Retryable(_)) => {
+            state.desktop_ops.retry(digest, op.id, attempt.id()).await;
+            Err(denied(true, denial.message()))
+        }
+        Err(denial) => {
+            state.desktop_ops.finish(digest, op.id).await;
+            Err(denied(true, denial.message()))
+        }
+    }
+}
+
+/// D14: consume a `GatePass` under the handle lock. The epoch is re-checked
+/// while the lock is held, so a lock (or lock + re-unlock) since the gate
+/// denies; the Allowed event returned by `f` is recorded with the pass's
+/// presence BEFORE the lock is released.
+async fn with_gated_handle<R, T, F>(
+    state: &VaultState<R>,
+    pass: &presence::GatePass,
+    f: F,
+) -> Result<T, String>
+where
+    R: Runtime,
+    F: FnOnce(&VaultHandle) -> Result<(T, AuditEvent), String>,
+{
+    let guard = state.handle.lock().await;
+    let handle = guard
+        .as_ref()
+        .ok_or_else(|| "vault is locked".to_string())?;
+    if state.session_timer.epoch() != pass.epoch {
+        return Err("vault state changed after verification; try again".into());
+    }
+    let (value, mut event) = f(handle)?;
+    event.presence = Some(pass.presence.clone());
+    record_with_handle(state, handle, event);
+    Ok(value)
+}
+
+/// The mutating form of [`with_gated_handle`].
+#[allow(dead_code)] // consumed by vault_rotate_key and init, Tasks 12-13
+async fn with_gated_handle_mut<R, T, F>(
+    state: &VaultState<R>,
+    pass: &presence::GatePass,
+    f: F,
+) -> Result<T, String>
+where
+    R: Runtime,
+    F: FnOnce(&mut VaultHandle) -> Result<(T, AuditEvent), String>,
+{
+    let mut guard = state.handle.lock().await;
+    let handle = guard
+        .as_mut()
+        .ok_or_else(|| "vault is locked".to_string())?;
+    if state.session_timer.epoch() != pass.epoch {
+        return Err("vault state changed after verification; try again".into());
+    }
+    let (value, mut event) = f(handle)?;
+    event.presence = Some(pass.presence.clone());
+    record_with_handle(state, handle, event);
+    Ok(value)
+}
+
 async fn require_desktop_consent<R: Runtime>(
     state: &VaultState<R>,
     action: sv_mcp::AccessAction,
     container: &str,
     file_name: Option<&str>,
     mode: Option<SecurityMode>,
-) -> Result<(), String> {
-    if !desktop_consent_required_for(action, mode)? {
-        return Ok(());
+    operation: &str,
+    destination: Option<&str>,
+) -> Result<Option<presence::GatePass>, presence::GateDenied> {
+    let required =
+        desktop_consent_required_for(action, mode).map_err(|message| presence::GateDenied {
+            protected: false,
+            message,
+            operation_id: "op-none".into(),
+        })?;
+    if !required {
+        return Ok(None);
     }
-
-    let request = sv_mcp::AccessRequest {
-        // The transport enum models agent channels only. `McpWs` is the
-        // closest existing value; the AUDIT transport is set separately by
-        // `desktop_event` and correctly reads `desktop-ui`, which is what a
-        // reviewer sees.
-        transport: sv_mcp::AccessTransport::McpWs,
-        action,
-        container: Some(container.to_string()),
-        file_name: file_name.map(str::to_string),
-        mode,
-        byte_size: None,
-        agent_id: None,
-        otp: None,
-        // Binds the prompt to this exact desktop operation.
-        authorization_context: format!(
-            "desktop-ui|{action:?}|{container}|{}",
-            file_name.unwrap_or("")
-        ),
-        import_summary: None,
-    };
-    state.approvals.request_click_only(request).await
+    let op = sv_presence::OpDescriptor::new("desktop_file")
+        .field("operation", operation)
+        .field("container", container)
+        .field("file", file_name.unwrap_or(""))
+        .bind("action", format!("{action:?}"))
+        .bind("mode", mode.map(|m| m.as_str()).unwrap_or(""))
+        .bind("destination", destination.unwrap_or(""));
+    let mut click = ClickRequest::desktop(&format!("{action:?}"), audit_action_for(&action), op);
+    click.container = Some(container.to_string());
+    click.file_name = file_name.map(str::to_string);
+    click.mode = mode;
+    desktop_presence_gate(state, click).await.map(Some)
 }
 
 /// Container mode of `container` for a generic state. Used by the gated
-/// desktop commands (Tasks 11+), which hold a `&VaultState<R>`, not a
+/// desktop commands, which hold a `&VaultState<R>`, not a
 /// `State<'_, VaultState>`.
-#[allow(dead_code)] // consumed by the gated commands added in Tasks 11+
 async fn container_mode_in<R: Runtime>(
     state: &VaultState<R>,
     container: &str,
@@ -3253,6 +3373,9 @@ async fn perform_vault_lock<R: Runtime>(state: &VaultState<R>, reason: &str) {
     state.publish_locked(&mut guard);
     // A lock ends every pending decision (spec §6.1).
     state.approvals.clear_all().await;
+    // D2: a lock ends every registered desktop operation and invalidates
+    // any attempt in flight.
+    state.desktop_ops.clear(&state.presence).await;
     // Pending plans do not survive a lock. A plan is a snapshot-bound
     // authorization to delete a specific file; carrying one across a lock
     // would let a decision taken in one session be executed in the next,
@@ -3338,6 +3461,8 @@ async fn perform_vault_lock_internal<R: Runtime>(state: &SessionMonitorState<R>,
     state.timer.set_locked();
     // A lock ends every pending decision (spec §6.1).
     state.approvals.clear_all().await;
+    // D2: registered desktop operations die with the session too.
+    state.desktop_ops.clear(&state.presence).await;
     {
         let mut server_guard = state.servers.lock().await;
         if let Some(mut servers) = server_guard.take() {
@@ -3558,59 +3683,102 @@ async fn vault_delete_container(state: State<'_, VaultState>, name: String) -> R
         }
         other => other,
     };
-    if let Err(denied) = require_desktop_consent(
+    let pass = match require_desktop_consent(
         &state,
         sv_mcp::AccessAction::DestroyContainer,
         &name,
         None,
         delete_mode,
+        "delete_container",
+        None,
     )
     .await
     {
-        record_desktop_event(
-            &state,
-            desktop_event(
+        Ok(pass) => pass,
+        Err(denied) => {
+            let mut event = desktop_event(
                 AuditAction::DeleteContainer,
                 AuditDecision::Denied,
                 Some(name.clone()),
                 None,
                 mode,
                 None,
-                Some(denied.clone()),
-            ),
-        );
-        return Err(denied);
-    }
-    let result = with_handle(&state, |handle| {
-        handle.delete_container(&name).map_err(estr)
-    })
-    .await;
-    match &result {
-        Ok(_) => record_desktop_event(
-            &state,
-            desktop_event(
-                AuditAction::DeleteContainer,
-                AuditDecision::Allowed,
-                Some(name.clone()),
-                None,
-                mode,
-                None,
-                None,
-            ),
-        ),
-        Err(error) => record_desktop_event(
-            &state,
-            desktop_event(
-                AuditAction::DeleteContainer,
-                AuditDecision::Error,
-                Some(name),
-                None,
-                mode,
-                None,
-                Some(error.clone()),
-            ),
-        ),
-    }
+                Some(denied.message.clone()),
+            );
+            event.presence = Some(denied.audit());
+            record_desktop_event_locked(&state, event).await;
+            return Err(denied.message);
+        }
+    };
+    let result = match pass {
+        Some(pass) => {
+            let outcome = with_gated_handle(state.inner(), &pass, |handle| {
+                handle.delete_container(&name).map_err(estr)?;
+                Ok((
+                    (),
+                    desktop_event(
+                        AuditAction::DeleteContainer,
+                        AuditDecision::Allowed,
+                        Some(name.clone()),
+                        None,
+                        mode,
+                        None,
+                        None,
+                    ),
+                ))
+            })
+            .await;
+            if let Err(error) = &outcome {
+                record_desktop_event_locked(
+                    state.inner(),
+                    desktop_event(
+                        AuditAction::DeleteContainer,
+                        AuditDecision::Error,
+                        Some(name.clone()),
+                        None,
+                        mode,
+                        None,
+                        Some(error.clone()),
+                    ),
+                )
+                .await;
+            }
+            outcome
+        }
+        None => {
+            let result = with_handle(&state, |handle| {
+                handle.delete_container(&name).map_err(estr)
+            })
+            .await;
+            match &result {
+                Ok(_) => record_desktop_event(
+                    &state,
+                    desktop_event(
+                        AuditAction::DeleteContainer,
+                        AuditDecision::Allowed,
+                        Some(name.clone()),
+                        None,
+                        mode,
+                        None,
+                        None,
+                    ),
+                ),
+                Err(error) => record_desktop_event(
+                    &state,
+                    desktop_event(
+                        AuditAction::DeleteContainer,
+                        AuditDecision::Error,
+                        Some(name.clone()),
+                        None,
+                        mode,
+                        None,
+                        Some(error.clone()),
+                    ),
+                ),
+            }
+            result
+        }
+    };
     result
 }
 
@@ -4738,61 +4906,106 @@ async fn vault_write_file(
     }
     let mode = container_mode(&state, &container).await;
     let byte_size = content.len();
-    if let Err(denied) = require_desktop_consent(
+    let pass = match require_desktop_consent(
         &state,
         sv_mcp::AccessAction::WriteFile,
         &container,
         Some(&file_name),
         mode,
+        "write",
+        None,
     )
     .await
     {
-        record_desktop_event(
-            &state,
-            desktop_event(
+        Ok(pass) => pass,
+        Err(denied) => {
+            let mut event = desktop_event(
                 AuditAction::WriteFile,
                 AuditDecision::Denied,
                 Some(container.clone()),
                 Some(file_name.clone()),
                 mode,
                 Some(byte_size),
-                Some(denied.clone()),
-            ),
-        );
-        return Err(denied);
-    }
-    let result = with_handle(&state, |handle| {
-        handle
-            .write_file(&container, &file_name, &content)
-            .map_err(estr)
-    })
-    .await;
-    match &result {
-        Ok(_) => record_desktop_event(
-            &state,
-            desktop_event(
-                AuditAction::WriteFile,
-                AuditDecision::Allowed,
-                Some(container.clone()),
-                Some(file_name.clone()),
-                mode,
-                Some(byte_size),
-                None,
-            ),
-        ),
-        Err(error) => record_desktop_event(
-            &state,
-            desktop_event(
-                AuditAction::WriteFile,
-                AuditDecision::Error,
-                Some(container),
-                Some(file_name),
-                mode,
-                Some(byte_size),
-                Some(error.clone()),
-            ),
-        ),
-    }
+                Some(denied.message.clone()),
+            );
+            event.presence = Some(denied.audit());
+            record_desktop_event_locked(&state, event).await;
+            return Err(denied.message);
+        }
+    };
+    let result = match pass {
+        Some(pass) => {
+            let outcome = with_gated_handle(state.inner(), &pass, |handle| {
+                handle
+                    .write_file(&container, &file_name, &content)
+                    .map_err(estr)?;
+                Ok((
+                    (),
+                    desktop_event(
+                        AuditAction::WriteFile,
+                        AuditDecision::Allowed,
+                        Some(container.clone()),
+                        Some(file_name.clone()),
+                        mode,
+                        Some(byte_size),
+                        None,
+                    ),
+                ))
+            })
+            .await;
+            if let Err(error) = &outcome {
+                record_desktop_event_locked(
+                    state.inner(),
+                    desktop_event(
+                        AuditAction::WriteFile,
+                        AuditDecision::Error,
+                        Some(container.clone()),
+                        Some(file_name.clone()),
+                        mode,
+                        Some(byte_size),
+                        Some(error.clone()),
+                    ),
+                )
+                .await;
+            }
+            outcome
+        }
+        None => {
+            let result = with_handle(&state, |handle| {
+                handle
+                    .write_file(&container, &file_name, &content)
+                    .map_err(estr)
+            })
+            .await;
+            match &result {
+                Ok(_) => record_desktop_event(
+                    &state,
+                    desktop_event(
+                        AuditAction::WriteFile,
+                        AuditDecision::Allowed,
+                        Some(container.clone()),
+                        Some(file_name.clone()),
+                        mode,
+                        Some(byte_size),
+                        None,
+                    ),
+                ),
+                Err(error) => record_desktop_event(
+                    &state,
+                    desktop_event(
+                        AuditAction::WriteFile,
+                        AuditDecision::Error,
+                        Some(container.clone()),
+                        Some(file_name.clone()),
+                        mode,
+                        Some(byte_size),
+                        Some(error.clone()),
+                    ),
+                ),
+            }
+            result
+        }
+    };
     result
 }
 
@@ -4804,11 +5017,25 @@ async fn vault_read_file(
     lease_id: Option<String>,
     agent_id: Option<String>,
 ) -> Result<Vec<u8>, String> {
+    vault_read_file_impl(state.inner(), container, file_name, lease_id, agent_id).await
+}
+
+/// The read itself, generic over the runtime so the harness can drive it.
+/// On a protected system the presence gate replaces the consent modal
+/// (D2/D3); the release only runs through `with_gated_handle` (D14), and a
+/// declaration-mode read keeps today's ungated path.
+async fn vault_read_file_impl<R: Runtime>(
+    state: &VaultState<R>,
+    container: String,
+    file_name: String,
+    lease_id: Option<String>,
+    agent_id: Option<String>,
+) -> Result<Vec<u8>, String> {
     state.touch_human_activity();
     let resource_ref = format!("container:{container}:file:{file_name}");
     let args = vec![container.clone(), file_name.clone()];
     if !require_lease(
-        &state,
+        state,
         lease_id.as_deref().unwrap_or(""),
         agent_id.as_deref().unwrap_or(""),
         &resource_ref,
@@ -4821,61 +5048,97 @@ async fn vault_read_file(
     {
         return Err("invalid or expired wake lease".into());
     }
-    let mode = container_mode(&state, &container).await;
+    let mode = container_mode_in(state, &container).await;
     // Enforce the container's mode, do not merely label the audit with it.
-    if let Err(denied) = require_desktop_consent(
-        &state,
+    let pass = match require_desktop_consent(
+        state,
         sv_mcp::AccessAction::ReadFile,
         &container,
         Some(&file_name),
         mode,
+        "read",
+        None,
     )
     .await
     {
-        record_desktop_event(
-            &state,
-            desktop_event(
+        Ok(pass) => pass,
+        Err(denied) => {
+            let mut event = desktop_event(
                 AuditAction::ReadFile,
                 AuditDecision::Denied,
                 Some(container.clone()),
                 Some(file_name.clone()),
                 mode,
                 None,
-                Some(denied.clone()),
-            ),
-        );
-        return Err(denied);
-    }
-    let result = with_handle(&state, |handle| {
-        handle.read_file(&container, &file_name).map_err(estr)
-    })
-    .await;
-    match &result {
-        Ok(bytes) => record_desktop_event(
-            &state,
-            desktop_event(
-                AuditAction::ReadFile,
-                AuditDecision::Allowed,
-                Some(container.clone()),
-                Some(file_name.clone()),
-                mode,
-                Some(bytes.len()),
-                None,
-            ),
-        ),
-        Err(error) => record_desktop_event(
-            &state,
-            desktop_event(
-                AuditAction::ReadFile,
-                AuditDecision::Error,
-                Some(container),
-                Some(file_name),
-                mode,
-                None,
-                Some(error.clone()),
-            ),
-        ),
-    }
+                Some(denied.message.clone()),
+            );
+            event.presence = Some(denied.audit());
+            record_desktop_event_locked(state, event).await;
+            return Err(denied.message);
+        }
+    };
+    let result = match pass {
+        Some(pass) => {
+            let outcome = with_gated_handle(state, &pass, |handle| {
+                let bytes = handle.read_file(&container, &file_name).map_err(estr)?;
+                let mut event =
+                    AuditEvent::new(AuditAction::ReadFile, AuditDecision::Allowed, "desktop-ui");
+                event.container = Some(container.clone());
+                event.file_name = Some(file_name.clone());
+                event.mode = mode.map(|m| m.as_str().to_string());
+                // Keep the byte-size audit signal the ungated path records.
+                event.byte_size = Some(bytes.len());
+                Ok((bytes, event))
+            })
+            .await;
+            if let Err(error) = &outcome {
+                let event = desktop_event(
+                    AuditAction::ReadFile,
+                    AuditDecision::Error,
+                    Some(container.clone()),
+                    Some(file_name.clone()),
+                    mode,
+                    None,
+                    Some(error.clone()),
+                );
+                record_desktop_event_locked(state, event).await;
+            }
+            outcome
+        }
+        None => {
+            let result = with_handle_in(state, |handle| {
+                handle.read_file(&container, &file_name).map_err(estr)
+            })
+            .await;
+            match &result {
+                Ok(bytes) => record_desktop_event(
+                    state,
+                    desktop_event(
+                        AuditAction::ReadFile,
+                        AuditDecision::Allowed,
+                        Some(container.clone()),
+                        Some(file_name.clone()),
+                        mode,
+                        Some(bytes.len()),
+                        None,
+                    ),
+                ),
+                Err(error) => record_desktop_event(
+                    state,
+                    desktop_event(
+                        AuditAction::ReadFile,
+                        AuditDecision::Error,
+                        Some(container.clone()),
+                        Some(file_name.clone()),
+                        mode,
+                        None,
+                        Some(error.clone()),
+                    ),
+                ),
+            }
+            result
+        }
+    };
     result
 }
 
@@ -4922,6 +5185,13 @@ async fn open_audit_folder(app: AppHandle) -> Result<(), String> {
 ///
 /// Returns the destination as a display string for the confirmation toast, or
 /// `None` when the user cancels the dialog.
+/// Ask for the destination BEFORE the gate and before decrypting (D10). A
+/// cancelled dialog then means no plaintext was ever produced, rather than a
+/// decrypted buffer held in memory for a save that never happens. The chosen
+/// destination is bound into the gate's digest, so an approval cannot be
+/// reused to write somewhere else; it is still never audited (see the
+/// command's doc above). Returns the destination for the confirmation toast,
+/// or `None` when the user cancels the dialog.
 #[tauri::command]
 async fn vault_export_file(
     app: AppHandle,
@@ -4932,34 +5202,6 @@ async fn vault_export_file(
     use tauri_plugin_dialog::DialogExt;
 
     state.touch_human_activity();
-    let mode = container_mode(&state, &container).await;
-    // Same gate as a read: this produces the same plaintext.
-    if let Err(denied) = require_desktop_consent(
-        &state,
-        sv_mcp::AccessAction::ReadFile,
-        &container,
-        Some(&file_name),
-        mode,
-    )
-    .await
-    {
-        let mut event = desktop_event(
-            AuditAction::ReadFile,
-            AuditDecision::Denied,
-            Some(container.clone()),
-            Some(file_name.clone()),
-            mode,
-            None,
-            Some(denied.clone()),
-        );
-        event.detail = Some("export to disk".into());
-        record_desktop_event(&state, event);
-        return Err(denied);
-    }
-
-    // Ask for the destination BEFORE decrypting. A cancelled dialog then means
-    // no plaintext was ever produced, rather than a decrypted buffer held in
-    // memory for a save that never happens.
     let suggested = std::path::Path::new(&file_name);
     let mut builder = app.dialog().file().set_title("Export file");
     if let Some(name) = suggested.file_name().and_then(|n| n.to_str()) {
@@ -4976,8 +5218,98 @@ async fn vault_export_file(
     let dest_path = dest
         .into_path()
         .map_err(|e| format!("unusable destination path: {e}"))?;
+    vault_export_file_impl(state.inner(), container, file_name, dest_path)
+        .await
+        .map(Some)
+}
 
-    let bytes = match with_handle(&state, |handle| {
+/// Decrypt one file and write it to an already-chosen destination, gated by
+/// ADR-0025 §7.5 (mode ANONYMIZED/APPROVAL/OTP) or ungated as today for a
+/// `DIRECT` container. Generic over the runtime so the harness can drive it.
+async fn vault_export_file_impl<R: Runtime>(
+    state: &VaultState<R>,
+    container: String,
+    file_name: String,
+    dest_path: PathBuf,
+) -> Result<String, String> {
+    let mode = container_mode_in(state, &container).await;
+    let destination = dest_path.display().to_string();
+    // Same gate as a read: this produces the same plaintext.
+    let pass = match require_desktop_consent(
+        state,
+        sv_mcp::AccessAction::ReadFile,
+        &container,
+        Some(&file_name),
+        mode,
+        "export",
+        Some(&destination),
+    )
+    .await
+    {
+        Ok(pass) => pass,
+        Err(denied) => {
+            let mut event = desktop_event(
+                AuditAction::ReadFile,
+                AuditDecision::Denied,
+                Some(container.clone()),
+                Some(file_name.clone()),
+                mode,
+                None,
+                Some(denied.message.clone()),
+            );
+            event.detail = Some("export to disk".into());
+            event.presence = Some(denied.audit());
+            record_desktop_event_locked(state, event).await;
+            return Err(denied.message);
+        }
+    };
+    if let Some(pass) = pass {
+        // Decrypt AND write inside `with_gated_handle`: a lock since the
+        // gate aborts before any byte is written (D14).
+        let outcome = with_gated_handle(state, &pass, |handle| {
+            let bytes = handle.read_file(&container, &file_name).map_err(estr)?;
+            let byte_size = bytes.len();
+            let result = write_export_bytes(&dest_path, &bytes);
+            let mut event = desktop_event(
+                AuditAction::ReadFile,
+                if result.is_ok() {
+                    AuditDecision::Allowed
+                } else {
+                    AuditDecision::Error
+                },
+                Some(container.clone()),
+                Some(file_name.clone()),
+                mode,
+                Some(byte_size),
+                result.as_ref().err().cloned(),
+            );
+            // Marks this read as one that left a decrypted copy outside the
+            // vault. The destination is deliberately absent from the audit.
+            event.detail = Some("export to disk".into());
+            Ok((result, event))
+        })
+        .await;
+        return match outcome {
+            Ok(Ok(())) => Ok(destination),
+            Ok(Err(error)) => Err(error),
+            Err(error) => {
+                let mut event = desktop_event(
+                    AuditAction::ReadFile,
+                    AuditDecision::Error,
+                    Some(container),
+                    Some(file_name),
+                    mode,
+                    None,
+                    Some(error.clone()),
+                );
+                event.detail = Some("export to disk".into());
+                record_desktop_event_locked(state, event).await;
+                Err(error)
+            }
+        };
+    }
+    // Ungated path (`DIRECT`): today's decrypt-then-write order and events.
+    let bytes = match with_handle_in(state, |handle| {
         handle.read_file(&container, &file_name).map_err(estr)
     })
     .await
@@ -4994,22 +5326,12 @@ async fn vault_export_file(
                 Some(error.clone()),
             );
             event.detail = Some("export to disk".into());
-            record_desktop_event(&state, event);
+            record_desktop_event(state, event);
             return Err(error);
         }
     };
-
     let byte_size = bytes.len();
-    // Write through a temporary file in the destination directory and rename,
-    // so an interrupted export cannot leave a half-written file that looks
-    // complete. `atomicwrites` is already used elsewhere in this crate.
-    let write_result = {
-        use atomicwrites::{AtomicFile, OverwriteBehavior};
-        use std::io::Write;
-        let file = AtomicFile::new(&dest_path, OverwriteBehavior::AllowOverwrite);
-        file.write(|f| f.write_all(&bytes)).map_err(estr)
-    };
-
+    let write_result = write_export_bytes(&dest_path, &bytes);
     match write_result {
         Ok(()) => {
             let mut event = desktop_event(
@@ -5024,8 +5346,8 @@ async fn vault_export_file(
             // Marks this read as one that left a decrypted copy outside the
             // vault. The destination is deliberately absent; see the doc above.
             event.detail = Some("export to disk".into());
-            record_desktop_event(&state, event);
-            Ok(Some(dest_path.display().to_string()))
+            record_desktop_event(state, event);
+            Ok(destination)
         }
         Err(error) => {
             let mut event = desktop_event(
@@ -5038,10 +5360,21 @@ async fn vault_export_file(
                 Some(error.clone()),
             );
             event.detail = Some("export to disk".into());
-            record_desktop_event(&state, event);
+            record_desktop_event(state, event);
             Err(error)
         }
     }
+}
+
+/// Write exported plaintext through a temporary file in the destination
+/// directory and rename, so an interrupted export cannot leave a
+/// half-written file that looks complete. `atomicwrites` is already used
+/// elsewhere in this crate.
+fn write_export_bytes(dest_path: &PathBuf, bytes: &[u8]) -> Result<(), String> {
+    use atomicwrites::{AtomicFile, OverwriteBehavior};
+    use std::io::Write;
+    let file = AtomicFile::new(dest_path, OverwriteBehavior::AllowOverwrite);
+    file.write(|f| f.write_all(bytes)).map_err(estr)
 }
 
 #[tauri::command]
@@ -5081,59 +5414,102 @@ async fn vault_delete_file(
         }
         other => other,
     };
-    if let Err(denied) = require_desktop_consent(
+    let pass = match require_desktop_consent(
         &state,
         sv_mcp::AccessAction::DeleteFile,
         &container,
         Some(&file_name),
         delete_mode,
+        "delete",
+        None,
     )
     .await
     {
-        record_desktop_event(
-            &state,
-            desktop_event(
+        Ok(pass) => pass,
+        Err(denied) => {
+            let mut event = desktop_event(
                 AuditAction::DeleteFile,
                 AuditDecision::Denied,
                 Some(container.clone()),
                 Some(file_name.clone()),
                 mode,
                 None,
-                Some(denied.clone()),
-            ),
-        );
-        return Err(denied);
-    }
-    let result = with_handle(&state, |handle| {
-        handle.delete_file(&container, &file_name).map_err(estr)
-    })
-    .await;
-    match &result {
-        Ok(_) => record_desktop_event(
-            &state,
-            desktop_event(
-                AuditAction::DeleteFile,
-                AuditDecision::Allowed,
-                Some(container.clone()),
-                Some(file_name.clone()),
-                mode,
-                None,
-                None,
-            ),
-        ),
-        Err(error) => record_desktop_event(
-            &state,
-            desktop_event(
-                AuditAction::DeleteFile,
-                AuditDecision::Error,
-                Some(container),
-                Some(file_name),
-                mode,
-                None,
-                Some(error.clone()),
-            ),
-        ),
-    }
+                Some(denied.message.clone()),
+            );
+            event.presence = Some(denied.audit());
+            record_desktop_event_locked(&state, event).await;
+            return Err(denied.message);
+        }
+    };
+    let result = match pass {
+        Some(pass) => {
+            let outcome = with_gated_handle(state.inner(), &pass, |handle| {
+                handle.delete_file(&container, &file_name).map_err(estr)?;
+                Ok((
+                    (),
+                    desktop_event(
+                        AuditAction::DeleteFile,
+                        AuditDecision::Allowed,
+                        Some(container.clone()),
+                        Some(file_name.clone()),
+                        mode,
+                        None,
+                        None,
+                    ),
+                ))
+            })
+            .await;
+            if let Err(error) = &outcome {
+                record_desktop_event_locked(
+                    state.inner(),
+                    desktop_event(
+                        AuditAction::DeleteFile,
+                        AuditDecision::Error,
+                        Some(container.clone()),
+                        Some(file_name.clone()),
+                        mode,
+                        None,
+                        Some(error.clone()),
+                    ),
+                )
+                .await;
+            }
+            outcome
+        }
+        None => {
+            let result = with_handle(&state, |handle| {
+                handle.delete_file(&container, &file_name).map_err(estr)
+            })
+            .await;
+            match &result {
+                Ok(_) => record_desktop_event(
+                    &state,
+                    desktop_event(
+                        AuditAction::DeleteFile,
+                        AuditDecision::Allowed,
+                        Some(container.clone()),
+                        Some(file_name.clone()),
+                        mode,
+                        None,
+                        None,
+                    ),
+                ),
+                Err(error) => record_desktop_event(
+                    &state,
+                    desktop_event(
+                        AuditAction::DeleteFile,
+                        AuditDecision::Error,
+                        Some(container.clone()),
+                        Some(file_name.clone()),
+                        mode,
+                        None,
+                        Some(error.clone()),
+                    ),
+                ),
+            }
+            result
+        }
+    };
     result
 }
 
@@ -5286,8 +5662,8 @@ async fn wake_prepare_access(
 /// Check a lease for an exact operation and consume it. Returns true if a valid
 /// lease was found and consumed. This helper enforces single-use binding to
 /// agent, resource, operation, args, destination, session, and policy version.
-async fn require_lease(
-    state: &VaultState,
+async fn require_lease<R: Runtime>(
+    state: &VaultState<R>,
     lease_id: &str,
     agent_id: &str,
     resource_ref: &str,
@@ -6523,6 +6899,223 @@ mod tests {
             .get(&key)
             .expect("a stale finisher must not erase the newer challenge");
         assert_eq!(chal.modal_id, b_modal);
+    }
+
+    async fn anonymized_fixture(h: &Harness, mode: SecurityMode) {
+        with_handle_in(h.state(), |handle| {
+            handle.create_container("anon", mode, None).map_err(estr)?;
+            handle
+                .write_file("anon", "a.txt", b"alice@example.com")
+                .map_err(estr)
+        })
+        .await
+        .unwrap();
+    }
+
+    /// `(decision, presence)` of ReadFile events, oldest first.
+    fn read_presence(h: &Harness) -> Vec<(String, serde_json::Value)> {
+        h.presence_events()
+            .into_iter()
+            .filter(|(action, _, _)| action.contains("read_file"))
+            .map(|(_, d, p)| (d.trim_matches('"').to_string(), p))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn anonymized_read_releases_nothing_without_presence() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        anonymized_fixture(&h, SecurityMode::Anonymized).await;
+        h.fake.push(FakeStep::Return(Err(
+            sv_presence::PresenceError::DisabledByPolicy,
+        )));
+        let got = vault_read_file_impl(h.state(), "anon".into(), "a.txt".into(), None, None).await;
+        assert!(got.is_err());
+        assert_eq!(h.fake.calls(), 1);
+        let records = read_presence(&h);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, "denied");
+        assert_eq!(records[0].1["protected"], true);
+        assert!(records[0].1["operation_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("op-"));
+    }
+
+    #[tokio::test]
+    async fn anonymized_read_releases_after_presence() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        anonymized_fixture(&h, SecurityMode::Anonymized).await;
+        h.fake.approve_next();
+        let got = vault_read_file_impl(h.state(), "anon".into(), "a.txt".into(), None, None).await;
+        assert_eq!(got.unwrap(), b"alice@example.com");
+        let records = read_presence(&h);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, "allowed");
+        assert_eq!(records[0].1["outcome"], "device_owner_authenticated");
+    }
+
+    /// D2: a retry of the same operation reuses its identity (and classification).
+    #[tokio::test]
+    async fn retry_reuses_the_operation_identity() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        anonymized_fixture(&h, SecurityMode::Anonymized).await;
+        h.fake
+            .push(FakeStep::Return(Err(sv_presence::PresenceError::Cancelled)));
+        h.fake.approve_next();
+        assert!(
+            vault_read_file_impl(h.state(), "anon".into(), "a.txt".into(), None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            vault_read_file_impl(h.state(), "anon".into(), "a.txt".into(), None, None)
+                .await
+                .is_ok()
+        );
+        let records = read_presence(&h);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].1["operation_id"], records[1].1["operation_id"]);
+        assert!(
+            h.state().desktop_ops.is_empty().await,
+            "terminal success ends the operation"
+        );
+    }
+
+    /// D2/B3: two concurrent calls for the same operation start ONE verification.
+    #[tokio::test]
+    async fn concurrent_same_operation_verifies_once() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        anonymized_fixture(&h, SecurityMode::Anonymized).await;
+        h.fake.push(FakeStep::Hold(APPROVED));
+        let state = h.state();
+        let first =
+            async { vault_read_file_impl(state, "anon".into(), "a.txt".into(), None, None).await };
+        let second = async {
+            while h.fake.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let got = vault_read_file_impl(state, "anon".into(), "a.txt".into(), None, None).await;
+            h.fake.release();
+            got
+        };
+        let (a, b) = tokio::join!(first, second);
+        assert!(a.is_ok());
+        assert!(b.unwrap_err().contains("already in progress"));
+        assert_eq!(h.fake.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn anonymized_export_writes_nothing_without_presence() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        anonymized_fixture(&h, SecurityMode::Anonymized).await;
+        let dest = h.root.parent().unwrap().join("out.txt");
+        h.fake
+            .push(FakeStep::Return(Err(sv_presence::PresenceError::Failed)));
+        let got =
+            vault_export_file_impl(h.state(), "anon".into(), "a.txt".into(), dest.clone()).await;
+        assert!(got.is_err());
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn declared_system_anonymized_read_takes_the_click_never_ungated() {
+        let h = Harness::unlocked(FakeVerifier::unavailable()).await;
+        anonymized_fixture(&h, SecurityMode::Anonymized).await;
+        let state = h.state();
+        let read =
+            async { vault_read_file_impl(state, "anon".into(), "a.txt".into(), None, None).await };
+        let click = async {
+            let id = h.next_pending_id().await;
+            state.approvals.respond(id, true, None).await.unwrap();
+        };
+        let (got, ()) = tokio::join!(read, click);
+        assert!(got.is_ok());
+        assert_eq!(h.fake.calls(), 0);
+        let records = read_presence(&h);
+        assert_eq!(records.last().unwrap().1["protected"], false);
+        assert_eq!(records.last().unwrap().1["outcome"], "click");
+    }
+
+    #[tokio::test]
+    async fn direct_read_is_declared_ungated() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        anonymized_fixture(&h, SecurityMode::Direct).await;
+        assert!(
+            vault_read_file_impl(h.state(), "anon".into(), "a.txt".into(), None, None)
+                .await
+                .is_ok()
+        );
+        assert_eq!(h.fake.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn lock_during_gate_releases_nothing() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        anonymized_fixture(&h, SecurityMode::Anonymized).await;
+        h.fake.push(FakeStep::Hold(APPROVED));
+        let state = h.state();
+        let read =
+            async { vault_read_file_impl(state, "anon".into(), "a.txt".into(), None, None).await };
+        let lock = async {
+            while h.fake.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            perform_vault_lock(state, "manual").await;
+            h.fake.release();
+        };
+        let (got, ()) = tokio::join!(read, lock);
+        assert!(got.is_err());
+        assert!(read_presence(&h).iter().all(|(d, _)| d != "allowed"));
+    }
+
+    /// D4/D14: a lock plus re-unlock between the gate and the release denies
+    /// the release, even though the gate itself passed.
+    #[tokio::test]
+    async fn relock_between_gate_and_consumption_denies() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        anonymized_fixture(&h, SecurityMode::Anonymized).await;
+        h.fake.approve_next();
+        let op = sv_presence::OpDescriptor::new("probe").field("x", "1");
+        let pass = desktop_presence_gate(
+            h.state(),
+            ClickRequest::desktop("probe", AuditAction::ReadFile, op),
+        )
+        .await
+        .ok()
+        .unwrap();
+        // Lock, then re-unlock with the same vault.
+        {
+            let mut guard = h.state().handle.lock().await;
+            let handle = guard.take().unwrap();
+            h.state().publish_locked(&mut guard);
+            h.state().publish_unlocked(&mut guard, handle);
+        }
+        let got = with_gated_handle(h.state(), &pass, |handle| {
+            let bytes = handle.read_file("anon", "a.txt").map_err(estr)?;
+            Ok((
+                bytes,
+                AuditEvent::new(AuditAction::ReadFile, AuditDecision::Allowed, "desktop-ui"),
+            ))
+        })
+        .await;
+        assert!(got.unwrap_err().contains("vault state changed"));
+    }
+
+    #[tokio::test]
+    async fn approval_mode_desktop_read_uses_presence_directly() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        anonymized_fixture(&h, SecurityMode::Approval).await;
+        h.fake.approve_next();
+        assert!(
+            vault_read_file_impl(h.state(), "anon".into(), "a.txt".into(), None, None)
+                .await
+                .is_ok()
+        );
+        assert_eq!(h.fake.calls(), 1);
+        assert!(
+            h.state().approvals.pending.lock().await.is_empty(),
+            "no modal on a protected system (D3)"
+        );
     }
 
     /// CP2 BLOQUEIO 1: a lock publication that lands while the reveal prompt
