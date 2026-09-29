@@ -68,7 +68,6 @@ impl GateDenied {
 impl GatePass {
     /// §6.3/§7.5: parameters derived from vault state must not have moved
     /// while the prompt was open.
-    #[allow(dead_code)] // consumed by the command gates added in Tasks 12-13
     pub fn ensure_same(&self, op_now: &OpDescriptor) -> Result<(), GateDenied> {
         if op_now.digest() == self.digest {
             Ok(())
