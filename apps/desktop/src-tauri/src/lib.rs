@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2997,6 +2997,19 @@ async fn desktop_presence_gate<R: Runtime>(
 /// while the lock is held, so a lock (or lock + re-unlock) since the gate
 /// denies; the Allowed event returned by `f` is recorded with the pass's
 /// presence BEFORE the lock is released.
+async fn record_gate_denial<R: Runtime>(
+    state: &VaultState<R>,
+    denied: presence::GateDenied,
+    mut event: AuditEvent,
+) -> String {
+    event.decision = AuditDecision::Denied;
+    event.presence = Some(denied.audit());
+    event.error = Some(denied.message.clone());
+    record_desktop_event_locked(state, event).await;
+    denied.message
+}
+
+/// presence BEFORE the lock is released.
 async fn with_gated_handle<R, T, F>(
     state: &VaultState<R>,
     pass: &presence::GatePass,
@@ -3020,7 +3033,6 @@ where
 }
 
 /// The mutating form of [`with_gated_handle`].
-#[allow(dead_code)] // consumed by vault_rotate_key and init, Tasks 12-13
 async fn with_gated_handle_mut<R, T, F>(
     state: &VaultState<R>,
     pass: &presence::GatePass,
@@ -3551,6 +3563,77 @@ async fn vault_change_passphrase(
     result
 }
 
+async fn vault_rotate_key_impl<R: Runtime>(
+    state: &VaultState<R>,
+    root: &Path,
+    passphrase: Option<String>,
+) -> Result<VaultInitResponse, String> {
+    state.touch_human_activity();
+    let dek_op = |root: &Path| -> Result<sv_presence::OpDescriptor, String> {
+        let version = sv_core::keyring::active_dek_version(root).map_err(estr)?;
+        Ok(sv_presence::OpDescriptor::new("vault_rotate_key").bind(
+            "dek_version",
+            version.map(|v| v.to_string()).unwrap_or_default(),
+        ))
+    };
+    let pass = match desktop_presence_gate(
+        state,
+        ClickRequest::desktop("Rotate vault key", AuditAction::KeyRotated, dek_op(root)?),
+    )
+    .await
+    {
+        Ok(pass) => pass,
+        Err(denied) => {
+            let event = desktop_event(
+                AuditAction::KeyRotated,
+                AuditDecision::Denied,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            return Err(record_gate_denial(state, denied, event).await);
+        }
+    };
+    let result = with_gated_handle_mut(state, &pass, |handle| {
+        // Re-derived under the handle lock: the DEK cannot move between this
+        // check and the rotation (D14).
+        pass.ensure_same(&dek_op(root)?)
+            .map_err(|denied| denied.message)?;
+        let recovery_phrase = handle
+            .rotate_key(root, passphrase.as_deref())
+            .map_err(estr)?;
+        let event = desktop_event(
+            AuditAction::KeyRotated,
+            AuditDecision::Allowed,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok((recovery_phrase, event))
+    })
+    .await;
+    if let Err(error) = &result {
+        let event = desktop_event(
+            AuditAction::KeyRotated,
+            AuditDecision::Error,
+            None,
+            None,
+            None,
+            None,
+            Some(error.clone()),
+        );
+        record_desktop_event_locked(state, event).await;
+    }
+    result.map(|recovery_phrase| VaultInitResponse {
+        recovery_phrase,
+        gateway_warning: None,
+    })
+}
+
 #[tauri::command]
 async fn vault_rotate_key(
     app: AppHandle,
@@ -3558,36 +3641,7 @@ async fn vault_rotate_key(
     passphrase: Option<String>,
 ) -> Result<VaultInitResponse, String> {
     let root = vault_root(&app)?;
-    state.touch_human_activity();
-    let result = {
-        let mut guard = state.handle.lock().await;
-        match guard.as_mut() {
-            Some(handle) => handle
-                .rotate_key(&root, passphrase.as_deref())
-                .map_err(estr),
-            None => Err("vault is locked".to_string()),
-        }
-    };
-    record_desktop_event(
-        &state,
-        desktop_event(
-            AuditAction::KeyRotated,
-            if result.is_ok() {
-                AuditDecision::Allowed
-            } else {
-                AuditDecision::Error
-            },
-            None,
-            None,
-            None,
-            None,
-            result.as_ref().err().cloned(),
-        ),
-    );
-    result.map(|recovery_phrase| VaultInitResponse {
-        recovery_phrase,
-        gateway_warning: None,
-    })
+    vault_rotate_key_impl(state.inner(), &root, passphrase).await
 }
 
 #[tauri::command]
@@ -4669,14 +4723,37 @@ async fn scan_report_get(
 /// This only works for scan reports produced in this process. The fingerprint
 /// is dropped before the report is written to disk, so reports loaded from
 /// a previous session cannot be revealed and must be re-scanned.
-#[tauri::command]
-async fn scan_reveal(
-    state: State<'_, VaultState>,
+async fn scan_reveal_impl<R: Runtime>(
+    state: &VaultState<R>,
     report_id: String,
     finding_index: usize,
 ) -> Result<String, String> {
     state.touch_human_activity();
-    let result = with_handle(&state, |_handle| {
+    let op = sv_presence::OpDescriptor::new("scan_reveal")
+        .field("report", report_id.clone())
+        .field("finding", finding_index.to_string());
+    let pass = match desktop_presence_gate(
+        state,
+        ClickRequest::desktop("Reveal scan finding", AuditAction::ScanReveal, op),
+    )
+    .await
+    {
+        Ok(pass) => pass,
+        Err(denied) => {
+            let mut event = desktop_event(
+                AuditAction::ScanReveal,
+                AuditDecision::Denied,
+                Some(report_id.clone()),
+                None,
+                None,
+                None,
+                None,
+            );
+            event.detail = Some(format!("finding_index={finding_index}"));
+            return Err(record_gate_denial(state, denied, event).await);
+        }
+    };
+    let result = with_gated_handle(state, &pass, |_handle| {
         // Reveal requires the in-memory report: the fingerprint salt never
         // left the process, and the fingerprints themselves are skipped on
         // serialization, so a loaded report cannot satisfy this check.
@@ -4694,7 +4771,7 @@ async fn scan_reveal(
             .findings
             .get(finding_index)
             .ok_or_else(|| format!("finding {finding_index} not found"))?;
-        let vault_root = vault_root(&state.app).map_err(estr)?;
+        let vault_root = state_root(state)?;
         let stored_path = scan_report_path(&vault_root, &report_id)?;
         let stored: StoredScanReport =
             serde_json::from_str(&std::fs::read_to_string(&stored_path).map_err(estr)?)
@@ -4722,51 +4799,53 @@ async fn scan_reveal(
             return Err("file changed since scan; re-scan to reveal".to_string());
         }
 
-        Ok(sv_scan::mask(value))
-    })
-    .await;
-
-    let audit_event = match &result {
-        Ok(_) => {
-            let mut event = desktop_event(
-                AuditAction::ScanReveal,
-                AuditDecision::Allowed,
-                Some(report_id.clone()),
-                None,
-                None,
-                None,
-                None,
-            );
-            event.detail = Some(format!("finding_index={finding_index}"));
-            if let Ok(vault_root) = vault_root(&state.app) {
-                if let Ok(report_path) = scan_report_path(&vault_root, &report_id) {
-                    if let Ok(text) = std::fs::read_to_string(&report_path) {
-                        if let Ok(stored) = serde_json::from_str::<StoredScanReport>(&text) {
-                            if let Some(finding) = stored.report.findings.get(finding_index) {
-                                event.file_name = Some(finding.path.to_string_lossy().to_string());
-                            }
-                        }
+        let masked = sv_scan::mask(value);
+        let mut event = desktop_event(
+            AuditAction::ScanReveal,
+            AuditDecision::Allowed,
+            Some(report_id.clone()),
+            None,
+            None,
+            None,
+            None,
+        );
+        event.detail = Some(format!("finding_index={finding_index}"));
+        if let Ok(report_path) = scan_report_path(&vault_root, &report_id) {
+            if let Ok(text) = std::fs::read_to_string(&report_path) {
+                if let Ok(stored) = serde_json::from_str::<StoredScanReport>(&text) {
+                    if let Some(finding) = stored.report.findings.get(finding_index) {
+                        event.file_name = Some(finding.path.to_string_lossy().to_string());
                     }
                 }
             }
-            event
         }
-        Err(_) => {
-            let mut event = desktop_event(
-                AuditAction::ScanReveal,
-                AuditDecision::Error,
-                Some(report_id.clone()),
-                None,
-                None,
-                None,
-                result.as_ref().err().cloned(),
-            );
-            event.detail = Some(format!("finding_index={finding_index}"));
-            event
-        }
-    };
-    record_desktop_event(&state, audit_event);
+        Ok((masked, event))
+    })
+    .await;
+
+    if let Err(error) = &result {
+        let mut event = desktop_event(
+            AuditAction::ScanReveal,
+            AuditDecision::Error,
+            Some(report_id.clone()),
+            None,
+            None,
+            None,
+            Some(error.clone()),
+        );
+        event.detail = Some(format!("finding_index={finding_index}"));
+        record_desktop_event_locked(state, event).await;
+    }
     result
+}
+
+#[tauri::command]
+async fn scan_reveal(
+    state: State<'_, VaultState>,
+    report_id: String,
+    finding_index: usize,
+) -> Result<String, String> {
+    scan_reveal_impl(state.inner(), report_id, finding_index).await
 }
 
 /// Compute a process-local fingerprint of matched bytes using the per-scan salt.
@@ -5770,22 +5849,62 @@ async fn notifications_set_enabled(
     Ok(())
 }
 
+async fn agent_create_impl<R: Runtime>(
+    state: &VaultState<R>,
+    name: String,
+    scopes: Option<Vec<sv_core::agents::AgentScope>>,
+) -> Result<AgentCreated, String> {
+    state.touch_human_activity();
+    let op = sv_presence::OpDescriptor::new("agent_create")
+        .field("name", name.clone())
+        .bind("scopes", serde_json::to_string(&scopes).map_err(estr)?);
+    let pass = match desktop_presence_gate(
+        state,
+        ClickRequest::desktop("Create agent", AuditAction::AgentCreate, op),
+    )
+    .await
+    {
+        Ok(pass) => pass,
+        Err(denied) => {
+            let event = desktop_event(
+                AuditAction::AgentCreate,
+                AuditDecision::Denied,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            return Err(record_gate_denial(state, denied, event).await);
+        }
+    };
+    with_gated_handle(state, &pass, |handle| {
+        let (agent_id, token) = handle
+            .create_agent(&name, scopes.unwrap_or_default())
+            .map_err(estr)?;
+        // New Allowed record: the agent id only, never the token.
+        let mut event = desktop_event(
+            AuditAction::AgentCreate,
+            AuditDecision::Allowed,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        event.agent_id = Some(agent_id.clone());
+        Ok((AgentCreated { agent_id, token }, event))
+    })
+    .await
+}
+
 #[tauri::command]
 async fn agent_create(
-    app: AppHandle,
     state: State<'_, VaultState>,
     name: String,
     scopes: Option<Vec<sv_core::agents::AgentScope>>,
 ) -> Result<AgentCreated, String> {
-    let _ = &app;
-    state.touch_human_activity();
-    let (agent_id, token) = with_handle(&state, |handle| {
-        handle
-            .create_agent(&name, scopes.unwrap_or_default())
-            .map_err(estr)
-    })
-    .await?;
-    Ok(AgentCreated { agent_id, token })
+    agent_create_impl(state.inner(), name, scopes).await
 }
 
 #[tauri::command]
@@ -6368,6 +6487,109 @@ mod tests {
         assert_eq!(h.fake.calls(), 0);
         respond_from_tray(h.app.handle(), id, false).await;
         assert_eq!(task.await.unwrap(), Err("access denied by user".into()));
+    }
+
+    #[tokio::test]
+    async fn scan_reveal_reveals_nothing_without_presence() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.fake
+            .push(FakeStep::Return(Err(sv_presence::PresenceError::Cancelled)));
+        let got = scan_reveal_impl(h.state(), "report-x".into(), 0).await;
+        assert!(got.unwrap_err().contains("presence"));
+        // The coordinator runs the backend on a spawned task; bounded wait
+        // before counting calls (test-only, same pattern as the cancel tests).
+        let confirmed = tokio::time::timeout(Duration::from_millis(2_000), async {
+            while h.fake.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(confirmed.is_ok(), "the gate never reached the backend");
+        assert_eq!(h.fake.calls(), 1, "the gate runs before any report lookup");
+        // AuditAction serializes snake_case ("scan_reveal"), never PascalCase.
+        let reveals: Vec<_> = h
+            .presence_events()
+            .into_iter()
+            .filter(|(a, _, _)| a.contains("scan_reveal"))
+            .collect();
+        assert_eq!(reveals.len(), 1);
+        assert!(reveals[0].1.contains("denied"));
+        assert_eq!(reveals[0].2["protected"], true);
+        assert!(reveals[0].2["operation_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("op-"));
+    }
+
+    #[tokio::test]
+    async fn agent_create_creates_no_agent_without_presence() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let before = with_handle_in(h.state(), |x| x.list_agents().map_err(estr))
+            .await
+            .unwrap()
+            .len();
+        h.fake
+            .push(FakeStep::Return(Err(sv_presence::PresenceError::Failed)));
+        assert!(agent_create_impl(h.state(), "bot".into(), None)
+            .await
+            .is_err());
+        let after = with_handle_in(h.state(), |x| x.list_agents().map_err(estr))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            before, after,
+            "observable state unchanged, not merely no token"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_create_returns_token_after_presence() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.fake.approve_next();
+        let created = agent_create_impl(h.state(), "bot".into(), None)
+            .await
+            .unwrap();
+        assert!(!created.token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rotate_key_leaves_dek_unchanged_without_presence() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let before = sv_core::keyring::active_dek_version(&h.root).unwrap();
+        h.fake
+            .push(FakeStep::Return(Err(sv_presence::PresenceError::Cancelled)));
+        let got = vault_rotate_key_impl(h.state(), &h.root, Some(TEST_PASSPHRASE.into())).await;
+        assert!(got.is_err());
+        assert_eq!(
+            sv_core::keyring::active_dek_version(&h.root).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_key_denied_when_dek_moves_during_prompt() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.fake.push(FakeStep::Hold(APPROVED));
+        let state = h.state();
+        let s2 = state;
+        let rotate =
+            async { vault_rotate_key_impl(s2, &h.root, Some(TEST_PASSPHRASE.into())).await };
+        let meddle = async {
+            while h.fake.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let mut guard = state.handle.lock().await;
+            guard
+                .as_mut()
+                .unwrap()
+                .rotate_key(&h.root, Some(TEST_PASSPHRASE))
+                .unwrap();
+            drop(guard);
+            h.fake.release();
+        };
+        let (got, ()) = tokio::join!(rotate, meddle);
+        assert!(got.unwrap_err().contains("changed during verification"));
     }
 
     /// The central test (spec §9.2).
