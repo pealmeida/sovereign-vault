@@ -8,9 +8,16 @@
 
 use std::sync::Arc;
 
+mod coordinator;
 mod gate;
 mod op;
 
+#[cfg(any(test, feature = "test-util"))]
+pub mod fake;
+
+pub use coordinator::{
+    Attempt, Classification, Denial, PresenceCoordinator, Verified, MAX_WAITING,
+};
 pub use gate::{AttemptId, GateError, GateState};
 pub use op::{OpDescriptor, OpDigest};
 
