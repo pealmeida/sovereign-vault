@@ -8,8 +8,10 @@
 
 use std::sync::Arc;
 
+mod gate;
 mod op;
 
+pub use gate::{AttemptId, GateError, GateState};
 pub use op::{OpDescriptor, OpDigest};
 
 /// How the device owner proved presence, as reported by the backend.
