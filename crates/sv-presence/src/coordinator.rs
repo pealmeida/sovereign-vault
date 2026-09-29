@@ -487,6 +487,17 @@ mod tests {
         settle().await;
         c.invalidate(id);
         assert_eq!(a.await.unwrap().unwrap_err(), Denial::Invalidated);
+        // Bounded wait: advance only when the backend confirmed the cancel.
+        let confirmed = tokio::time::timeout(Duration::from_secs(2), async {
+            while fake.cancels() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            confirmed.is_ok(),
+            "the backend never confirmed the cancellation"
+        );
         assert_eq!(fake.cancels(), 1);
     }
 
