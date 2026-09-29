@@ -100,6 +100,14 @@ struct PendingApproval {
     /// Used to dedupe a retry storm: only an identical request supersedes the
     /// older pending one.
     signature: String,
+    /// Fixed when the request was created (§6.2); never re-evaluated.
+    protected: bool,
+    gate: sv_presence::GateState,
+    deadline: Instant,
+    op: sv_presence::OpDescriptor,
+    audit_action: AuditAction,
+    /// From `ClickRequest::pre_unlock`.
+    pre_unlock: bool,
 }
 
 /// Stable identity for an access request so retries collapse onto one modal.
@@ -294,9 +302,8 @@ fn generate_otp_code() -> Result<String, String> {
 
 struct ApprovalState<R: Runtime = tauri::Wry> {
     app: AppHandle<R>,
-    /// Presence coordinator for the approve transition (Tasks 8+ add the
-    /// gates; the field is wired now so every surface shares one queue).
-    #[allow(dead_code)] // consumed by the gates added in Tasks 8+
+    /// Presence coordinator: one native prompt at a time behind a bounded
+    /// queue (ADR-0025 §6.1). Every approve passes through it.
     presence: Arc<sv_presence::PresenceCoordinator>,
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, PendingApproval>>,
@@ -333,13 +340,10 @@ struct ClickRequest {
     byte_size: Option<usize>,
     import_summary: Option<sv_mcp::ImportApprovalSummary>,
     signature: String,
-    /// Bound into the verification digest by the gates (Tasks 8+).
-    #[allow(dead_code)]
     op: sv_presence::OpDescriptor,
     /// Consent that may complete while the vault is locked or absent. Set
     /// ONLY by `desktop_pre_unlock` (keychain unlock, init); an MCP request
     /// can never carry it (D5, round-3 review).
-    #[allow(dead_code)] // read by the gates added in Tasks 8+/13
     pre_unlock: bool,
 }
 
@@ -378,8 +382,9 @@ impl ClickRequest {
 
     /// The declared consent click of `vault_unlock` (keychain) and
     /// `vault_init`: the only clicks that can be approved without a vault.
-    /// Their audit happens at commit, under the handle guard (Task 13).
-    #[allow(dead_code)] // used by the pre-unlock gates added in Task 13
+    /// Their audit happens at commit, under the handle guard (Task 13);
+    /// exercised in tests meanwhile.
+    #[allow(dead_code)] // production callers land with Task 13
     fn desktop_pre_unlock(
         label: &str,
         audit_action: AuditAction,
@@ -520,6 +525,10 @@ impl<R: Runtime> ApprovalState<R> {
                             byte_size: request.byte_size,
                             otp_code: Some(code),
                             import_summary: request.import_summary.clone(),
+                            // The OTP presence gate itself lands in Task 11;
+                            // the flag already reports the platform state.
+                            protected: self.presence.classify().is_protected(),
+                            pre_unlock: false,
                         };
                         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
                         notify_once(
@@ -615,6 +624,10 @@ impl<R: Runtime> ApprovalState<R> {
             byte_size: request.byte_size,
             otp_code: Some(code),
             import_summary: request.import_summary.clone(),
+            // The OTP presence gate itself lands in Task 11; the flag
+            // already reports the platform state.
+            protected: self.presence.classify().is_protected(),
+            pre_unlock: false,
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
         notify_once(
@@ -674,6 +687,13 @@ impl<R: Runtime> ApprovalState<R> {
     async fn request_click(&self, click: ClickRequest, mirror: TrayMirror) -> Result<(), String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let signature = click.signature;
+        // The protected classification is fixed when the request is created
+        // (§6.2) — before any lock, and never re-evaluated for this request.
+        let protected = self.presence.classify().is_protected();
+        let op = click.op.bind("request_id", id.to_string());
+        let deadline = Instant::now() + Duration::from_secs(APPROVAL_TIMEOUT_SECS);
+        let pre_unlock = click.pre_unlock;
+        let audit_action = click.audit_action;
         let (tx, rx) = oneshot::channel();
         let superseded: Vec<u64> = {
             let mut pending = self.pending.lock().await;
@@ -697,6 +717,12 @@ impl<R: Runtime> ApprovalState<R> {
                     tx,
                     otp_code: None,
                     signature,
+                    protected,
+                    gate: sv_presence::GateState::default(),
+                    deadline,
+                    op,
+                    audit_action,
+                    pre_unlock,
                 },
             );
             stale
@@ -719,6 +745,8 @@ impl<R: Runtime> ApprovalState<R> {
             byte_size: click.byte_size,
             otp_code: None,
             import_summary: click.import_summary.clone(),
+            protected,
+            pre_unlock,
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
         // Mirror this request into the tray menu. Only the click path does
@@ -751,7 +779,11 @@ impl<R: Runtime> ApprovalState<R> {
             Ok(Err(_)) => Err("approval channel closed".into()),
             Err(_) => {
                 let mut pending = self.pending.lock().await;
-                pending.remove(&id);
+                if let Some(entry) = pending.remove(&id) {
+                    // D13: a timed-out request must not keep (or later open)
+                    // a native prompt.
+                    self.invalidate_entry(&entry);
+                }
                 drop(pending);
                 // Tell the UI to drop the now-defunct modal.
                 let _ = self.app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id });
@@ -766,31 +798,223 @@ impl<R: Runtime> ApprovalState<R> {
         }
     }
 
-    async fn respond(&self, id: u64, approved: bool, otp: Option<String>) -> Result<(), String> {
-        let mut pending = self.pending.lock().await;
-        if approved {
-            if let Some(existing) = pending.get(&id) {
-                if let Some(expected) = &existing.otp_code {
-                    if otp.as_deref() != Some(expected.as_str()) {
-                        return Err("incorrect confirmation code".into());
-                    }
-                }
-            }
+    /// D13: a refused, expired, or locked request must not keep (or later
+    /// open) a native prompt.
+    fn invalidate_entry(&self, entry: &PendingApproval) {
+        if let sv_presence::GateState::Verifying { attempt, .. } = entry.gate {
+            self.presence.invalidate(attempt);
         }
+    }
 
-        let Some(pending_request) = pending.remove(&id) else {
-            return Err(format!("unknown approval request: {id}"));
-        };
-        let sent = pending_request
-            .tx
-            .send(approved)
-            .map_err(|_| "approval request already closed".to_string());
-        // Whichever surface decided, the tray row is now stale.
+    fn drop_tray_row(&self, id: u64) {
         if let Some(tray_state) = self.app.try_state::<tray::TrayApprovals>() {
             tray_state.remove(id);
         }
         tray::refresh(&self.app);
+    }
+
+    /// Plans D5/D6: the desktop records every decision with its presence
+    /// facts and the request's operation id. Waits for the handle; a locked
+    /// vault (no key) is the declared exception.
+    async fn audit_decision(
+        &self,
+        operation_id: String,
+        action: AuditAction,
+        approved: bool,
+        presence: sv_audit::PresenceAudit,
+        transport: &str,
+        error: Option<String>,
+    ) {
+        let Some(state) = self.app.try_state::<VaultState<R>>() else {
+            return;
+        };
+        let decision = if approved {
+            AuditDecision::Allowed
+        } else {
+            AuditDecision::Denied
+        };
+        let mut event = AuditEvent::new(action, decision, transport);
+        event.presence = Some(presence.with_operation(operation_id));
+        event.error = error;
+        record_desktop_event_locked(&state, event).await;
+    }
+
+    /// Refuse `id` from `transport` ("desktop-ui" or "desktop-tray").
+    async fn refuse_from(&self, id: u64, transport: &str) -> Result<(), String> {
+        let removed = self.pending.lock().await.remove(&id);
+        let Some(entry) = removed else {
+            return Err(format!("unknown approval request: {id}"));
+        };
+        self.invalidate_entry(&entry);
+        let sent = entry
+            .tx
+            .send(false)
+            .map_err(|_| "approval request already closed".to_string());
+        self.audit_decision(
+            format!("approval-{id}"),
+            entry.audit_action,
+            false,
+            sv_audit::PresenceAudit::denied(entry.protected),
+            transport,
+            None,
+        )
+        .await;
+        self.drop_tray_row(id);
         sent
+    }
+
+    fn allowed_event(
+        &self,
+        id: u64,
+        action: AuditAction,
+        presence: sv_audit::PresenceAudit,
+    ) -> AuditEvent {
+        let mut event = AuditEvent::new(action, AuditDecision::Allowed, "desktop-ui");
+        event.presence = Some(presence.with_operation(format!("approval-{id}")));
+        event
+    }
+
+    /// Approving verifies OS presence for requests classified protected at
+    /// creation (§6.1). Refusal is immediate and needs no presence (§2).
+    /// Lock order is always handle → pending, the same as the lock path, and
+    /// an Allowed decision is recorded WITH the handle held before `true` is
+    /// sent (D5), so a lock can never slip between the decision and its
+    /// record.
+    async fn respond(&self, id: u64, approved: bool, otp: Option<String>) -> Result<(), String> {
+        if !approved {
+            // Refusal is immediate and needs no presence (§2).
+            return self.refuse_from(id, "desktop-ui").await;
+        }
+        let vault = self
+            .app
+            .try_state::<VaultState<R>>()
+            .ok_or_else(|| "vault state unavailable".to_string())?;
+
+        // Phase 1 (handle -> pending): the click path completes here; the
+        // protected path registers its attempt (so a refusal cannot miss it).
+        let (attempt, op, deadline) = {
+            let handle_guard = vault.handle.lock().await;
+            let mut pending = self.pending.lock().await;
+            let entry = pending
+                .get_mut(&id)
+                .ok_or_else(|| format!("unknown approval request: {id}"))?;
+            if let Some(expected) = &entry.otp_code {
+                if otp.as_deref() != Some(expected.as_str()) {
+                    return Err("incorrect confirmation code".into());
+                }
+            }
+            if !entry.protected {
+                let entry = pending.remove(&id).expect("present above");
+                drop(pending);
+                let Some(handle) = handle_guard.as_ref() else {
+                    if entry.pre_unlock {
+                        // Keychain unlock / init consent: there is no vault
+                        // yet to audit into; the commit records it under the
+                        // handle guard, with this click (Task 13).
+                        let sent = entry
+                            .tx
+                            .send(true)
+                            .map_err(|_| "approval request already closed".to_string());
+                        drop(handle_guard);
+                        self.drop_tray_row(id);
+                        return sent;
+                    }
+                    let _ = entry.tx.send(false);
+                    drop(handle_guard);
+                    self.drop_tray_row(id);
+                    return Err("vault is locked".into());
+                };
+                record_with_handle(
+                    &vault,
+                    handle,
+                    self.allowed_event(id, entry.audit_action, sv_audit::PresenceAudit::click()),
+                );
+                let sent = entry
+                    .tx
+                    .send(true)
+                    .map_err(|_| "approval request already closed".to_string());
+                drop(handle_guard);
+                self.drop_tray_row(id);
+                return sent;
+            }
+            let attempt = self.presence.begin_attempt();
+            entry
+                .gate
+                .begin(attempt.id(), entry.op.digest())
+                .map_err(|e| e.to_string())?;
+            (attempt, entry.op.clone(), entry.deadline)
+        };
+
+        // Phase 2 (no locks held): the native prompt.
+        let result = self.presence.verify(&attempt, &op, deadline).await;
+
+        // Phase 3, the finisher (handle -> pending).
+        let handle_guard = vault.handle.lock().await;
+        let mut pending = self.pending.lock().await;
+        let Some(entry) = pending.get_mut(&id) else {
+            // Refused, expired, or locked while the prompt was open: the
+            // result is discarded (§6.1); the refusal was already audited.
+            return Err("approval request is no longer pending".into());
+        };
+        let denial = match result {
+            Ok(verified) => {
+                let current = entry.op.digest();
+                match entry.gate.finish(
+                    attempt.id(),
+                    verified.digest,
+                    current,
+                    entry.deadline,
+                    Instant::now(),
+                ) {
+                    Err(error) => error.to_string(),
+                    Ok(()) => {
+                        let entry = pending.remove(&id).expect("present above");
+                        drop(pending);
+                        let Some(handle) = handle_guard.as_ref() else {
+                            let _ = entry.tx.send(false);
+                            drop(handle_guard);
+                            self.drop_tray_row(id);
+                            return Err("vault is locked".into());
+                        };
+                        let presence = sv_audit::PresenceAudit::authenticated(
+                            presence::audit_modality(verified.outcome.modality),
+                        );
+                        record_with_handle(
+                            &vault,
+                            handle,
+                            self.allowed_event(id, entry.audit_action, presence),
+                        );
+                        let sent = entry
+                            .tx
+                            .send(true)
+                            .map_err(|_| "approval request already closed".to_string());
+                        drop(handle_guard);
+                        self.drop_tray_row(id);
+                        return sent;
+                    }
+                }
+            }
+            Err(sv_presence::Denial::Retryable(error)) => {
+                entry.gate.abort(attempt.id());
+                return Err(sv_presence::Denial::Retryable(error).message());
+            }
+            Err(denial) => denial.message(),
+        };
+        let entry = pending.remove(&id).expect("present above");
+        drop(pending);
+        drop(handle_guard);
+        let _ = entry.tx.send(false);
+        self.audit_decision(
+            format!("approval-{id}"),
+            entry.audit_action,
+            false,
+            sv_audit::PresenceAudit::denied(true),
+            "desktop-ui",
+            Some(denial.clone()),
+        )
+        .await;
+        self.drop_tray_row(id);
+        Err(denial)
     }
 
     /// A lock ends every pending decision (spec §6.1): refuse each waiting
@@ -798,6 +1022,9 @@ impl<R: Runtime> ApprovalState<R> {
     async fn clear_all(&self) {
         let drained: Vec<(u64, PendingApproval)> = self.pending.lock().await.drain().collect();
         for (id, pending) in drained {
+            // D13: an attempt in flight must be cancelled before its channel
+            // closes, so no native prompt is kept or later opened.
+            self.invalidate_entry(&pending);
             let _ = pending.tx.send(false);
             let _ = self.app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id });
         }
@@ -1430,8 +1657,9 @@ struct VaultState<R: Runtime = tauri::Wry> {
     handle: SharedHandle,
     approvals: Arc<ApprovalState<R>>,
     /// ADR-0025 presence coordinator: one native prompt at a time behind a
-    /// bounded queue. Read by the gated commands (Tasks 8+).
-    #[allow(dead_code)] // consumed by the gates added in Tasks 8+
+    /// bounded queue. The same Arc reaches approvals (gates of §6–7); this
+    /// reference is read by the desktop command gates (Task 9).
+    #[allow(dead_code)] // consumed by the command gates added in Task 9
     presence: Arc<sv_presence::PresenceCoordinator>,
     servers: Arc<Mutex<Option<ServersShutdown>>>,
     /// Scan reports that were produced in this process and still have a live
@@ -1720,6 +1948,11 @@ struct ApprovalPrompt {
     otp_code: Option<String>,
     /// Validated non-secret authority shown for agent imports.
     import_summary: Option<sv_mcp::ImportApprovalSummary>,
+    /// Presence will be verified on approve (ADR-0025 §6.2 classification).
+    protected: bool,
+    /// This consent may complete while the vault is locked or absent
+    /// (keychain unlock / init; D5 round-3 review).
+    pre_unlock: bool,
 }
 
 /// Generic wake response; the agent MUST NOT be able to tell whether the
@@ -1874,12 +2107,19 @@ impl sv_mcp::AgentAuthenticator for DesktopAgentAuthenticator {
 
 struct DesktopAccessController<R: Runtime = tauri::Wry> {
     approvals: Arc<ApprovalState<R>>,
+    timer: SessionTimer,
 }
 
 #[async_trait]
 impl<R: Runtime> sv_mcp::AccessController for DesktopAccessController<R> {
     async fn authorize(&self, request: sv_mcp::AccessRequest) -> Result<(), String> {
-        self.approvals.request(request).await
+        let epoch = self.timer.epoch();
+        self.approvals.request(request).await?;
+        // An approval granted in one unlock is never consumed in the next.
+        if self.timer.epoch() != epoch {
+            return Err("vault state changed during approval; resend the request".into());
+        }
+        Ok(())
     }
 }
 
@@ -1957,18 +2197,18 @@ async fn respond_from_tray<R: Runtime>(app: &AppHandle<R>, id: u64, approved: bo
         return;
     }
 
-    // The action is read BEFORE responding, so the audit names the action that
-    // was actually authorised rather than a placeholder. A request missing from
-    // the registry is not decided here at all: without it there is nothing
-    // truthful to record, and the app remains the way to answer.
-    let Some(audit_action) = app
+    // A request missing from the registry is not decided here at all:
+    // without a truthful row there is nothing to answer from, and the app
+    // remains the way to answer. (Task 8: `respond`/`refuse_from` now record
+    // the decision themselves; Task 9 routes the tray through
+    // `refuse_from(id, "desktop-tray")` to restore the tray transport.)
+    let listed = app
         .try_state::<tray::TrayApprovals>()
-        .and_then(|s| s.snapshot().into_iter().find(|a| a.id == id))
-        .map(|a| a.audit_action)
-    else {
+        .is_some_and(|s| s.snapshot().into_iter().any(|a| a.id == id));
+    if !listed {
         tray::refresh(app);
         return;
-    };
+    }
 
     // A tray click is a real human at the machine, exactly like a click in the
     // app, so it refreshes the idle timer the same way `approval_respond` does.
@@ -1977,20 +2217,7 @@ async fn respond_from_tray<R: Runtime>(app: &AppHandle<R>, id: u64, approved: bo
     // No OTP is ever passed from the tray: OTP-mode requests never enter the
     // tray registry, and `respond` rejects an approval whose pending entry
     // carries a code when none is supplied.
-    let result = state.approvals.respond(id, approved, None).await;
-
-    if result.is_ok() {
-        let event = AuditEvent::new(
-            audit_action,
-            if approved {
-                AuditDecision::Allowed
-            } else {
-                AuditDecision::Denied
-            },
-            "desktop-tray",
-        );
-        record_desktop_event(&state, event);
-    }
+    let _ = state.approvals.respond(id, approved, None).await;
 
     if let Some(tray_state) = app.try_state::<tray::TrayApprovals>() {
         tray_state.remove(id);
@@ -2018,9 +2245,8 @@ fn record_desktop_event<R: Runtime>(state: &VaultState<R>, event: AuditEvent) {
 }
 
 /// Record with a handle the caller already holds. Used inside
-/// `with_gated_handle`, so an Allowed record is written before the lock that
-/// guards the release is released.
-#[allow(dead_code)] // consumed by `with_gated_handle` added in Task 9
+/// `respond`/`with_gated_handle`, so an Allowed record is written before the
+/// lock that guards the release is released.
 fn record_with_handle<R: Runtime>(state: &VaultState<R>, handle: &VaultHandle, event: AuditEvent) {
     let Ok(root) = audit_root(state) else {
         return;
@@ -2033,7 +2259,6 @@ fn record_with_handle<R: Runtime>(state: &VaultState<R>, handle: &VaultHandle, e
 /// Like `record_desktop_event`, but waits for the handle instead of
 /// skipping on contention. Only a locked vault (no key) skips: the declared
 /// D5 exception. Never call it while holding `state.handle`.
-#[allow(dead_code)] // consumed by the denial writers added in Tasks 8+
 async fn record_desktop_event_locked<R: Runtime>(state: &VaultState<R>, event: AuditEvent) {
     let guard = state.handle.lock().await;
     if let Some(handle) = guard.as_ref() {
@@ -5048,6 +5273,7 @@ async fn start_servers<R: Runtime>(state: &State<'_, VaultState<R>>) -> Result<(
 
     let controller = Arc::new(DesktopAccessController {
         approvals: state.approvals.clone(),
+        timer: state.session_timer.clone(),
     });
     let sink = Arc::new(DesktopAuditSink::new(audit_root, audit_hmac_key));
     let authenticator = Arc::new(DesktopAgentAuthenticator {
@@ -5202,7 +5428,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sv_presence::fake::FakeVerifier;
+    use sv_presence::fake::{FakeStep, FakeVerifier, APPROVED};
     use tauri::test::MockRuntime;
 
     const TEST_PASSPHRASE: &str = "correct horse battery staple";
@@ -5211,8 +5437,6 @@ mod tests {
         app: tauri::App<MockRuntime>,
         _dir: tempfile::TempDir,
         root: PathBuf,
-        /// Read by the scripted-approval tests added in Tasks 8+ (the gates).
-        #[allow(dead_code)]
         fake: Arc<FakeVerifier>,
     }
 
@@ -5288,8 +5512,6 @@ mod tests {
         }
 
         /// Events carrying a `presence` field, as `(action, decision, presence)`.
-        /// Used by the presence-audit tests added in Tasks 8+.
-        #[allow(dead_code)]
         fn presence_events(&self) -> Vec<(String, String, serde_json::Value)> {
             self.audit_events()
                 .into_iter()
@@ -5379,6 +5601,293 @@ mod tests {
         assert!(
             state.session_timer.remaining_secs().0.is_some(),
             "the new session's timer is running"
+        );
+    }
+
+    async fn spawn_agent_request(
+        h: &Harness,
+    ) -> (u64, tokio::task::JoinHandle<Result<(), String>>) {
+        let approvals = h.state().approvals.clone();
+        let task = tokio::spawn(async move {
+            approvals
+                .request(container_request(SecurityMode::Approval, "ctx"))
+                .await
+        });
+        (h.next_pending_id().await, task)
+    }
+
+    fn approval_presence(h: &Harness, id: u64) -> Vec<serde_json::Value> {
+        let op = serde_json::Value::String(format!("approval-{id}"));
+        h.presence_events()
+            .into_iter()
+            .filter(|(_, _, p)| p["operation_id"] == op)
+            .map(|(_, decision, mut p)| {
+                p["decision"] = serde_json::Value::String(decision.trim_matches('"').to_string());
+                p
+            })
+            .collect()
+    }
+
+    /// The central test (spec §9.2).
+    #[tokio::test]
+    async fn approve_without_completed_verification_does_not_approve() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.fake
+            .push(FakeStep::Return(Err(sv_presence::PresenceError::Cancelled)));
+        let (id, task) = spawn_agent_request(&h).await;
+        assert!(h.state().approvals.respond(id, true, None).await.is_err());
+        assert!(
+            !task.is_finished(),
+            "a cancelled prompt leaves the request pending"
+        );
+        assert!(h.state().approvals.pending.lock().await.contains_key(&id));
+        h.state().approvals.respond(id, false, None).await.unwrap();
+        assert_eq!(task.await.unwrap(), Err("access denied by user".into()));
+        let records = approval_presence(&h, id);
+        assert_eq!(records.len(), 1, "exactly one decision record: the refusal");
+        assert_eq!(records[0]["decision"], "denied");
+        assert_eq!(records[0]["protected"], true);
+    }
+
+    #[tokio::test]
+    async fn verified_approval_approves_and_audits_presence() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.fake.approve_next();
+        let (id, task) = spawn_agent_request(&h).await;
+        h.state().approvals.respond(id, true, None).await.unwrap();
+        assert_eq!(task.await.unwrap(), Ok(()));
+        let records = approval_presence(&h, id);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["decision"], "allowed");
+        assert_eq!(records[0]["protected"], true);
+        assert_eq!(records[0]["outcome"], "device_owner_authenticated");
+        assert_eq!(records[0]["modality"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn mid_attempt_unavailability_denies_and_never_clicks() {
+        for err in [
+            sv_presence::PresenceError::Unavailable,
+            sv_presence::PresenceError::DisabledByPolicy,
+            sv_presence::PresenceError::NotConfigured,
+        ] {
+            let h = Harness::unlocked(FakeVerifier::protected()).await;
+            h.fake.push(FakeStep::Return(Err(err)));
+            let (id, task) = spawn_agent_request(&h).await;
+            assert!(h.state().approvals.respond(id, true, None).await.is_err());
+            assert_eq!(
+                task.await.unwrap(),
+                Err("access denied by user".into()),
+                "{err:?}"
+            );
+            let records = approval_presence(&h, id);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["decision"], "denied");
+            assert_eq!(records[0]["protected"], true);
+            assert!(records[0]["outcome"].is_null(), "never a click");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_approve_starts_one_verification() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.fake.push(FakeStep::Hold(APPROVED));
+        let (id, task) = spawn_agent_request(&h).await;
+        let approvals = h.state().approvals.clone();
+        let first = tokio::spawn(async move { approvals.respond(id, true, None).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let second = h.state().approvals.respond(id, true, None).await;
+        assert!(second.unwrap_err().contains("already in progress"));
+        h.fake.release();
+        first.await.unwrap().unwrap();
+        assert_eq!(task.await.unwrap(), Ok(()));
+        assert_eq!(h.fake.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn refuse_during_verification_wins_and_cancels_the_prompt() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.fake.set_cancel_supported(true);
+        h.fake.push(FakeStep::Hold(APPROVED));
+        let (id, task) = spawn_agent_request(&h).await;
+        let approvals = h.state().approvals.clone();
+        let approving = tokio::spawn(async move { approvals.respond(id, true, None).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        h.state().approvals.respond(id, false, None).await.unwrap();
+        assert!(approving.await.unwrap().is_err());
+        assert_eq!(h.fake.cancels(), 1, "refusal requests native cancel (D13)");
+        assert_eq!(task.await.unwrap(), Err("access denied by user".into()));
+    }
+
+    /// D13: a request refused while waiting behind another prompt never prompts.
+    #[tokio::test]
+    async fn refused_while_queued_never_prompts() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.fake.push(FakeStep::Hold(APPROVED)); // A's prompt stays open
+        h.fake.approve_next(); // B's result, if B ever prompted
+        let (a, task_a) = spawn_agent_request(&h).await;
+        let approvals = h.state().approvals.clone();
+        let approving_a = tokio::spawn(async move { approvals.respond(a, true, None).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let approvals = h.state().approvals.clone();
+        let task_b = tokio::spawn(async move {
+            approvals
+                .request(container_request(SecurityMode::Approval, "ctx-b"))
+                .await
+        });
+        let b = loop {
+            let ids: Vec<u64> = h
+                .state()
+                .approvals
+                .pending
+                .lock()
+                .await
+                .keys()
+                .copied()
+                .collect();
+            if let Some(b) = ids.into_iter().find(|k| *k != a) {
+                break b;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let approvals = h.state().approvals.clone();
+        let approving_b = tokio::spawn(async move { approvals.respond(b, true, None).await });
+        tokio::time::sleep(Duration::from_millis(30)).await; // B is queued behind A
+        h.state().approvals.respond(b, false, None).await.unwrap();
+        assert!(approving_b.await.unwrap().is_err());
+        assert_eq!(task_b.await.unwrap(), Err("access denied by user".into()));
+        h.fake.release();
+        approving_a.await.unwrap().unwrap();
+        task_a.await.unwrap().unwrap();
+        assert_eq!(h.fake.calls(), 1, "B never reached the backend");
+    }
+
+    #[tokio::test]
+    async fn lock_during_verification_denies() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.fake.push(FakeStep::Hold(APPROVED));
+        let (id, task) = spawn_agent_request(&h).await;
+        let approvals = h.state().approvals.clone();
+        let approving = tokio::spawn(async move { approvals.respond(id, true, None).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        perform_vault_lock(h.state(), "manual").await;
+        h.fake.release();
+        assert!(approving.await.unwrap().is_err());
+        assert_eq!(task.await.unwrap(), Err("access denied by user".into()));
+    }
+
+    /// D4: an approval that lands after the vault's epoch moved is not honored
+    /// by the MCP path, even though the modal decision itself went through.
+    #[tokio::test]
+    async fn mcp_authorize_rejects_approval_across_an_epoch_change() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.fake.push(FakeStep::Hold(APPROVED));
+        let controller = DesktopAccessController {
+            approvals: h.state().approvals.clone(),
+            timer: h.state().session_timer.clone(),
+        };
+        let authorizing = tokio::spawn(async move {
+            sv_mcp::AccessController::authorize(
+                &controller,
+                container_request(SecurityMode::Approval, "ctx"),
+            )
+            .await
+        });
+        let id = h.next_pending_id().await;
+        let approvals = h.state().approvals.clone();
+        let approving = tokio::spawn(async move { approvals.respond(id, true, None).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // An epoch change lands while the prompt is open, without the lock
+        // path's clear (the narrowest interleaving the controller must catch).
+        h.state().session_timer.set_unlocked();
+        h.fake.release();
+        approving.await.unwrap().unwrap();
+        assert!(authorizing
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("vault state changed"));
+    }
+
+    #[tokio::test]
+    async fn one_verification_does_not_satisfy_the_next_request() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.fake.approve_next();
+        let (id1, t1) = spawn_agent_request(&h).await;
+        h.state().approvals.respond(id1, true, None).await.unwrap();
+        t1.await.unwrap().unwrap();
+        let (id2, t2) = spawn_agent_request(&h).await;
+        assert!(
+            h.state().approvals.respond(id2, true, None).await.is_err(),
+            "unscripted => fails"
+        );
+        h.state().approvals.respond(id2, false, None).await.unwrap();
+        let _ = t2.await;
+    }
+
+    #[tokio::test]
+    async fn declared_system_click_approves_with_protected_false() {
+        let h = Harness::unlocked(FakeVerifier::unavailable()).await;
+        let (id, task) = spawn_agent_request(&h).await;
+        h.state().approvals.respond(id, true, None).await.unwrap();
+        assert_eq!(task.await.unwrap(), Ok(()));
+        assert_eq!(h.fake.calls(), 0);
+        let records = approval_presence(&h, id);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["protected"], false);
+        assert_eq!(records[0]["outcome"], "click");
+    }
+
+    /// Round-3 review: the declared consent click of a keychain unlock works
+    /// while the vault is locked...
+    #[tokio::test]
+    async fn pre_unlock_click_is_approvable_while_locked() {
+        let h = Harness::new(FakeVerifier::unavailable()); // locked, declared system
+        let approvals = h.state().approvals.clone();
+        let op = sv_presence::OpDescriptor::new("vault_unlock").field("vault", "v");
+        let task = tokio::spawn(async move {
+            approvals
+                .request_click(
+                    ClickRequest::desktop_pre_unlock("Unlock", AuditAction::VaultUnlock, op),
+                    TrayMirror::No,
+                )
+                .await
+        });
+        let id = h.next_pending_id().await;
+        h.state().approvals.respond(id, true, None).await.unwrap();
+        assert_eq!(task.await.unwrap(), Ok(()));
+    }
+
+    /// ...but no MCP request can be approved while locked.
+    #[tokio::test]
+    async fn mcp_request_is_not_approvable_while_locked() {
+        let h = Harness::new(FakeVerifier::unavailable());
+        let approvals = h.state().approvals.clone();
+        let task = tokio::spawn(async move {
+            approvals
+                .request(container_request(SecurityMode::Approval, "ctx"))
+                .await
+        });
+        let id = h.next_pending_id().await;
+        assert_eq!(
+            h.state().approvals.respond(id, true, None).await,
+            Err("vault is locked".into())
+        );
+        assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn classification_is_fixed_at_creation() {
+        let h = Harness::unlocked(FakeVerifier::unavailable()).await;
+        let (id, task) = spawn_agent_request(&h).await; // born unprotected
+        h.fake
+            .set_availability(sv_presence::Availability::Protected { modalities: vec![] });
+        h.state().approvals.respond(id, true, None).await.unwrap();
+        assert_eq!(task.await.unwrap(), Ok(()));
+        assert_eq!(
+            h.fake.calls(),
+            0,
+            "a request born unprotected never silently becomes protected"
         );
     }
 
