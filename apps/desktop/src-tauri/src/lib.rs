@@ -76,6 +76,7 @@ const APPROVAL_TIMEOUT_SECS: u64 = 120;
 
 type SharedHandle = Arc<Mutex<Option<VaultHandle>>>;
 
+mod presence;
 /// Remediation persistence (plan P8): the desktop `VaultSink` over the
 /// vault handle. P9 wires the plan registry and Tauri commands on top.
 mod remediate;
@@ -111,13 +112,6 @@ fn request_signature(request: &sv_mcp::AccessRequest) -> String {
         request.agent_id,
         request.authorization_context
     )
-}
-
-/// Compare a pending approval identity with a request. The authorization
-/// context is part of both values, so a changed MCP argument envelope cannot
-/// collapse onto (and inherit approval from) an earlier pending request.
-fn matches_pending_approval(signature: &str, request: &sv_mcp::AccessRequest) -> bool {
-    signature == request_signature(request)
 }
 
 #[derive(Clone, Serialize)]
@@ -300,6 +294,10 @@ fn generate_otp_code() -> Result<String, String> {
 
 struct ApprovalState<R: Runtime = tauri::Wry> {
     app: AppHandle<R>,
+    /// Presence coordinator for the approve transition (Tasks 8+ add the
+    /// gates; the field is wired now so every surface shares one queue).
+    #[allow(dead_code)] // consumed by the gates added in Tasks 8+
+    presence: Arc<sv_presence::PresenceCoordinator>,
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, PendingApproval>>,
     /// Outstanding OTP challenges keyed by request signature.
@@ -320,10 +318,104 @@ enum TrayMirror {
     No,
 }
 
+/// What a click-approval modal shows and binds. Agent requests convert
+/// from `AccessRequest`; desktop-originated gates (ADR-0025 §7.5) build one
+/// directly, because most of them have no `AccessAction`.
+#[derive(Clone)]
+struct ClickRequest {
+    action_label: String,
+    audit_action: AuditAction,
+    /// `Some` only for requests that may be mirrored to the tray.
+    tray_label: Option<&'static str>,
+    container: Option<String>,
+    file_name: Option<String>,
+    mode: Option<SecurityMode>,
+    byte_size: Option<usize>,
+    import_summary: Option<sv_mcp::ImportApprovalSummary>,
+    signature: String,
+    /// Bound into the verification digest by the gates (Tasks 8+).
+    #[allow(dead_code)]
+    op: sv_presence::OpDescriptor,
+    /// Consent that may complete while the vault is locked or absent. Set
+    /// ONLY by `desktop_pre_unlock` (keychain unlock, init); an MCP request
+    /// can never carry it (D5, round-3 review).
+    #[allow(dead_code)] // read by the gates added in Tasks 8+/13
+    pre_unlock: bool,
+}
+
+impl ClickRequest {
+    fn from_access(request: &sv_mcp::AccessRequest) -> Self {
+        Self {
+            action_label: format!("{:?}", request.action),
+            audit_action: audit_action_for(&request.action),
+            tray_label: Some(tray::action_label(&request.action)),
+            container: request.container.clone(),
+            file_name: request.file_name.clone(),
+            mode: request.mode,
+            byte_size: request.byte_size,
+            import_summary: request.import_summary.clone(),
+            signature: request_signature(request),
+            op: op_for_access(request),
+            pre_unlock: false,
+        }
+    }
+
+    fn desktop(label: &str, audit_action: AuditAction, op: sv_presence::OpDescriptor) -> Self {
+        Self {
+            action_label: label.to_string(),
+            audit_action,
+            tray_label: None,
+            container: None,
+            file_name: None,
+            mode: None,
+            byte_size: None,
+            import_summary: None,
+            signature: format!("desktop|{}", op.digest().to_hex()),
+            op,
+            pre_unlock: false,
+        }
+    }
+
+    /// The declared consent click of `vault_unlock` (keychain) and
+    /// `vault_init`: the only clicks that can be approved without a vault.
+    /// Their audit happens at commit, under the handle guard (Task 13).
+    #[allow(dead_code)] // used by the pre-unlock gates added in Task 13
+    fn desktop_pre_unlock(
+        label: &str,
+        audit_action: AuditAction,
+        op: sv_presence::OpDescriptor,
+    ) -> Self {
+        Self {
+            pre_unlock: true,
+            ..Self::desktop(label, audit_action, op)
+        }
+    }
+}
+
+/// The complete description of an MCP request (§6.3). `request_click`
+/// appends the request id.
+fn op_for_access(request: &sv_mcp::AccessRequest) -> sv_presence::OpDescriptor {
+    sv_presence::OpDescriptor::new("mcp_request")
+        .field("action", format!("{:?}", request.action))
+        .field("container", request.container.clone().unwrap_or_default())
+        .field("file", request.file_name.clone().unwrap_or_default())
+        .field("agent", request.agent_id.clone().unwrap_or_default())
+        .bind("mode", request.mode.map(|m| m.as_str()).unwrap_or(""))
+        .bind(
+            "byte_size",
+            request.byte_size.map(|b| b.to_string()).unwrap_or_default(),
+        )
+        .bind(
+            "authorization_context",
+            request.authorization_context.clone(),
+        )
+}
+
 impl<R: Runtime> ApprovalState<R> {
-    fn new(app: AppHandle<R>) -> Self {
+    fn new(app: AppHandle<R>, presence: Arc<sv_presence::PresenceCoordinator>) -> Self {
         Self {
             app,
+            presence,
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             otp_pending: Mutex::new(HashMap::new()),
@@ -556,7 +648,8 @@ impl<R: Runtime> ApprovalState<R> {
         // OTP caller through this click path, and the tray renders while the
         // vault is locked, so mirroring it would put an OTP-container
         // confirmation on a surface the OTP escalation exists to avoid.
-        self.request_click(request, TrayMirror::No).await
+        self.request_click(ClickRequest::from_access(&request), TrayMirror::No)
+            .await
     }
 
     async fn request(&self, request: sv_mcp::AccessRequest) -> Result<(), String> {
@@ -567,7 +660,8 @@ impl<R: Runtime> ApprovalState<R> {
         }
         // An agent's request: the user may be in another application, which is
         // the whole reason the tray menu exists (ADR-0022).
-        self.request_click(request, TrayMirror::Yes).await
+        self.request_click(ClickRequest::from_access(&request), TrayMirror::Yes)
+            .await
     }
 
     /// The click-approval flow: emit a modal, optionally mirror it to the tray,
@@ -577,13 +671,9 @@ impl<R: Runtime> ApprovalState<R> {
     /// is a parameter rather than an inference from the request, because the
     /// distinction is about WHO IS WAITING -- an absent user or one already at
     /// the modal -- which the request itself does not record.
-    async fn request_click(
-        &self,
-        request: sv_mcp::AccessRequest,
-        mirror: TrayMirror,
-    ) -> Result<(), String> {
+    async fn request_click(&self, click: ClickRequest, mirror: TrayMirror) -> Result<(), String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let signature = request_signature(&request);
+        let signature = click.signature;
         let (tx, rx) = oneshot::channel();
         let superseded: Vec<u64> = {
             let mut pending = self.pending.lock().await;
@@ -593,7 +683,7 @@ impl<R: Runtime> ApprovalState<R> {
             // call) instead of stacking a second modal.
             let stale: Vec<u64> = pending
                 .iter()
-                .filter(|(_, p)| matches_pending_approval(&p.signature, &request))
+                .filter(|(_, p)| p.signature == signature)
                 .map(|(k, _)| *k)
                 .collect();
             for old in &stale {
@@ -622,24 +712,29 @@ impl<R: Runtime> ApprovalState<R> {
 
         let payload = ApprovalPrompt {
             id,
-            action: format!("{:?}", request.action),
-            container: request.container.clone(),
-            file_name: request.file_name.clone(),
-            mode: request.mode.map(|m| m.as_str().to_string()),
-            byte_size: request.byte_size,
+            action: click.action_label.clone(),
+            container: click.container.clone(),
+            file_name: click.file_name.clone(),
+            mode: click.mode.map(|m| m.as_str().to_string()),
+            byte_size: click.byte_size,
             otp_code: None,
-            import_summary: request.import_summary.clone(),
+            import_summary: click.import_summary.clone(),
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
         // Mirror this request into the tray menu. Only the click path does
         // this: an OTP request must stay answerable at the desktop only, and
-        // `handle_otp` returns before ever reaching here.
+        // `handle_otp` returns before ever reaching here. Desktop-raised
+        // prompts carry no tray label at all: most of them are not agent
+        // requests and have no audience elsewhere (ADR-0025 §7.5).
         if mirror == TrayMirror::Yes {
-            if let Some(tray_state) = self.app.try_state::<tray::TrayApprovals>() {
+            if let (Some(label), Some(tray_state)) = (
+                click.tray_label,
+                self.app.try_state::<tray::TrayApprovals>(),
+            ) {
                 tray_state.insert(tray::TrayApproval {
                     id,
-                    action_label: tray::action_label(&request.action),
-                    audit_action: audit_action_for(&request.action),
+                    action_label: label,
+                    audit_action: click.audit_action,
                 });
             }
             tray::refresh(&self.app);
@@ -696,6 +791,28 @@ impl<R: Runtime> ApprovalState<R> {
         }
         tray::refresh(&self.app);
         sent
+    }
+
+    /// A lock ends every pending decision (spec §6.1): refuse each waiting
+    /// approval, drop every OTP challenge, and clear their modals.
+    async fn clear_all(&self) {
+        let drained: Vec<(u64, PendingApproval)> = self.pending.lock().await.drain().collect();
+        for (id, pending) in drained {
+            let _ = pending.tx.send(false);
+            let _ = self.app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id });
+        }
+        let challenges: Vec<OtpChallenge> = self
+            .otp_pending
+            .lock()
+            .await
+            .drain()
+            .map(|(_, c)| c)
+            .collect();
+        for chal in challenges {
+            let _ = self
+                .app
+                .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: chal.modal_id });
+        }
     }
 }
 
@@ -1197,6 +1314,7 @@ struct SessionMonitorState<R: Runtime = tauri::Wry> {
     handle: SharedHandle,
     servers: Arc<Mutex<Option<ServersShutdown>>>,
     timer: SessionTimer,
+    approvals: Arc<ApprovalState<R>>,
 }
 
 /// Self-contained desktop session timer. Kept separate from [`VaultState`] so
@@ -1213,9 +1331,12 @@ struct SessionTimer {
     /// When the vault was unlocked, if it currently is.
     unlocked_at: Arc<Mutex<Option<Instant>>>,
     /// Seconds of inactivity before auto-lock.
-    idle_timeout_secs: Arc<Mutex<u64>>,
+    idle_timeout_secs: Arc<AtomicU64>,
     /// Maximum seconds a single unlock can last, regardless of activity.
-    absolute_session_secs: Arc<Mutex<u64>>,
+    absolute_session_secs: Arc<AtomicU64>,
+    /// Advances on every unlock and every lock, under the handle guard
+    /// (plan D4). The session id derives from it.
+    epoch: Arc<AtomicU64>,
 }
 
 impl SessionTimer {
@@ -1223,8 +1344,9 @@ impl SessionTimer {
         Self {
             last_activity: Arc::new(Mutex::new(Instant::now())),
             unlocked_at: Arc::new(Mutex::new(None)),
-            idle_timeout_secs: Arc::new(Mutex::new(DEFAULT_IDLE_TIMEOUT_SECS)),
-            absolute_session_secs: Arc::new(Mutex::new(DEFAULT_ABSOLUTE_SESSION_SECS)),
+            idle_timeout_secs: Arc::new(AtomicU64::new(DEFAULT_IDLE_TIMEOUT_SECS)),
+            absolute_session_secs: Arc::new(AtomicU64::new(DEFAULT_ABSOLUTE_SESSION_SECS)),
+            epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1242,6 +1364,7 @@ impl SessionTimer {
 
     /// Record that the vault is now unlocked, starting both timers.
     fn set_unlocked(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         let now = Instant::now();
         if let Ok(mut guard) = self.unlocked_at.try_lock() {
             *guard = Some(now);
@@ -1251,14 +1374,36 @@ impl SessionTimer {
         }
     }
 
+    /// Changes on every unlock and every lock (plan D4). A gate captures it
+    /// before the native prompt and requires it unchanged afterwards.
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Record that the vault is now locked.
+    fn set_locked(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut guard) = self.unlocked_at.try_lock() {
+            *guard = None;
+        }
+    }
+
     /// Set the two session limits.
     fn set_limits(&self, idle_secs: u64, absolute_secs: u64) {
-        if let Ok(mut guard) = self.idle_timeout_secs.try_lock() {
-            *guard = idle_secs.max(1);
-        }
-        if let Ok(mut guard) = self.absolute_session_secs.try_lock() {
-            *guard = absolute_secs.max(1);
-        }
+        self.idle_timeout_secs
+            .store(idle_secs.max(1), Ordering::SeqCst);
+        self.absolute_session_secs
+            .store(absolute_secs.max(1), Ordering::SeqCst);
+    }
+
+    /// The two session limits as they currently are. Never silently skipped:
+    /// plain atomic loads and stores (plan D15 reads them for its comparison).
+    #[allow(dead_code)] // consumed by the D15 comparison in Task 15
+    fn limits(&self) -> (u64, u64) {
+        (
+            self.idle_timeout_secs.load(Ordering::SeqCst),
+            self.absolute_session_secs.load(Ordering::SeqCst),
+        )
     }
 
     /// Compute remaining seconds before idle or absolute lock, if unlocked.
@@ -1271,16 +1416,8 @@ impl SessionTimer {
             Some(g) => *g,
             None => return (None, None),
         };
-        let idle_limit = self
-            .idle_timeout_secs
-            .try_lock()
-            .map(|g| *g)
-            .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
-        let absolute_limit = self
-            .absolute_session_secs
-            .try_lock()
-            .map(|g| *g)
-            .unwrap_or(DEFAULT_ABSOLUTE_SESSION_SECS);
+        let idle_limit = self.idle_timeout_secs.load(Ordering::SeqCst);
+        let absolute_limit = self.absolute_session_secs.load(Ordering::SeqCst);
         let idle_remaining = idle_limit.saturating_sub(idle.elapsed().as_secs());
         let absolute_remaining = absolute_limit.saturating_sub(unlocked.elapsed().as_secs());
         (Some(idle_remaining), Some(absolute_remaining))
@@ -1292,6 +1429,10 @@ struct VaultState<R: Runtime = tauri::Wry> {
     app: AppHandle<R>,
     handle: SharedHandle,
     approvals: Arc<ApprovalState<R>>,
+    /// ADR-0025 presence coordinator: one native prompt at a time behind a
+    /// bounded queue. Read by the gated commands (Tasks 8+).
+    #[allow(dead_code)] // consumed by the gates added in Tasks 8+
+    presence: Arc<sv_presence::PresenceCoordinator>,
     servers: Arc<Mutex<Option<ServersShutdown>>>,
     /// Scan reports that were produced in this process and still have a live
     /// per-scan salt. Findings loaded from disk do not appear here, so their
@@ -1314,15 +1455,27 @@ struct VaultState<R: Runtime = tauri::Wry> {
     /// duplicate monitors on every unlock (a leaked second monitor is harmless
     /// but noisy; we drop the old JoinHandle before spawning a new one).
     session_monitor: Mutex<Option<JoinHandle<()>>>,
+    /// Tests only: keeps a MockRuntime harness out of the real app-data
+    /// directory.
+    root_override: Option<PathBuf>,
 }
 
 impl<R: Runtime> VaultState<R> {
     fn new(app: AppHandle<R>) -> Self {
-        let approvals = Arc::new(ApprovalState::<R>::new(app.clone()));
+        Self::new_with(app.clone(), presence::build_coordinator(&app), None)
+    }
+
+    fn new_with(
+        app: AppHandle<R>,
+        presence: Arc<sv_presence::PresenceCoordinator>,
+        root_override: Option<PathBuf>,
+    ) -> Self {
+        let approvals = Arc::new(ApprovalState::<R>::new(app.clone(), presence.clone()));
         Self {
             app: app.clone(),
             handle: Arc::new(Mutex::new(None)),
             approvals,
+            presence,
             servers: Arc::new(Mutex::new(None)),
             active_scans: Mutex::new(HashMap::new()),
             session_timer: SessionTimer::new(),
@@ -1330,7 +1483,21 @@ impl<R: Runtime> VaultState<R> {
             leases: Arc::new(LeaseStore::new()),
             pending_plans: Arc::new(Mutex::new(HashMap::new())),
             session_monitor: Mutex::new(None),
+            root_override,
         }
+    }
+
+    /// Publish an unlocked handle and advance the epoch under the SAME
+    /// guard, before servers start or any access is released.
+    fn publish_unlocked(&self, guard: &mut Option<VaultHandle>, handle: VaultHandle) {
+        *guard = Some(handle);
+        self.session_timer.set_unlocked();
+    }
+
+    /// Withdraw the handle and advance the epoch under the same guard.
+    fn publish_locked(&self, guard: &mut Option<VaultHandle>) {
+        *guard = None;
+        self.session_timer.set_locked();
     }
 
     /// Build a monitor-state snapshot for the background task.
@@ -1340,6 +1507,7 @@ impl<R: Runtime> VaultState<R> {
             handle: self.handle.clone(),
             servers: self.servers.clone(),
             timer: self.session_timer.clone(),
+            approvals: self.approvals.clone(),
         }
     }
 
@@ -1358,11 +1526,6 @@ impl<R: Runtime> VaultState<R> {
         self.session_timer.touch_human_activity();
     }
 
-    /// Record that the vault is now unlocked, starting both timers.
-    fn set_unlocked(&self) {
-        self.session_timer.set_unlocked();
-    }
-
     /// Set the two session limits.
     fn set_limits(&self, idle_secs: u64, absolute_secs: u64) {
         self.session_timer.set_limits(idle_secs, absolute_secs);
@@ -1374,15 +1537,11 @@ impl<R: Runtime> VaultState<R> {
     }
 
     fn session_id(&self) -> String {
-        // The session is identified by the unlock instant, which changes on
-        // every lock/unlock cycle. This is coarse but sufficient for lease
-        // binding: a lease issued in one unlock cannot outlive the next lock.
-        self.session_timer
-            .unlocked_at
-            .try_lock()
-            .ok()
-            .and_then(|g| g.map(|i| format!("{:?}", i)))
-            .unwrap_or_else(|| "locked".into())
+        // The session is identified by the epoch, which changes on every
+        // lock and every unlock (plan D4). A lock changes it; so does every
+        // unlock. Wake authorizations and leases are therefore bound to
+        // exactly one unlock.
+        format!("session-{}", self.session_timer.epoch())
     }
 }
 
@@ -1742,8 +1901,16 @@ fn vault_root<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     Ok(dir.join("sovereign-vault"))
 }
 
+/// The vault root for a state: the test override, else the app-data path.
+fn state_root<R: Runtime>(state: &VaultState<R>) -> Result<PathBuf, String> {
+    match &state.root_override {
+        Some(root) => Ok(root.clone()),
+        None => vault_root(&state.app),
+    }
+}
+
 fn audit_root<R: Runtime>(state: &VaultState<R>) -> Result<PathBuf, String> {
-    vault_root(&state.app)
+    state_root(state)
 }
 
 fn desktop_event(
@@ -1847,6 +2014,30 @@ fn record_desktop_event<R: Runtime>(state: &VaultState<R>, event: AuditEvent) {
     let audit_hmac_key = handle.audit_hmac_key();
     if let Ok(log) = AuditLog::with_hmac_key(&root, audit_hmac_key) {
         let _ = log.record(&event);
+    }
+}
+
+/// Record with a handle the caller already holds. Used inside
+/// `with_gated_handle`, so an Allowed record is written before the lock that
+/// guards the release is released.
+#[allow(dead_code)] // consumed by `with_gated_handle` added in Task 9
+fn record_with_handle<R: Runtime>(state: &VaultState<R>, handle: &VaultHandle, event: AuditEvent) {
+    let Ok(root) = audit_root(state) else {
+        return;
+    };
+    if let Ok(log) = AuditLog::with_hmac_key(&root, handle.audit_hmac_key()) {
+        let _ = log.record(&event);
+    }
+}
+
+/// Like `record_desktop_event`, but waits for the handle instead of
+/// skipping on contention. Only a locked vault (no key) skips: the declared
+/// D5 exception. Never call it while holding `state.handle`.
+#[allow(dead_code)] // consumed by the denial writers added in Tasks 8+
+async fn record_desktop_event_locked<R: Runtime>(state: &VaultState<R>, event: AuditEvent) {
+    let guard = state.handle.lock().await;
+    if let Some(handle) = guard.as_ref() {
+        record_with_handle(state, handle, event);
     }
 }
 
@@ -2075,15 +2266,23 @@ fn approval_requirement(request: &sv_mcp::AccessRequest) -> Result<ApprovalPromp
     }
 }
 
-async fn with_handle<R, F>(state: &State<'_, VaultState>, f: F) -> Result<R, String>
+async fn with_handle_in<R, T, F>(state: &VaultState<R>, f: F) -> Result<T, String>
 where
-    F: FnOnce(&VaultHandle) -> Result<R, String>,
+    R: Runtime,
+    F: FnOnce(&VaultHandle) -> Result<T, String>,
 {
     let guard = state.handle.lock().await;
     let handle = guard
         .as_ref()
         .ok_or_else(|| "vault is locked".to_string())?;
     f(handle)
+}
+
+async fn with_handle<R, F>(state: &State<'_, VaultState>, f: F) -> Result<R, String>
+where
+    F: FnOnce(&VaultHandle) -> Result<R, String>,
+{
+    with_handle_in(state.inner(), f).await
 }
 
 /// Check whether the vault is currently unlocked, without refreshing any
@@ -2204,12 +2403,23 @@ async fn require_desktop_consent<R: Runtime>(
     state.approvals.request_click_only(request).await
 }
 
-async fn container_mode(state: &State<'_, VaultState>, container: &str) -> Option<SecurityMode> {
-    with_handle(state, |handle| {
+/// Container mode of `container` for a generic state. Used by the gated
+/// desktop commands (Tasks 9+), which hold a `&VaultState<R>`, not a
+/// `State<'_, VaultState>`.
+#[allow(dead_code)] // consumed by the gated commands added in Tasks 9+
+async fn container_mode_in<R: Runtime>(
+    state: &VaultState<R>,
+    container: &str,
+) -> Option<SecurityMode> {
+    with_handle_in(state, |handle| {
         handle.container_mode(container).map_err(estr)
     })
     .await
     .ok()
+}
+
+async fn container_mode(state: &State<'_, VaultState>, container: &str) -> Option<SecurityMode> {
+    container_mode_in(state.inner(), container).await
 }
 
 #[tauri::command]
@@ -2281,9 +2491,8 @@ async fn vault_init(
 
     {
         let mut guard = state.handle.lock().await;
-        *guard = Some(handle);
+        state.publish_unlocked(&mut guard, handle);
     }
-    state.set_unlocked();
     state.restart_session_monitor().await;
 
     // Initialization is already durably committed at this point, and the
@@ -2366,11 +2575,11 @@ async fn vault_unlock(
     };
     {
         let mut guard = state.handle.lock().await;
-        *guard = Some(handle);
+        state.publish_unlocked(&mut guard, handle);
     }
     if let Err(error) = start_servers(&state).await {
         let mut guard = state.handle.lock().await;
-        *guard = None;
+        state.publish_locked(&mut guard);
         record_desktop_event(
             &state,
             desktop_event(
@@ -2385,7 +2594,6 @@ async fn vault_unlock(
         );
         return Err(error);
     }
-    state.set_unlocked();
     state.restart_session_monitor().await;
     record_desktop_event(
         &state,
@@ -2429,11 +2637,11 @@ async fn vault_unlock_recovery(
     };
     {
         let mut guard = state.handle.lock().await;
-        *guard = Some(handle);
+        state.publish_unlocked(&mut guard, handle);
     }
     if let Err(error) = start_servers(&state).await {
         let mut guard = state.handle.lock().await;
-        *guard = None;
+        state.publish_locked(&mut guard);
         record_desktop_event(
             &state,
             desktop_event(
@@ -2448,7 +2656,6 @@ async fn vault_unlock_recovery(
         );
         return Err(error);
     }
-    state.set_unlocked();
     state.restart_session_monitor().await;
     record_desktop_event(
         &state,
@@ -2479,7 +2686,7 @@ async fn vault_unlock_recovery(
 
 #[tauri::command]
 async fn vault_lock(state: State<'_, VaultState>) -> Result<(), String> {
-    perform_vault_lock(&state, "manual").await;
+    perform_vault_lock(state.inner(), "manual").await;
     Ok(())
 }
 
@@ -2490,9 +2697,11 @@ async fn vault_lock(state: State<'_, VaultState>) -> Result<(), String> {
 ///
 /// ADR-0020 §9: locking cannot retract bytes already delivered to an agent or
 /// process. Auto-lock stops future access; it does not recall what already left.
-async fn perform_vault_lock(state: &VaultState, reason: &str) {
+async fn perform_vault_lock<R: Runtime>(state: &VaultState<R>, reason: &str) {
     let mut guard = state.handle.lock().await;
-    *guard = None;
+    state.publish_locked(&mut guard);
+    // A lock ends every pending decision (spec §6.1).
+    state.approvals.clear_all().await;
     // Pending plans do not survive a lock. A plan is a snapshot-bound
     // authorization to delete a specific file; carrying one across a lock
     // would let a decision taken in one session be executed in the next,
@@ -2525,10 +2734,8 @@ async fn perform_vault_lock(state: &VaultState, reason: &str) {
             }
         }
     }
-    // Clear session bookkeeping so the monitor stops counting against this session.
-    if let Ok(mut guard) = state.session_timer.unlocked_at.try_lock() {
-        *guard = None;
-    }
+    // The session bookkeeping already moved with the handle, under this same
+    // guard, at publication (`publish_locked`).
     let mut event = desktop_event(
         AuditAction::VaultLock,
         AuditDecision::Allowed,
@@ -2575,6 +2782,11 @@ fn spawn_session_monitor<R: Runtime>(state: SessionMonitorState<R>) -> JoinHandl
 async fn perform_vault_lock_internal<R: Runtime>(state: &SessionMonitorState<R>, reason: &str) {
     let mut guard = state.handle.lock().await;
     *guard = None;
+    // Same publication effect as `VaultState::publish_locked`, done under
+    // this same guard: the monitor owns no `VaultState`.
+    state.timer.set_locked();
+    // A lock ends every pending decision (spec §6.1).
+    state.approvals.clear_all().await;
     {
         let mut server_guard = state.servers.lock().await;
         if let Some(mut servers) = server_guard.take() {
@@ -2591,9 +2803,6 @@ async fn perform_vault_lock_internal<R: Runtime>(state: &SessionMonitorState<R>,
                 let _ = task.await;
             }
         }
-    }
-    if let Ok(mut guard) = state.timer.unlocked_at.try_lock() {
-        *guard = None;
     }
     let mut event = desktop_event(
         AuditAction::VaultLock,
@@ -4993,6 +5202,185 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sv_presence::fake::FakeVerifier;
+    use tauri::test::MockRuntime;
+
+    const TEST_PASSPHRASE: &str = "correct horse battery staple";
+
+    struct Harness {
+        app: tauri::App<MockRuntime>,
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        /// Read by the scripted-approval tests added in Tasks 8+ (the gates).
+        #[allow(dead_code)]
+        fake: Arc<FakeVerifier>,
+    }
+
+    impl Harness {
+        fn new(fake: Arc<FakeVerifier>) -> Self {
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("sovereign-vault");
+            let presence = Arc::new(sv_presence::PresenceCoordinator::new(fake.clone()));
+            app.manage(VaultState::new_with(
+                app.handle().clone(),
+                presence,
+                Some(root.clone()),
+            ));
+            Self {
+                app,
+                _dir: dir,
+                root,
+                fake,
+            }
+        }
+
+        /// A harness with a real passphrase-custody vault, unlocked.
+        async fn unlocked(fake: Arc<FakeVerifier>) -> Self {
+            let h = Self::new(fake);
+            let boot =
+                VaultHandle::bootstrap(&h.root, CustodyMode::Passphrase, Some(TEST_PASSPHRASE))
+                    .unwrap();
+            let mut guard = h.state().handle.lock().await;
+            h.state().publish_unlocked(&mut guard, boot.handle);
+            drop(guard);
+            h
+        }
+
+        /// A plain reference, so generic `_impl<R>` functions infer `R` without
+        /// relying on deref coercion through `tauri::State`.
+        fn state(&self) -> &VaultState<MockRuntime> {
+            self.app.state::<VaultState<MockRuntime>>().inner()
+        }
+
+        /// Wait (bounded) for the next pending click-approval id.
+        async fn next_pending_id(&self) -> u64 {
+            for _ in 0..200 {
+                if let Some(id) = self
+                    .state()
+                    .approvals
+                    .pending
+                    .lock()
+                    .await
+                    .keys()
+                    .min()
+                    .copied()
+                {
+                    return id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("no pending approval appeared");
+        }
+
+        fn audit_text(&self) -> String {
+            std::fs::read_to_string(self.root.join("audit.jsonl")).unwrap_or_default()
+        }
+
+        /// Structured audit events (the `event` object of each record), oldest
+        /// first. Tests assert on these fields, never on substrings (D5).
+        fn audit_events(&self) -> Vec<serde_json::Value> {
+            self.audit_text()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .map(|record| record["event"].clone())
+                .collect()
+        }
+
+        /// Events carrying a `presence` field, as `(action, decision, presence)`.
+        /// Used by the presence-audit tests added in Tasks 8+.
+        #[allow(dead_code)]
+        fn presence_events(&self) -> Vec<(String, String, serde_json::Value)> {
+            self.audit_events()
+                .into_iter()
+                .filter(|e| !e["presence"].is_null())
+                .map(|e| {
+                    (
+                        e["action"].to_string(),
+                        e["decision"].to_string(),
+                        e["presence"].clone(),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_hosts_vault_state_on_mock_runtime() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        assert!(h.state().handle.lock().await.is_some());
+        assert_eq!(state_root(h.state()).unwrap(), h.root);
+        assert!(h.state().presence.classify().is_protected());
+    }
+
+    #[tokio::test]
+    async fn locked_writer_records_under_contention() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let state = h.state();
+        let hold = state.handle.lock().await; // contention
+        let writer = record_desktop_event_locked(
+            state,
+            AuditEvent::new(AuditAction::VaultInfo, AuditDecision::Allowed, "desktop-ui"),
+        );
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(hold);
+        };
+        tokio::join!(writer, release);
+        assert!(h.audit_events().iter().any(|e| e["action"] == "vault_info"));
+    }
+
+    #[tokio::test]
+    async fn lock_refuses_pending_approvals_and_bumps_epoch() {
+        let h = Harness::unlocked(FakeVerifier::unavailable()).await;
+        let state = h.state();
+        let epoch = state.session_timer.epoch();
+        let approvals = state.approvals.clone();
+        let waiting = tokio::spawn(async move {
+            approvals
+                .request(container_request(SecurityMode::Approval, "ctx"))
+                .await
+        });
+        let _ = h.next_pending_id().await;
+        perform_vault_lock(state, "manual").await;
+        assert_eq!(waiting.await.unwrap(), Err("access denied by user".into()));
+        assert_ne!(state.session_timer.epoch(), epoch);
+    }
+
+    /// Plan D4: the epoch and the unlocked timer move only at publication.
+    #[test]
+    fn session_transitions_happen_only_at_publication() {
+        let src = include_str!("lib.rs");
+        let body = src.split("#[cfg(test)]").next().unwrap();
+        let calls = body.matches(".set_locked()").count() + body.matches(".set_unlocked()").count();
+        // publish_locked, publish_unlocked, and the monitor's lock line.
+        assert_eq!(calls, 3, "session transitions outside publication: {calls}");
+    }
+
+    /// A lock followed at once by an unlock: the old lock flow cannot touch
+    /// the new session, because it holds the handle guard until it finishes.
+    #[tokio::test]
+    async fn lock_then_immediate_unlock_leaves_the_new_session_intact() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let state = h.state();
+        let start = state.session_timer.epoch();
+        let root = h.root.clone();
+        let lock = perform_vault_lock(state, "manual");
+        let unlock = async {
+            tokio::task::yield_now().await;
+            let mut guard = state.handle.lock().await;
+            let handle =
+                VaultHandle::unlock(&root, CustodyMode::Passphrase, Some(TEST_PASSPHRASE)).unwrap();
+            state.publish_unlocked(&mut guard, handle);
+        };
+        tokio::join!(lock, unlock);
+        assert_eq!(state.session_timer.epoch(), start + 2);
+        assert!(state.handle.lock().await.is_some());
+        assert!(
+            state.session_timer.remaining_secs().0.is_some(),
+            "the new session's timer is running"
+        );
+    }
 
     /// The regression this change exists for.
     ///
@@ -5299,9 +5687,10 @@ mod tests {
         let changed = import_request("context-for-broader-import");
         let approved_signature = request_signature(&approved);
 
-        assert!(matches_pending_approval(&approved_signature, &approved));
-        assert!(
-            !matches_pending_approval(&approved_signature, &changed),
+        assert_eq!(request_signature(&approved), approved_signature);
+        assert_ne!(
+            request_signature(&changed),
+            approved_signature,
             "an approval for one import envelope must not match another"
         );
     }
@@ -5323,10 +5712,11 @@ mod tests {
             request_signature(&create_only),
             request_signature(&replacement)
         );
-        assert!(!matches_pending_approval(
-            &request_signature(&create_only),
-            &replacement
-        ));
+        assert_ne!(
+            request_signature(&create_only),
+            request_signature(&replacement),
+            "a broader scope must not collapse onto the narrower approval"
+        );
     }
 
     #[test]
