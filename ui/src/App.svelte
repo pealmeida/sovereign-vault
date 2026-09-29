@@ -40,6 +40,7 @@
   onMount(() => {
     let unlisten: (() => void) | undefined;
     let unlistenCancel: (() => void) | undefined;
+    let unlistenFocus: (() => void) | undefined;
     let unlistenWake: (() => void) | undefined;
     let unlistenWakeCancel: (() => void) | undefined;
 
@@ -67,6 +68,11 @@
       unlistenCancel = await listen<{ id: number }>('vault://approval-cancel', (ev) => {
         approvalStore.remove(ev.payload.id);
       });
+      // Tray "Review…" brings one request's modal to the front; approval
+      // happens in the modal behind the OS presence prompt (ADR-0025 §7.2).
+      unlistenFocus = await listen<{ id: number }>('vault://approval-focus', (ev) => {
+        approvalStore.focus(ev.payload.id);
+      });
       // Wake-on-demand notifications arrive while locked or unlocked, but the
       // UI indicator is only shown after unlock (ADR-0020 §7-8).
       unlistenWake = await listen<WakePrompt>('vault://wake-request', (ev) => {
@@ -80,6 +86,7 @@
     return () => {
       unlisten?.();
       unlistenCancel?.();
+      unlistenFocus?.();
       unlistenWake?.();
       unlistenWakeCancel?.();
     };
