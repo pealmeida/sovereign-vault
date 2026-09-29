@@ -6,7 +6,7 @@
 //! plugin's Actions API (`register_action_types`) is implemented only in its
 //! mobile backend, and the desktop backend drops the `notify_rust` handle that
 //! would receive a click. The tray is the one always-reachable surface that
-//! *can* hold Approve/Deny controls while the user is working in another app.
+//! *can* hold Review/Deny controls while the user is working in another app.
 //!
 //! # What a menu item may say
 //!
@@ -24,9 +24,13 @@
 //! common case (recognising the request you just triggered) without turning a
 //! transient prompt into a durable on-screen disclosure.
 //!
-//! # What may be approved here
+//! # What a menu item may decide (ADR-0025 §7.2, revision of ADR-0022)
 //!
-//! Only click-approvals ever reach this menu. OTP-mode requests never become
+//! Deny stays a direct decision: refusing never requires presence. Approve
+//! does NOT approve from the tray any more — the menu item is "Review…", and
+//! it brings the request's modal to the front, where the OS presence prompt
+//! runs, so a synthetic click on the tray cannot approve anything. Only
+//! click-approvals ever reach this menu. OTP-mode requests never become
 //! pending approvals at all: `handle_otp` returns an error and requires the
 //! agent to resend with a code shown on the desktop. That escalation exists
 //! precisely so the decision requires presence at the machine, and the tray
@@ -184,7 +188,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, pending: &[TrayApproval]) -> tauri
             // adjacent in a flat list, where a mis-click lands on the opposite
             // decision. The submenu label carries the action class only.
             let approve =
-                MenuItemBuilder::with_id(format!("{APPROVE_PREFIX}{}", approval.id), "Approve")
+                MenuItemBuilder::with_id(format!("{APPROVE_PREFIX}{}", approval.id), "Review…")
                     .build(app)?;
             let deny = MenuItemBuilder::with_id(format!("{DENY_PREFIX}{}", approval.id), "Deny")
                 .build(app)?;

@@ -66,6 +66,10 @@ use tokio::sync::{oneshot, Mutex};
 const RPC_PORT: u16 = 9944;
 const APPROVAL_EVENT: &str = "vault://approval-request";
 const APPROVAL_CANCEL_EVENT: &str = "vault://approval-cancel";
+/// The tray "Review…" action brings one request's modal to the front; the
+/// approval itself happens there, behind the OS presence prompt (ADR-0025
+/// §7.2, revision of ADR-0022).
+const APPROVAL_FOCUS_EVENT: &str = "vault://approval-focus";
 const WAKE_EVENT: &str = "vault://wake-request";
 const WAKE_CANCEL_EVENT: &str = "vault://wake-cancel";
 const WAKE_LEASE_EVENT: &str = "vault://wake-lease";
@@ -2199,9 +2203,10 @@ async fn respond_from_tray<R: Runtime>(app: &AppHandle<R>, id: u64, approved: bo
 
     // A request missing from the registry is not decided here at all:
     // without a truthful row there is nothing to answer from, and the app
-    // remains the way to answer. (Task 8: `respond`/`refuse_from` now record
-    // the decision themselves; Task 9 routes the tray through
-    // `refuse_from(id, "desktop-tray")` to restore the tray transport.)
+    // remains the way to answer. (Task 8: `respond`/`refuse_from` record
+    // the decision themselves; this path routes denials through
+    // `refuse_from(id, "desktop-tray")` so a reviewer can tell a tray
+    // refusal from an in-app one.)
     let listed = app
         .try_state::<tray::TrayApprovals>()
         .is_some_and(|s| s.snapshot().into_iter().any(|a| a.id == id));
@@ -2214,11 +2219,14 @@ async fn respond_from_tray<R: Runtime>(app: &AppHandle<R>, id: u64, approved: bo
     // app, so it refreshes the idle timer the same way `approval_respond` does.
     state.touch_human_activity();
 
-    // No OTP is ever passed from the tray: OTP-mode requests never enter the
-    // tray registry, and `respond` rejects an approval whose pending entry
-    // carries a code when none is supplied.
-    let _ = state.approvals.respond(id, approved, None).await;
-
+    if approved {
+        // ADR-0025 §7.2 (revision of ADR-0022): the tray opens the request's
+        // modal; approval happens there, behind the OS presence prompt.
+        tray::focus_main(app);
+        let _ = app.emit(APPROVAL_FOCUS_EVENT, ApprovalCancel { id });
+        return;
+    }
+    let _ = state.approvals.refuse_from(id, "desktop-tray").await;
     if let Some(tray_state) = app.try_state::<tray::TrayApprovals>() {
         tray_state.remove(id);
     }
@@ -5626,6 +5634,38 @@ mod tests {
                 p
             })
             .collect()
+    }
+
+    /// ADR-0025 §7.2: the tray alone can never approve.
+    #[test]
+    fn tray_approve_never_responds_true() {
+        let src = include_str!("lib.rs");
+        let start = src.find("async fn respond_from_tray").unwrap();
+        let body = &src[start..start + src[start..].find("\nfn record_desktop_event").unwrap()];
+        assert!(
+            !body.contains(".respond("),
+            "the tray must not call respond at all"
+        );
+        assert!(
+            body.contains("refuse_from("),
+            "tray Deny stays a direct refusal"
+        );
+        assert!(
+            body.contains("APPROVAL_FOCUS_EVENT"),
+            "tray Approve opens the modal"
+        );
+    }
+
+    #[tokio::test]
+    async fn tray_approve_leaves_the_request_pending() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.app.manage(tray::TrayApprovals::new());
+        let (id, task) = spawn_agent_request(&h).await;
+        respond_from_tray(h.app.handle(), id, true).await;
+        assert!(h.state().approvals.pending.lock().await.contains_key(&id));
+        assert_eq!(h.fake.calls(), 0);
+        respond_from_tray(h.app.handle(), id, false).await;
+        assert_eq!(task.await.unwrap(), Err("access denied by user".into()));
     }
 
     /// The central test (spec §9.2).
