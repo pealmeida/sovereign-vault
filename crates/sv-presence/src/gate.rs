@@ -15,9 +15,7 @@ use crate::OpDigest;
 pub struct AttemptId(u64);
 
 impl AttemptId {
-    /// Constructed only inside the crate; the coordinator (Task 3) is the
-    /// non-test caller, so until it lands this is dead code outside tests.
-    #[allow(dead_code)]
+    /// Constructed only inside the crate.
     pub(crate) fn new(value: u64) -> Self {
         Self(value)
     }
