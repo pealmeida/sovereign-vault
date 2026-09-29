@@ -656,21 +656,22 @@ impl<R: Runtime> ApprovalState<R> {
                     .as_ref()
                     .filter(|c| c.is_locked_out())
                     .map(|c| c.modal_id);
-                let in_flight = new_challenge.as_ref().and_then(|c| match c.gate {
-                    sv_presence::GateState::Verifying { attempt, .. } => Some(attempt),
-                    _ => None,
-                });
-                if let Some(chal) = new_challenge {
+                if let Some(mut chal) = new_challenge {
                     if let Some(id) = lockout_modal {
-                        // Lockout just triggered - cancel the modal
+                        // Lockout just triggered. While BOTH guards are still
+                        // held: cancel the racing reveal attempt (D13) and
+                        // disqualify this challenge's gate (CP2 round 2) -
+                        // `lockout_until` marks the block, and a finisher
+                        // arriving later must find neither `Verifying` nor an
+                        // authenticated state, so it can neither get the
+                        // code nor erase the lockout.
+                        if let sv_presence::GateState::Verifying { attempt, .. } = chal.gate {
+                            self.presence.invalidate(attempt);
+                        }
+                        chal.gate.reset();
                         store.insert(key, chal);
                         drop(store);
                         drop(handle_guard);
-                        // D13: a reveal attempt racing the lockout is
-                        // cancelled before the modal closes.
-                        if let Some(attempt) = in_flight {
-                            self.presence.invalidate(attempt);
-                        }
                         let _ = self.app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id });
                     } else {
                         store.insert(key, chal);
@@ -813,8 +814,19 @@ impl<R: Runtime> ApprovalState<R> {
         let state_moved = handle_guard.as_ref().map(|g| g.is_none()).unwrap_or(true)
             || vault.as_ref().map(|v| v.session_timer.epoch()) != Some(epoch);
         let mut store = self.otp_pending.lock().await;
+        // CP2 round 2: a finisher may only consume THE challenge it started -
+        // same modal id, still `Verifying` with THIS attempt. Anything else
+        // (a lockout that reset the gate, a newer challenge under the same
+        // key) is left alone.
+        let mine = store.get(&key).is_some_and(|c| {
+            c.modal_id == modal_id
+                && matches!(
+                    c.gate,
+                    sv_presence::GateState::Verifying { attempt: a, .. } if a == attempt.id()
+                )
+        });
         if state_moved {
-            let removed = store.remove(&key);
+            let removed = if mine { store.remove(&key) } else { None };
             drop(store);
             drop(handle_guard);
             if let Some(chal) = removed {
@@ -837,6 +849,12 @@ impl<R: Runtime> ApprovalState<R> {
             .get_mut(&key)
             .filter(|c| c.modal_id == modal_id)
             .ok_or_else(|| "code request is no longer pending".to_string())?;
+        if chal.is_locked_out() {
+            // CP2 round 2: a lockout that landed while the prompt was open
+            // revokes the reveal - no code, and the challenge with its
+            // lockout state is left in place.
+            return Err("otp_required: too many failed attempts; retry after 5 minutes".into());
+        }
         match result {
             Ok(verified) => {
                 let current = chal.op.digest();
@@ -858,22 +876,25 @@ impl<R: Runtime> ApprovalState<R> {
                 Err(sv_presence::Denial::Retryable(e).message())
             }
             Err(denial) => {
-                // Mid-attempt unavailability denies the request (§6.2).
-                let chal = store.remove(&key).expect("present above");
-                drop(store);
-                drop(handle_guard);
-                let _ = self
-                    .app
-                    .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: chal.modal_id });
-                self.audit_decision(
-                    format!("otp-{}", chal.modal_id),
-                    chal.audit_action,
-                    false,
-                    sv_audit::PresenceAudit::denied(true),
-                    "desktop-ui",
-                    Some(denial.message()),
-                )
-                .await;
+                // Mid-attempt unavailability denies the request (§6.2) - but
+                // only while the challenge is still THIS attempt's.
+                if mine {
+                    let chal = store.remove(&key).expect("present above");
+                    drop(store);
+                    drop(handle_guard);
+                    let _ = self
+                        .app
+                        .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: chal.modal_id });
+                    self.audit_decision(
+                        format!("otp-{}", chal.modal_id),
+                        chal.audit_action,
+                        false,
+                        sv_audit::PresenceAudit::denied(true),
+                        "desktop-ui",
+                        Some(denial.message()),
+                    )
+                    .await;
+                }
                 Err(denial.message())
             }
         }
@@ -6397,6 +6418,113 @@ mod tests {
         assert_eq!(h.fake.calls(), 0);
     }
 
+    /// CP2 round 2, BLOQUEIO 1: a lockout that lands while a reveal prompt is
+    /// open must disqualify the reveal AND survive it - the finisher may not
+    /// erase the locked-out challenge, and the code is never released.
+    #[tokio::test]
+    async fn lockout_during_reveal_never_releases_the_code() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let req = container_request(SecurityMode::Otp, "ctx");
+        let _ = h.state().approvals.request(req.clone()).await;
+        let (modal_id, _code) = {
+            let store = h.state().approvals.otp_pending.lock().await;
+            let c = store.values().next().unwrap();
+            (c.modal_id, c.code.clone())
+        };
+        let key = request_signature(&req);
+        h.fake.push(FakeStep::Hold(APPROVED));
+        let approvals = h.state().approvals.clone();
+        let revealing = tokio::spawn(async move { approvals.reveal_otp(modal_id).await });
+        for _ in 0..100 {
+            if h.fake.calls() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(h.fake.calls(), 1, "the reveal prompt reached the backend");
+        // Burn the maximum attempts with codes that cannot match (the real
+        // code is digits; these are not).
+        for i in 0..OTP_MAX_ATTEMPTS {
+            let mut bad = req.clone();
+            bad.otp = Some(format!("XXXXXX{i}"));
+            assert!(
+                h.state().approvals.request(bad).await.is_err(),
+                "wrong attempt {i} must be denied"
+            );
+        }
+        h.fake.release();
+        let outcome = revealing.await.unwrap();
+        assert!(
+            outcome.is_err(),
+            "the code is never released after a lockout"
+        );
+        // The lockout survives the racing finisher: the challenge stays (with
+        // its lockout flag) instead of being erased and reset by a retry.
+        let store = h.state().approvals.otp_pending.lock().await;
+        let chal = store
+            .get(&key)
+            .expect("the locked-out challenge must not be erased by the finisher");
+        assert_eq!(chal.modal_id, modal_id);
+        assert!(chal.is_locked_out(), "the lockout state must survive");
+    }
+
+    /// CP2 round 2, BLOQUEIO 2: a stale reveal finisher must never consume a
+    /// NEWER challenge stored under the same key.
+    #[tokio::test]
+    async fn stale_reveal_finisher_leaves_the_new_challenge_alone() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let req = container_request(SecurityMode::Otp, "ctx");
+        let _ = h.state().approvals.request(req.clone()).await;
+        let a_modal = h
+            .state()
+            .approvals
+            .otp_pending
+            .lock()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .modal_id;
+        h.fake.push(FakeStep::Hold(APPROVED));
+        let approvals = h.state().approvals.clone();
+        let revealing = tokio::spawn(async move { approvals.reveal_otp(a_modal).await });
+        for _ in 0..100 {
+            if h.fake.calls() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Lock and re-unlock WITHOUT ever releasing the handle guard: the
+        // finisher of A parks on `handle.lock()`, and a new challenge is
+        // created in that window (the no-code OTP path never touches the
+        // handle).
+        let state = h.state();
+        let mut g = state.handle.lock().await;
+        let handle = g.take().unwrap();
+        state.publish_locked(&mut g);
+        state.approvals.clear_all().await;
+        state.publish_unlocked(&mut g, handle);
+        let _ = state.approvals.request(req.clone()).await;
+        let b_modal = {
+            let store = state.approvals.otp_pending.lock().await;
+            store.values().next().unwrap().modal_id
+        };
+        assert_ne!(a_modal, b_modal, "the new challenge has a fresh modal id");
+        drop(g); // let A's finisher proceed
+        let outcome = revealing.await.unwrap();
+        assert!(
+            outcome.is_err(),
+            "the stale reveal is denied by the epoch change"
+        );
+        // The NEWER challenge must still be there, untouched.
+        let store = state.approvals.otp_pending.lock().await;
+        let key = request_signature(&req);
+        let chal = store
+            .get(&key)
+            .expect("a stale finisher must not erase the newer challenge");
+        assert_eq!(chal.modal_id, b_modal);
+    }
+
     /// CP2 BLOQUEIO 1: a lock publication that lands while the reveal prompt
     /// is open must revoke the reveal - the code never leaves.
     #[tokio::test]
@@ -6479,9 +6607,30 @@ mod tests {
         };
         let approvals = h.state().approvals.clone();
         let approving_a = tokio::spawn(async move { approvals.respond(a, true, None).await });
-        // A is queued behind X; the retry below supersedes it with an
-        // identical signature.
+        // A is queued behind X. Determinism (CP2 round-2 caveat): A's approve
+        // must have registered its attempt before the retry supersedes it -
+        // bounded wait with a clear failure if it never gets there.
         tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut begun = false;
+        for _ in 0..100 {
+            begun = h
+                .state()
+                .approvals
+                .pending
+                .lock()
+                .await
+                .get(&a)
+                .map(|e| matches!(e.gate, sv_presence::GateState::Verifying { .. }))
+                .unwrap_or(false);
+            if begun {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            begun,
+            "A's approve never reached Verifying before the retry"
+        );
         let approvals = h.state().approvals.clone();
         let _retry = tokio::spawn(async move {
             approvals
