@@ -1,8 +1,27 @@
 <script lang="ts">
   import { X } from '@lucide/svelte';
+  import { invoke } from '../lib/tauri';
   import type { ApprovalPrompt } from '../lib/types';
+  import { toastStore } from '../stores/toast.svelte';
 
   let { prompt, onClose }: { prompt: ApprovalPrompt; onClose: () => void } = $props();
+
+  /// The code is shown only when the backend released it: on a protected
+  /// system that is after a presence verification (§7.3), via reveal().
+  let revealed = $state<string | null>(null);
+  let code = $derived(prompt.otp_code ?? revealed);
+  let revealing = $state(false);
+
+  async function reveal() {
+    revealing = true;
+    try {
+      revealed = await invoke<string>('approval_reveal_otp', { id: prompt.id });
+    } catch (e) {
+      toastStore.setError(e);
+    } finally {
+      revealing = false;
+    }
+  }
 </script>
 
 <div class="modal-shell" role="dialog" aria-modal="true">
@@ -15,9 +34,18 @@
       <button class="ghost-button" onclick={onClose}><X size={16} /></button>
     </div>
 
-    {#if prompt.otp_code}
+    {#if code}
       <div class="notice-banner" style="font-family:var(--font-mono);font-size:1.6rem;letter-spacing:0.3em;text-align:center">
-        {prompt.otp_code}
+        {code}
+      </div>
+    {:else if prompt.otp_reveal_required}
+      <div class="notice-banner">
+        The code stays hidden until your OS confirms you are at this machine.
+      </div>
+      <div style="display:flex;justify-content:center;margin-top:0.5rem">
+        <button class="primary-button" onclick={reveal} disabled={revealing}>
+          {revealing ? 'Verifying…' : 'Reveal code — verify it’s you'}
+        </button>
       </div>
     {/if}
     <p style="color:var(--muted);font-size:0.85rem;margin-top:0.75rem">

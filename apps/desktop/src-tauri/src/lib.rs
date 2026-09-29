@@ -165,16 +165,38 @@ struct OtpChallenge {
     failed_attempts: u8,
     /// If locked out, the time until which requests are denied.
     lockout_until: Option<Instant>,
+    /// Fixed when the challenge was created (§6.2): the code is revealed only
+    /// after a presence verification bound to this request's digest.
+    protected: bool,
+    /// Presence state machine of the reveal attempt (spec §7.3).
+    gate: sv_presence::GateState,
+    /// The complete description the verification is bound to (§6.3).
+    op: sv_presence::OpDescriptor,
+    audit_action: AuditAction,
+    /// Modality stored at reveal, reused on the resend's audit record —
+    /// never re-inferred (D5).
+    revealed_modality: Option<sv_presence::Modality>,
 }
 
 impl OtpChallenge {
-    fn new(code: String, modal_id: u64) -> Self {
+    fn new(
+        code: String,
+        modal_id: u64,
+        protected: bool,
+        op: sv_presence::OpDescriptor,
+        audit_action: AuditAction,
+    ) -> Self {
         Self {
             code,
             modal_id,
             issued_at: Instant::now(),
             failed_attempts: 0,
             lockout_until: None,
+            protected,
+            gate: sv_presence::GateState::default(),
+            op,
+            audit_action,
+            revealed_modality: None,
         }
     }
 
@@ -204,6 +226,11 @@ impl OtpChallenge {
     /// Validate an OTP code with constant-time comparison.
     fn validate(&self, supplied: &str) -> bool {
         if self.is_expired() || self.is_locked_out() {
+            return false;
+        }
+        // ADR-0025 §7.3: on a protected request the code only works after a
+        // successful verification bound to this request's digest.
+        if self.protected && !self.gate.is_authenticated_for(self.op.digest()) {
             return false;
         }
         supplied.as_bytes().ct_eq(self.code.as_bytes()).into()
@@ -458,6 +485,20 @@ impl<R: Runtime> ApprovalState<R> {
         let key = request_signature(request);
         let supplied = request.otp.as_deref();
 
+        // Lock order (D4/D5): handle BEFORE otp_pending, the same order as
+        // the lock path. Only a code-bearing request can reach the Accepted
+        // record, so it takes the handle guard first; the issuance paths
+        // never touch the handle.
+        let vault = if supplied.is_some() {
+            self.app.try_state::<VaultState<R>>()
+        } else {
+            None
+        };
+        let handle_guard = match vault.as_ref() {
+            Some(v) => Some(v.handle.lock().await),
+            None => None,
+        };
+
         let mut store = self.otp_pending.lock().await;
 
         // Prune expired entries before processing
@@ -483,9 +524,35 @@ impl<R: Runtime> ApprovalState<R> {
 
         match result {
             OtpProcessResult::Accepted { modal_id } => {
-                // Valid OTP - remove challenge and cancel modal
-                store.remove(&key);
+                // Valid OTP - remove challenge and cancel modal. The Allowed
+                // record is written with the handle held, before `Ok` (D5);
+                // a vault locked in between releases nothing.
+                let handle = handle_guard.as_ref().and_then(|g| g.as_ref());
+                let Some(handle) = handle else {
+                    return Err("vault is locked".into());
+                };
+                let removed = store.remove(&key).expect("accepted challenge present");
+                let presence = if removed.protected {
+                    sv_audit::PresenceAudit::authenticated(presence::audit_modality(
+                        removed
+                            .revealed_modality
+                            .unwrap_or(sv_presence::Modality::Unknown),
+                    ))
+                } else {
+                    // Code relay on a declared system: not a click, not a
+                    // verification - the OS presence simply is not there.
+                    sv_audit::PresenceAudit::denied(false)
+                };
+                let mut event =
+                    AuditEvent::new(removed.audit_action, AuditDecision::Allowed, "desktop-ui");
+                event.presence = Some(presence.with_operation(format!("otp-{modal_id}")));
+                record_with_handle(
+                    vault.as_ref().expect("state checked above").inner(),
+                    handle,
+                    event,
+                );
                 drop(store);
+                drop(handle_guard);
                 let _ = self
                     .app
                     .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: modal_id });
@@ -516,9 +583,12 @@ impl<R: Runtime> ApprovalState<R> {
 
                     let modal_id = chal.modal_id;
                     let code = chal.code.clone();
+                    let challenge_protected = chal.protected;
                     drop(store);
 
-                    // Only emit modal for fresh challenges (not reuse)
+                    // Only emit modal for fresh challenges (not reuse). Never
+                    // emit the code of a protected challenge: it is revealed
+                    // by `reveal_otp` after presence (§7.3).
                     if should_emit_modal {
                         let payload = ApprovalPrompt {
                             id: modal_id,
@@ -527,11 +597,14 @@ impl<R: Runtime> ApprovalState<R> {
                             file_name: request.file_name.clone(),
                             mode: request.mode.map(|m| m.as_str().to_string()),
                             byte_size: request.byte_size,
-                            otp_code: Some(code),
+                            otp_code: if challenge_protected {
+                                None
+                            } else {
+                                Some(code.clone())
+                            },
                             import_summary: request.import_summary.clone(),
-                            // The OTP presence gate itself lands in Task 11;
-                            // the flag already reports the platform state.
-                            protected: self.presence.classify().is_protected(),
+                            protected: challenge_protected,
+                            otp_reveal_required: challenge_protected,
                             pre_unlock: false,
                         };
                         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
@@ -554,26 +627,61 @@ impl<R: Runtime> ApprovalState<R> {
                 }
             }
             OtpProcessResult::LockedOut => {
+                let denied = new_challenge
+                    .as_ref()
+                    .filter(|c| c.protected)
+                    .map(|c| (c.modal_id, c.audit_action));
                 drop(store);
+                drop(handle_guard);
+                if let Some((modal_id, action)) = denied {
+                    self.audit_decision(
+                        format!("otp-{modal_id}"),
+                        action,
+                        false,
+                        sv_audit::PresenceAudit::denied(true),
+                        "desktop-ui",
+                        Some("otp lockout".into()),
+                    )
+                    .await;
+                }
                 Err("otp_required: too many failed attempts; retry after 5 minutes".into())
             }
             OtpProcessResult::Invalid => {
                 // Update store with incremented failure count
+                let denied = new_challenge
+                    .as_ref()
+                    .filter(|c| c.protected)
+                    .map(|c| (c.modal_id, c.audit_action));
+                let lockout_modal = new_challenge
+                    .as_ref()
+                    .filter(|c| c.is_locked_out())
+                    .map(|c| c.modal_id);
                 if let Some(chal) = new_challenge {
-                    if chal.is_locked_out() {
+                    if let Some(id) = lockout_modal {
                         // Lockout just triggered - cancel the modal
-                        let modal_id = chal.modal_id;
                         store.insert(key, chal);
                         drop(store);
-                        let _ = self
-                            .app
-                            .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: modal_id });
+                        drop(handle_guard);
+                        let _ = self.app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id });
                     } else {
                         store.insert(key, chal);
                         drop(store);
+                        drop(handle_guard);
                     }
                 } else {
                     drop(store);
+                    drop(handle_guard);
+                }
+                if let Some((modal_id, action)) = denied {
+                    self.audit_decision(
+                        format!("otp-{modal_id}"),
+                        action,
+                        false,
+                        sv_audit::PresenceAudit::denied(true),
+                        "desktop-ui",
+                        Some("otp invalid code".into()),
+                    )
+                    .await;
                 }
                 Err("otp_required: invalid code".into())
             }
@@ -581,6 +689,7 @@ impl<R: Runtime> ApprovalState<R> {
                 // Remove expired challenge and issue fresh one
                 store.remove(&key);
                 drop(store);
+                drop(handle_guard);
                 // Call handle_otp_fresh to issue a fresh challenge
                 self.handle_otp_fresh(request).await
             }
@@ -592,6 +701,11 @@ impl<R: Runtime> ApprovalState<R> {
         let key = request_signature(request);
         let code = generate_otp_code()?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // The protected classification is fixed when the challenge is born
+        // (§6.2); a protected code is revealed only after presence (§7.3).
+        let protected = self.presence.classify().is_protected();
+        let op = op_for_access(request).bind("request_id", id.to_string());
+        let audit_action = audit_action_for(&request.action);
 
         let mut store = self.otp_pending.lock().await;
         self.prune_expired(&mut store);
@@ -616,7 +730,10 @@ impl<R: Runtime> ApprovalState<R> {
             );
         }
 
-        store.insert(key, OtpChallenge::new(code.clone(), id));
+        store.insert(
+            key,
+            OtpChallenge::new(code.clone(), id, protected, op, audit_action),
+        );
         drop(store);
 
         let payload = ApprovalPrompt {
@@ -626,11 +743,10 @@ impl<R: Runtime> ApprovalState<R> {
             file_name: request.file_name.clone(),
             mode: request.mode.map(|m| m.as_str().to_string()),
             byte_size: request.byte_size,
-            otp_code: Some(code),
+            otp_code: if protected { None } else { Some(code) },
             import_summary: request.import_summary.clone(),
-            // The OTP presence gate itself lands in Task 11; the flag
-            // already reports the platform state.
-            protected: self.presence.classify().is_protected(),
+            protected,
+            otp_reveal_required: protected,
             pre_unlock: false,
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
@@ -644,6 +760,73 @@ impl<R: Runtime> ApprovalState<R> {
              Resend this exact request with the `otp` argument set to that code."
                 .into(),
         )
+    }
+
+    /// Reveal an OTP code after a presence verification bound to that
+    /// request (§7.3). The approval itself still happens on the resend.
+    async fn reveal_otp(&self, modal_id: u64) -> Result<String, String> {
+        let (key, attempt, op, deadline) = {
+            let mut store = self.otp_pending.lock().await;
+            self.prune_expired(&mut store);
+            let (key, chal) = store
+                .iter_mut()
+                .find(|(_, c)| c.modal_id == modal_id)
+                .ok_or_else(|| "unknown or expired code request".to_string())?;
+            if !chal.protected {
+                return Ok(chal.code.clone());
+            }
+            let attempt = self.presence.begin_attempt();
+            chal.gate
+                .begin(attempt.id(), chal.op.digest())
+                .map_err(|e| e.to_string())?;
+            let deadline = chal.issued_at + Duration::from_secs(OTP_TTL_SECS);
+            (key.clone(), attempt, chal.op.clone(), deadline)
+        };
+        let result = self.presence.verify(&attempt, &op, deadline).await;
+        let mut store = self.otp_pending.lock().await;
+        let chal = store
+            .get_mut(&key)
+            .filter(|c| c.modal_id == modal_id)
+            .ok_or_else(|| "code request is no longer pending".to_string())?;
+        match result {
+            Ok(verified) => {
+                let current = chal.op.digest();
+                chal.gate
+                    .finish(
+                        attempt.id(),
+                        verified.digest,
+                        current,
+                        deadline,
+                        Instant::now(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                // Kept for the resend's audit record (D5).
+                chal.revealed_modality = Some(verified.outcome.modality);
+                Ok(chal.code.clone())
+            }
+            Err(sv_presence::Denial::Retryable(e)) => {
+                chal.gate.abort(attempt.id());
+                Err(sv_presence::Denial::Retryable(e).message())
+            }
+            Err(denial) => {
+                // Mid-attempt unavailability denies the request (§6.2).
+                let chal = store.remove(&key).expect("present above");
+                drop(store);
+                let _ = self
+                    .app
+                    .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: chal.modal_id });
+                self.audit_decision(
+                    format!("otp-{}", chal.modal_id),
+                    chal.audit_action,
+                    false,
+                    sv_audit::PresenceAudit::denied(true),
+                    "desktop-ui",
+                    Some(denial.message()),
+                )
+                .await;
+                Err(denial.message())
+            }
+        }
     }
 
     /// Prompt for explicit human confirmation, always as a click.
@@ -750,6 +933,7 @@ impl<R: Runtime> ApprovalState<R> {
             otp_code: None,
             import_summary: click.import_summary.clone(),
             protected,
+            otp_reveal_required: false,
             pre_unlock,
         };
         self.app.emit(APPROVAL_EVENT, payload).map_err(estr)?;
@@ -1040,6 +1224,10 @@ impl<R: Runtime> ApprovalState<R> {
             .map(|(_, c)| c)
             .collect();
         for chal in challenges {
+            // D13: an OTP reveal attempt in flight must be cancelled too.
+            if let sv_presence::GateState::Verifying { attempt, .. } = chal.gate {
+                self.presence.invalidate(attempt);
+            }
             let _ = self
                 .app
                 .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: chal.modal_id });
@@ -1629,7 +1817,7 @@ impl SessionTimer {
 
     /// The two session limits as they currently are. Never silently skipped:
     /// plain atomic loads and stores (plan D15 reads them for its comparison).
-    #[allow(dead_code)] // consumed by the D15 comparison in Task 15
+    #[allow(dead_code)] // consumed by the D15 comparison in Task 14
     fn limits(&self) -> (u64, u64) {
         (
             self.idle_timeout_secs.load(Ordering::SeqCst),
@@ -1662,8 +1850,8 @@ struct VaultState<R: Runtime = tauri::Wry> {
     approvals: Arc<ApprovalState<R>>,
     /// ADR-0025 presence coordinator: one native prompt at a time behind a
     /// bounded queue. The same Arc reaches approvals (gates of §6–7); this
-    /// reference is read by the desktop command gates (Task 9).
-    #[allow(dead_code)] // consumed by the command gates added in Task 9
+    /// reference is read by the desktop command gates (Tasks 11-13).
+    #[allow(dead_code)] // consumed by the command gates added in Tasks 11-13
     presence: Arc<sv_presence::PresenceCoordinator>,
     servers: Arc<Mutex<Option<ServersShutdown>>>,
     /// Scan reports that were produced in this process and still have a live
@@ -1954,6 +2142,9 @@ struct ApprovalPrompt {
     import_summary: Option<sv_mcp::ImportApprovalSummary>,
     /// Presence will be verified on approve (ADR-0025 §6.2 classification).
     protected: bool,
+    /// The OTP code is withheld until `approval_reveal_otp` passes a presence
+    /// verification for this request (§7.3).
+    otp_reveal_required: bool,
     /// This consent may complete while the vault is locked or absent
     /// (keychain unlock / init; D5 round-3 review).
     pre_unlock: bool,
@@ -2637,9 +2828,9 @@ async fn require_desktop_consent<R: Runtime>(
 }
 
 /// Container mode of `container` for a generic state. Used by the gated
-/// desktop commands (Tasks 9+), which hold a `&VaultState<R>`, not a
+/// desktop commands (Tasks 11+), which hold a `&VaultState<R>`, not a
 /// `State<'_, VaultState>`.
-#[allow(dead_code)] // consumed by the gated commands added in Tasks 9+
+#[allow(dead_code)] // consumed by the gated commands added in Tasks 11+
 async fn container_mode_in<R: Runtime>(
     state: &VaultState<R>,
     container: &str,
@@ -4830,6 +5021,13 @@ async fn approval_respond(
     state.approvals.respond(id, approved, otp).await
 }
 
+/// Reveal a protected OTP code after the OS presence prompt (ADR-0025 §7.3).
+#[tauri::command]
+async fn approval_reveal_otp(state: State<'_, VaultState>, id: u64) -> Result<String, String> {
+    state.touch_human_activity();
+    state.approvals.reveal_otp(id).await
+}
+
 /// Wake-on-demand request endpoint. The response is intentionally generic:
 /// the agent cannot tell whether the resource exists (ADR-0020 §8). Wake
 /// requests never unlock the vault and never refresh the idle timer.
@@ -5405,6 +5603,7 @@ pub fn run() {
             open_audit_folder,
             vault_delete_file,
             approval_respond,
+            approval_reveal_otp,
             wake_request,
             wake_list,
             wake_respond,
@@ -5931,6 +6130,167 @@ mod tests {
         );
     }
 
+    fn protected_challenge() -> OtpChallenge {
+        let op = sv_presence::OpDescriptor::new("mcp_request").field("action", "ReadFile");
+        OtpChallenge::new("123456".into(), 1, true, op, AuditAction::ReadFile)
+    }
+
+    #[test]
+    fn correct_code_before_reveal_is_rejected() {
+        let mut chal = protected_challenge();
+        let (result, updated) = process_otp_request(Some(&mut chal), Some("123456"));
+        assert!(matches!(result, OtpProcessResult::Invalid));
+        assert_eq!(
+            updated.unwrap().failed_attempts,
+            1,
+            "counts like a wrong code"
+        );
+    }
+
+    #[test]
+    fn revealed_code_is_accepted_once() {
+        let mut chal = protected_challenge();
+        let digest = chal.op.digest();
+        chal.gate = sv_presence::GateState::Authenticated { digest };
+        let (result, updated) = process_otp_request(Some(&mut chal), Some("123456"));
+        assert!(matches!(result, OtpProcessResult::Accepted { .. }));
+        assert!(updated.is_none(), "single use: the challenge is consumed");
+    }
+
+    #[test]
+    fn authentication_for_another_request_does_not_count() {
+        let mut chal = protected_challenge();
+        chal.gate = sv_presence::GateState::Authenticated {
+            digest: sv_presence::OpDescriptor::new("mcp_request")
+                .field("action", "WriteFile")
+                .digest(),
+        };
+        let (result, _) = process_otp_request(Some(&mut chal), Some("123456"));
+        assert!(matches!(result, OtpProcessResult::Invalid));
+    }
+
+    #[tokio::test]
+    async fn otp_code_is_absent_from_the_event_until_reveal() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let req = container_request(SecurityMode::Otp, "ctx");
+        let err = h.state().approvals.request(req.clone()).await.unwrap_err();
+        assert!(err.starts_with("otp_required"));
+        let (key, modal_id, code, revealed) = {
+            let store = h.state().approvals.otp_pending.lock().await;
+            let (k, c) = store.iter().next().unwrap();
+            (k.clone(), c.modal_id, c.code.clone(), c.gate)
+        };
+        assert_eq!(revealed, sv_presence::GateState::Pending);
+        // No verification yet: the correct code is rejected.
+        let mut resend = req.clone();
+        resend.otp = Some(code.clone());
+        assert!(h.state().approvals.request(resend.clone()).await.is_err());
+        // Reveal after presence, then the same code works exactly once.
+        h.fake.approve_next();
+        assert_eq!(
+            h.state().approvals.reveal_otp(modal_id).await.unwrap(),
+            code
+        );
+        assert!(h.state().approvals.request(resend.clone()).await.is_ok());
+        assert!(
+            !h.state()
+                .approvals
+                .otp_pending
+                .lock()
+                .await
+                .contains_key(&key),
+            "consumed on acceptance"
+        );
+        assert!(
+            h.state().approvals.request(resend).await.is_err(),
+            "single use"
+        );
+        // Correlated, structured records for this OTP operation (D5).
+        let op = serde_json::Value::String(format!("otp-{modal_id}"));
+        let records: Vec<_> = h
+            .presence_events()
+            .into_iter()
+            .filter(|(_, _, p)| p["operation_id"] == op)
+            .collect();
+        assert!(records.iter().any(|(_, d, p)| d.contains("allowed")
+            && p["protected"] == true
+            && p["outcome"] == "device_owner_authenticated"
+            && p["modality"] == "unknown"));
+    }
+
+    #[tokio::test]
+    async fn lock_during_reveal_cancels_and_reveals_nothing() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.fake.set_cancel_supported(true);
+        let _ = h
+            .state()
+            .approvals
+            .request(container_request(SecurityMode::Otp, "ctx"))
+            .await;
+        let modal_id = h
+            .state()
+            .approvals
+            .otp_pending
+            .lock()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .modal_id;
+        h.fake.push(FakeStep::Hold(APPROVED));
+        let approvals = h.state().approvals.clone();
+        let revealing = tokio::spawn(async move { approvals.reveal_otp(modal_id).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        perform_vault_lock(h.state(), "manual").await;
+        assert!(revealing.await.unwrap().is_err());
+        assert_eq!(h.fake.cancels(), 1);
+    }
+
+    #[tokio::test]
+    async fn reveal_is_denied_without_presence() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let _ = h
+            .state()
+            .approvals
+            .request(container_request(SecurityMode::Otp, "ctx"))
+            .await;
+        let modal_id = h
+            .state()
+            .approvals
+            .otp_pending
+            .lock()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .modal_id;
+        h.fake
+            .push(FakeStep::Return(Err(sv_presence::PresenceError::Cancelled)));
+        assert!(h.state().approvals.reveal_otp(modal_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unprotected_system_shows_code_as_today() {
+        let h = Harness::unlocked(FakeVerifier::unavailable()).await;
+        let req = container_request(SecurityMode::Otp, "ctx");
+        let _ = h.state().approvals.request(req.clone()).await;
+        let code = h
+            .state()
+            .approvals
+            .otp_pending
+            .lock()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .code
+            .clone();
+        let mut resend = req;
+        resend.otp = Some(code);
+        assert!(h.state().approvals.request(resend).await.is_ok());
+        assert_eq!(h.fake.calls(), 0);
+    }
+
     /// The regression this change exists for.
     ///
     /// `vault_read_file` used to call `container_mode` only to LABEL the audit
@@ -6292,7 +6652,13 @@ mod tests {
 
     /// Helper to create a test challenge with known state.
     fn make_test_challenge(code: &str, modal_id: u64) -> OtpChallenge {
-        let mut chal = OtpChallenge::new(code.to_string(), modal_id);
+        let mut chal = OtpChallenge::new(
+            code.to_string(),
+            modal_id,
+            false,
+            sv_presence::OpDescriptor::new("mcp_request"),
+            AuditAction::ReadFile,
+        );
         // Override issued_at to be "now" for testing
         chal.issued_at = Instant::now();
         chal
