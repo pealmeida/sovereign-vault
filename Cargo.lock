@@ -4636,6 +4636,7 @@ dependencies = [
  "sv-mcp",
  "sv-recovery",
  "sv-storage",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "url",

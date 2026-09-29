@@ -64,6 +64,16 @@ pub fn exists(root: &Path) -> bool {
     fs::symlink_metadata(root.join(KEYRING_FILE)).is_ok()
 }
 
+/// The active DEK version from the keyring header, without unwrapping any
+/// key. Version numbers are not secret (module docs). `None` for a vault
+/// without a keyring.
+pub fn active_dek_version(root: &Path) -> Result<Option<u32>> {
+    if !exists(root) {
+        return Ok(None);
+    }
+    Ok(Some(read_keyring(root)?.active_dek_version))
+}
+
 /// The unwrapped contents of a keyring: every DEK version available, plus the
 /// active version that new writes should use.
 pub struct Unwrapped {
@@ -436,4 +446,33 @@ pub fn remove_version(root: &Path, version: u32) -> Result<()> {
         .min()
         .unwrap_or(1);
     write_keyring(root, &kr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_dek_version_is_public_and_moves_on_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        let mut boot = crate::VaultHandle::bootstrap(
+            &root,
+            crate::CustodyMode::Passphrase,
+            Some("correct horse battery staple"),
+        )
+        .unwrap();
+        let before = active_dek_version(&root).unwrap();
+        assert!(before.is_some());
+        boot.handle
+            .rotate_key(&root, Some("correct horse battery staple"))
+            .unwrap();
+        assert_ne!(active_dek_version(&root).unwrap(), before);
+    }
+
+    #[test]
+    fn active_dek_version_is_none_without_keyring() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(active_dek_version(dir.path()).unwrap(), None);
+    }
 }

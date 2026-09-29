@@ -199,6 +199,87 @@ pub enum AuditDecision {
     Error,
 }
 
+/// What authorized a presence-gated decision (ADR-0025 §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresenceOutcome {
+    /// The device owner authenticated through the OS verifier.
+    DeviceOwnerAuthenticated,
+    /// The declared consent click (no presence available).
+    Click,
+}
+
+/// Modality as reported by the verifier, never inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresenceModality {
+    /// Fingerprint/face biometry.
+    Biometric,
+    /// Account password typed into the OS verifier.
+    Password,
+    /// Device PIN typed into the OS verifier.
+    Pin,
+    /// The verifier does not report which modality was used.
+    Unknown,
+}
+
+/// Presence facts of one gated decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceAudit {
+    /// Was presence enforced for this decision.
+    pub protected: bool,
+    /// Absent on denials: nothing authorized them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<PresenceOutcome>,
+    /// Modality used for a successful verification, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modality: Option<PresenceModality>,
+    /// Correlates every record of one gated operation (plan D5):
+    /// `approval-<id>`, `otp-<modal id>`, `op-<desktop op id>`. An opaque
+    /// counter, never derived from names or content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+}
+
+impl PresenceAudit {
+    /// A verification the OS attested, with the modality it reported.
+    pub fn authenticated(modality: PresenceModality) -> Self {
+        Self {
+            protected: true,
+            outcome: Some(PresenceOutcome::DeviceOwnerAuthenticated),
+            modality: Some(modality),
+            operation_id: None,
+        }
+    }
+
+    /// The declared consent click authorized this decision.
+    pub fn click() -> Self {
+        Self {
+            protected: false,
+            outcome: Some(PresenceOutcome::Click),
+            modality: None,
+            operation_id: None,
+        }
+    }
+
+    /// A denial of a gated decision; `protected` is how it was classified.
+    pub fn denied(protected: bool) -> Self {
+        Self {
+            protected,
+            outcome: None,
+            modality: None,
+            operation_id: None,
+        }
+    }
+
+    /// Correlate this record with every other record of the operation.
+    #[must_use]
+    pub fn with_operation(mut self, id: impl Into<String>) -> Self {
+        self.operation_id = Some(id.into());
+        self
+    }
+}
+
 /// One event in the authenticated audit stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
@@ -231,6 +312,9 @@ pub struct AuditEvent {
     /// Identity of the agent that originated the action, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// Presence facts for gated decisions (ADR-0025 §8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence: Option<PresenceAudit>,
 }
 
 impl AuditEvent {
@@ -248,6 +332,7 @@ impl AuditEvent {
             detail: None,
             error: None,
             agent_id: None,
+            presence: None,
         }
     }
 }
@@ -2009,5 +2094,52 @@ mod tests {
 
         drop(lock);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn presence_serializes_as_nested_snake_case_and_is_optional() {
+        let mut event =
+            AuditEvent::new(AuditAction::ReadFile, AuditDecision::Allowed, "desktop-ui");
+        let bare = serde_json::to_string(&event).unwrap();
+        assert!(
+            !bare.contains("presence"),
+            "absent presence keeps old bytes"
+        );
+        event.presence = Some(
+            PresenceAudit::authenticated(PresenceModality::Unknown).with_operation("approval-7"),
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(
+            r#""presence":{"protected":true,"outcome":"device_owner_authenticated","modality":"unknown","operation_id":"approval-7"}"#
+        ));
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.presence, event.presence);
+        let old: AuditEvent = serde_json::from_str(&bare).unwrap();
+        assert_eq!(old.presence, None);
+    }
+
+    #[test]
+    fn click_and_denied_shapes() {
+        assert_eq!(
+            serde_json::to_string(&PresenceAudit::click()).unwrap(),
+            r#"{"protected":false,"outcome":"click"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&PresenceAudit::denied(true)).unwrap(),
+            r#"{"protected":true}"#
+        );
+    }
+
+    #[test]
+    fn event_with_presence_verifies_in_the_chain() {
+        let dir = tmp_dir("presence-chain");
+        // `with_hmac_key` never creates state; `create` is what the existing
+        // chain tests use for a fresh log.
+        let log = AuditLog::create(&dir, [7u8; 32]).unwrap();
+        let mut event = AuditEvent::new(AuditAction::ReadFile, AuditDecision::Denied, "desktop-ui");
+        event.presence = Some(PresenceAudit::denied(true));
+        log.record(&event).unwrap();
+        assert!(log.verify_chain().unwrap().ok);
+        let _ = fs::remove_dir_all(dir);
     }
 }
