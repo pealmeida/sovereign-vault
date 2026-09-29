@@ -36,6 +36,13 @@
       {/if}
     </dl>
 
+    {#if prompt.protected}
+      <p style="color:var(--muted);font-size:0.8rem">
+        Your OS will ask for Touch ID, Windows Hello, or your password.
+        Refusing needs no verification.
+      </p>
+    {/if}
+
     {#if prompt.import_summary}
       <section aria-label="Imported agent authority" style="margin-top:1rem">
         <p class="eyebrow" style="margin-bottom:0.4rem">Imported authority</p>
@@ -62,7 +69,9 @@
 
     <div style="display:flex;gap:0.75rem;margin-top:1.25rem;justify-content:flex-end">
       <button class="ghost-button" onclick={() => respond(false)}>Deny</button>
-      <button class="primary-button" onclick={() => respond(true)}>Approve</button>
+      <button class="primary-button" onclick={() => respond(true)}>
+        {prompt.protected ? 'Approve — verify it’s you' : 'Approve'}
+      </button>
     </div>
   </div>
 </div>

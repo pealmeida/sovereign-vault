@@ -51,6 +51,10 @@ export interface ApprovalPrompt {
   byte_size: number | null;
   otp_code: string | null;
   import_summary?: ImportApprovalSummary | null;
+  /** Approving will verify OS presence (ADR-0025 §6.2). */
+  protected: boolean;
+  /** Consent that may complete while the vault is locked (unlock/init). */
+  pre_unlock: boolean;
 }
 
 /** Non-secret authority included in an agent-import approval prompt. */

@@ -29,8 +29,6 @@ pub(crate) fn build_coordinator<R: Runtime>(app: &AppHandle<R>) -> Arc<PresenceC
 }
 
 /// Modality mapping is 1:1; kept here so the audit writers never inline it.
-/// Read by the gated commands (Tasks 8+).
-#[allow(dead_code)]
 pub(crate) fn audit_modality(m: sv_presence::Modality) -> sv_audit::PresenceModality {
     match m {
         sv_presence::Modality::Biometric => sv_audit::PresenceModality::Biometric,
