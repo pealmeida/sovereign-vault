@@ -53,6 +53,9 @@ export interface ApprovalPrompt {
   import_summary?: ImportApprovalSummary | null;
   /** Approving will verify OS presence (ADR-0025 §6.2). */
   protected: boolean;
+  /** The OTP code is hidden until `approval_reveal_otp` passes a presence
+   *  verification for this request (ADR-0025 §7.3). */
+  otp_reveal_required: boolean;
   /** Consent that may complete while the vault is locked (unlock/init). */
   pre_unlock: boolean;
 }
