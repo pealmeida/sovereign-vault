@@ -4537,6 +4537,8 @@ dependencies = [
  "sv-core",
  "sv-http",
  "sv-mcp",
+ "sv-presence",
+ "sv-presence-windows",
  "sv-remediate",
  "sv-runtime",
  "sv-scan",
