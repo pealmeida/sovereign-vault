@@ -15,6 +15,7 @@ members = [
     "crates/sv-exposure",
     "crates/sv-patterns",
     "crates/sv-remediate",
+    "crates/sv-presence",
     "apps/cli",
     "apps/desktop/src-tauri",
     "apps/thesis-eval",
@@ -47,6 +48,7 @@ sv-runtime   = { path = "crates/sv-runtime",   version = "0.1.0" }
 sv-scan      = { path = "crates/sv-scan",      version = "0.1.0" }
 sv-patterns  = { path = "crates/sv-patterns",  version = "0.1.0" }
 sv-remediate = { path = "crates/sv-remediate", version = "0.1.0" }
+sv-presence  = { path = "crates/sv-presence",  version = "0.1.0" }
 sv-http      = { path = "crates/sv-http",      version = "0.1.0" }
 sv-exposure  = { path = "crates/sv-exposure",  version = "0.1.0" }
 sv-core      = { path = "crates/sv-core",      version = "0.1.0" }
