@@ -1,0 +1,28 @@
+[package]
+name        = "sv-presence-windows"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+description = "Windows Hello presence backend (ADR-0025 §5.2). The workspace's one declared unsafe exception."
+
+[dependencies]
+async-trait = "0.1"
+sv-presence = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+tokio          = { workspace = true }
+windows-future = "0.2"
+windows        = { version = "0.61", features = [
+    "Foundation",
+    "Security_Credentials_UI",
+    "Win32_Foundation",
+    "Win32_System_WinRT",
+    "Win32_System_SystemInformation",
+    "Wdk_System_SystemServices",
+] }
+
+# Deliberately NOT `[lints] workspace = true`: the workspace forbids unsafe,
+# and this crate is the exception declared in ADR-0025. The replacement
+# discipline is in `src/lib.rs` (crate attributes).
