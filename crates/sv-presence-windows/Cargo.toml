@@ -10,9 +10,9 @@ description = "Windows Hello presence backend (ADR-0025 §5.2). The workspace's 
 [dependencies]
 async-trait = "0.1"
 sv-presence = { workspace = true }
+tokio       = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-tokio          = { workspace = true }
 windows-future = "0.2"
 windows        = { version = "0.61", features = [
     "Foundation",
