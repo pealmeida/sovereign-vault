@@ -18,5 +18,9 @@ sha2        = { workspace = true }
 thiserror   = { workspace = true }
 tokio       = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Pinned: single maintainer; isolated behind `LaBoundary` (spec §11).
+robius-authentication = "=0.3.1"
+
 [lints]
 workspace = true

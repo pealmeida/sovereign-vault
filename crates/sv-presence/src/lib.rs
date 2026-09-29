@@ -10,7 +10,10 @@ use std::sync::Arc;
 
 mod coordinator;
 mod gate;
+pub mod macos;
 mod op;
+#[cfg(target_os = "macos")]
+mod robius;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod fake;
@@ -178,7 +181,14 @@ impl PresenceVerifier for UnavailableVerifier {
 /// Verifier for the current platform. Windows is built by the desktop from
 /// `sv-presence-windows`, because it needs the application's window.
 pub fn platform_verifier() -> Arc<dyn PresenceVerifier> {
-    Arc::new(UnavailableVerifier::new(Reason::UnsupportedPlatform))
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(macos::MacVerifier::new(robius::RobiusBoundary))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Arc::new(UnavailableVerifier::new(Reason::UnsupportedPlatform))
+    }
 }
 
 #[cfg(test)]
