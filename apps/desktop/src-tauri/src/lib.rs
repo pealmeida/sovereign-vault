@@ -656,12 +656,21 @@ impl<R: Runtime> ApprovalState<R> {
                     .as_ref()
                     .filter(|c| c.is_locked_out())
                     .map(|c| c.modal_id);
+                let in_flight = new_challenge.as_ref().and_then(|c| match c.gate {
+                    sv_presence::GateState::Verifying { attempt, .. } => Some(attempt),
+                    _ => None,
+                });
                 if let Some(chal) = new_challenge {
                     if let Some(id) = lockout_modal {
                         // Lockout just triggered - cancel the modal
                         store.insert(key, chal);
                         drop(store);
                         drop(handle_guard);
+                        // D13: a reveal attempt racing the lockout is
+                        // cancelled before the modal closes.
+                        if let Some(attempt) = in_flight {
+                            self.presence.invalidate(attempt);
+                        }
                         let _ = self.app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id });
                     } else {
                         store.insert(key, chal);
@@ -720,8 +729,12 @@ impl<R: Runtime> ApprovalState<R> {
             );
         }
 
-        // Cancel any prior modal for this signature
+        // Cancel any prior modal for this signature; D13: an old challenge
+        // with a reveal attempt in flight must not keep or open a prompt.
         if let Some(old_chal) = store.remove(&key) {
+            if let sv_presence::GateState::Verifying { attempt, .. } = old_chal.gate {
+                self.presence.invalidate(attempt);
+            }
             let _ = self.app.emit(
                 APPROVAL_CANCEL_EVENT,
                 ApprovalCancel {
@@ -765,7 +778,7 @@ impl<R: Runtime> ApprovalState<R> {
     /// Reveal an OTP code after a presence verification bound to that
     /// request (§7.3). The approval itself still happens on the resend.
     async fn reveal_otp(&self, modal_id: u64) -> Result<String, String> {
-        let (key, attempt, op, deadline) = {
+        let (key, attempt, op, deadline, epoch) = {
             let mut store = self.otp_pending.lock().await;
             self.prune_expired(&mut store);
             let (key, chal) = store
@@ -780,10 +793,46 @@ impl<R: Runtime> ApprovalState<R> {
                 .begin(attempt.id(), chal.op.digest())
                 .map_err(|e| e.to_string())?;
             let deadline = chal.issued_at + Duration::from_secs(OTP_TTL_SECS);
-            (key.clone(), attempt, chal.op.clone(), deadline)
+            // D4: remember the unlock this verification belongs to.
+            let epoch = self
+                .app
+                .try_state::<VaultState<R>>()
+                .map(|v| v.session_timer.epoch())
+                .unwrap_or(u64::MAX);
+            (key.clone(), attempt, chal.op.clone(), deadline, epoch)
         };
         let result = self.presence.verify(&attempt, &op, deadline).await;
+        // Finisher under the lock order handle -> otp_pending (D4/D5): a
+        // lock or re-unlock that landed while the prompt was open revokes
+        // the reveal; the code never leaves this function.
+        let vault = self.app.try_state::<VaultState<R>>();
+        let handle_guard = match vault.as_ref() {
+            Some(v) => Some(v.handle.lock().await),
+            None => None,
+        };
+        let state_moved = handle_guard.as_ref().map(|g| g.is_none()).unwrap_or(true)
+            || vault.as_ref().map(|v| v.session_timer.epoch()) != Some(epoch);
         let mut store = self.otp_pending.lock().await;
+        if state_moved {
+            let removed = store.remove(&key);
+            drop(store);
+            drop(handle_guard);
+            if let Some(chal) = removed {
+                let _ = self
+                    .app
+                    .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: chal.modal_id });
+                self.audit_decision(
+                    format!("otp-{}", chal.modal_id),
+                    chal.audit_action,
+                    false,
+                    sv_audit::PresenceAudit::denied(true),
+                    "desktop-ui",
+                    Some("vault state changed during verification".into()),
+                )
+                .await;
+            }
+            return Err("vault state changed during verification".into());
+        }
         let chal = store
             .get_mut(&key)
             .filter(|c| c.modal_id == modal_id)
@@ -812,6 +861,7 @@ impl<R: Runtime> ApprovalState<R> {
                 // Mid-attempt unavailability denies the request (§6.2).
                 let chal = store.remove(&key).expect("present above");
                 drop(store);
+                drop(handle_guard);
                 let _ = self
                     .app
                     .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: chal.modal_id });
@@ -882,7 +932,7 @@ impl<R: Runtime> ApprovalState<R> {
         let pre_unlock = click.pre_unlock;
         let audit_action = click.audit_action;
         let (tx, rx) = oneshot::channel();
-        let superseded: Vec<u64> = {
+        let superseded: Vec<(u64, AuditAction, bool)> = {
             let mut pending = self.pending.lock().await;
             // Supersede any outstanding request with the same signature: a
             // duplicate almost always means the previous caller disconnected
@@ -893,8 +943,14 @@ impl<R: Runtime> ApprovalState<R> {
                 .filter(|(_, p)| p.signature == signature)
                 .map(|(k, _)| *k)
                 .collect();
+            let mut replaced: Vec<(u64, AuditAction, bool)> = Vec::new();
             for old in &stale {
                 if let Some(prev) = pending.remove(old) {
+                    // D13: the superseded attempt - queued or prompting - is
+                    // cancelled BEFORE its channel closes, so it can never
+                    // open a prompt after being replaced.
+                    self.invalidate_entry(&prev);
+                    replaced.push((*old, prev.audit_action, prev.protected));
                     let _ = prev.tx.send(false);
                 }
             }
@@ -912,15 +968,26 @@ impl<R: Runtime> ApprovalState<R> {
                     pre_unlock,
                 },
             );
-            stale
+            replaced
         };
-        for old in superseded {
+        for (old, action, was_protected) in superseded {
             let _ = self
                 .app
                 .emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id: old });
             if let Some(tray_state) = self.app.try_state::<tray::TrayApprovals>() {
                 tray_state.remove(old);
             }
+            // CP2 BLOQUEIO 4: a superseded request is a decision too - it
+            // leaves a Denied record (D5), correlated by its operation id.
+            self.audit_decision(
+                format!("approval-{old}"),
+                action,
+                false,
+                sv_audit::PresenceAudit::denied(was_protected),
+                "desktop-ui",
+                Some("superseded".into()),
+            )
+            .await;
         }
 
         let payload = ApprovalPrompt {
@@ -961,29 +1028,45 @@ impl<R: Runtime> ApprovalState<R> {
             NOTIFICATION_APPROVAL_BODY,
         );
 
-        match tokio::time::timeout(Duration::from_secs(APPROVAL_TIMEOUT_SECS), rx).await {
+        // CP2 BLOQUEIO 3: one deadline, computed before insert and used by
+        // both the wait and the entry - the window cannot drift.
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), rx).await {
             Ok(Ok(true)) => Ok(()),
             Ok(Ok(false)) => Err("access denied by user".into()),
             Ok(Err(_)) => Err("approval channel closed".into()),
             Err(_) => {
-                let mut pending = self.pending.lock().await;
-                if let Some(entry) = pending.remove(&id) {
-                    // D13: a timed-out request must not keep (or later open)
-                    // a native prompt.
-                    self.invalidate_entry(&entry);
-                }
-                drop(pending);
-                // Tell the UI to drop the now-defunct modal.
-                let _ = self.app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id });
-                // A timed-out request must not stay clickable in the tray: the
-                // channel is gone, so the menu row would be a dead control.
-                if let Some(tray_state) = self.app.try_state::<tray::TrayApprovals>() {
-                    tray_state.remove(id);
-                }
-                tray::refresh(&self.app);
+                self.reap_timeout(id).await;
                 Err("approval timed out".into())
             }
         }
+    }
+
+    /// Reap a request whose approval window closed: drop the entry, cancel
+    /// any in-flight prompt (D13), audit the denial (D5 - every decision is
+    /// recorded), and clear the modal and tray row. Shared by the timeout
+    /// branch above and the tests.
+    async fn reap_timeout(&self, id: u64) {
+        let removed = self.pending.lock().await.remove(&id);
+        if let Some(entry) = removed {
+            let action = entry.audit_action;
+            let was_protected = entry.protected;
+            self.invalidate_entry(&entry);
+            drop(entry.tx);
+            self.audit_decision(
+                format!("approval-{id}"),
+                action,
+                false,
+                sv_audit::PresenceAudit::denied(was_protected),
+                "desktop-ui",
+                Some("timed out".into()),
+            )
+            .await;
+        }
+        // Tell the UI to drop the now-defunct modal.
+        let _ = self.app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id });
+        // A timed-out request must not stay clickable in the tray: the
+        // channel is gone, so the menu row would be a dead control.
+        self.drop_tray_row(id);
     }
 
     /// D13: a refused, expired, or locked request must not keep (or later
@@ -1090,6 +1173,27 @@ impl<R: Runtime> ApprovalState<R> {
                 if otp.as_deref() != Some(expected.as_str()) {
                     return Err("incorrect confirmation code".into());
                 }
+            }
+            // CP2 BLOQUEIO 3: the deadline is absolute. An approve after it
+            // is refused on every path - click and protected alike - and
+            // audited as a denial (D5), never silently honored.
+            if Instant::now() > entry.deadline {
+                let entry = pending.remove(&id).expect("present above");
+                drop(pending);
+                self.invalidate_entry(&entry);
+                let _ = entry.tx.send(false);
+                drop(handle_guard);
+                self.drop_tray_row(id);
+                self.audit_decision(
+                    format!("approval-{id}"),
+                    entry.audit_action,
+                    false,
+                    sv_audit::PresenceAudit::denied(entry.protected),
+                    "desktop-ui",
+                    Some("approval expired".into()),
+                )
+                .await;
+                return Err("approval request expired".into());
             }
             if !entry.protected {
                 let entry = pending.remove(&id).expect("present above");
@@ -2406,8 +2510,10 @@ async fn respond_from_tray<R: Runtime>(app: &AppHandle<R>, id: u64, approved: bo
         return;
     }
 
-    // A tray click is a real human at the machine, exactly like a click in the
-    // app, so it refreshes the idle timer the same way `approval_respond` does.
+    // A tray click refreshes the idle timer like any UI interaction - it is
+    // NOT evidence of human presence: synthetic input can reach this surface
+    // too, which is exactly why the tray never approves (ADR-0022 revision,
+    // spec §7.2). Approval happens in the modal, behind the OS prompt.
     state.touch_human_activity();
 
     if approved {
@@ -6289,6 +6395,237 @@ mod tests {
         resend.otp = Some(code);
         assert!(h.state().approvals.request(resend).await.is_ok());
         assert_eq!(h.fake.calls(), 0);
+    }
+
+    /// CP2 BLOQUEIO 1: a lock publication that lands while the reveal prompt
+    /// is open must revoke the reveal - the code never leaves.
+    #[tokio::test]
+    async fn reveal_after_lock_publication_returns_nothing() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let _ = h
+            .state()
+            .approvals
+            .request(container_request(SecurityMode::Otp, "ctx"))
+            .await;
+        let modal_id = h
+            .state()
+            .approvals
+            .otp_pending
+            .lock()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .modal_id;
+        h.fake.push(FakeStep::Hold(APPROVED));
+        let approvals = h.state().approvals.clone();
+        let revealing = tokio::spawn(async move { approvals.reveal_otp(modal_id).await });
+        for _ in 0..100 {
+            if h.fake.calls() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(h.fake.calls(), 1, "the reveal prompt reached the backend");
+        // A lock publication WITHOUT clear_all: the narrow window the
+        // finisher must catch (D4).
+        let state = h.state();
+        let mut g = state.handle.lock().await;
+        state.publish_locked(&mut g);
+        drop(g);
+        h.fake.release();
+        assert!(
+            revealing.await.unwrap().is_err(),
+            "the code is not delivered after the vault state moved"
+        );
+    }
+
+    /// CP2 BLOQUEIO 2: superseding an entry must invalidate its queued
+    /// attempt - a superseded request never opens a prompt.
+    #[tokio::test]
+    async fn superseded_while_waiting_never_prompts() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.fake.push(FakeStep::Hold(APPROVED)); // X's prompt stays open
+        let approvals = h.state().approvals.clone();
+        let task_x = tokio::spawn(async move {
+            approvals
+                .request(container_request(SecurityMode::Approval, "ctx-x"))
+                .await
+        });
+        let x = h.next_pending_id().await;
+        let approvals = h.state().approvals.clone();
+        let approving_x = tokio::spawn(async move { approvals.respond(x, true, None).await });
+        tokio::time::sleep(Duration::from_millis(30)).await; // X is in the backend
+        let approvals = h.state().approvals.clone();
+        let task_a = tokio::spawn(async move {
+            approvals
+                .request(container_request(SecurityMode::Approval, "ctx-a"))
+                .await
+        });
+        let a = loop {
+            let ids: Vec<u64> = h
+                .state()
+                .approvals
+                .pending
+                .lock()
+                .await
+                .keys()
+                .copied()
+                .collect();
+            if let Some(id) = ids.into_iter().find(|k| *k != x) {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let approvals = h.state().approvals.clone();
+        let approving_a = tokio::spawn(async move { approvals.respond(a, true, None).await });
+        // A is queued behind X; the retry below supersedes it with an
+        // identical signature.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let approvals = h.state().approvals.clone();
+        let _retry = tokio::spawn(async move {
+            approvals
+                .request(container_request(SecurityMode::Approval, "ctx-a"))
+                .await
+        });
+        for _ in 0..100 {
+            if !h.state().approvals.pending.lock().await.contains_key(&a) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            approving_a.await.unwrap().is_err(),
+            "the superseded approve ends in error"
+        );
+        assert_eq!(task_a.await.unwrap(), Err("access denied by user".into()));
+        h.fake.release(); // X's prompt ends
+        approving_x.await.unwrap().unwrap();
+        task_x.await.unwrap().unwrap();
+        assert_eq!(h.fake.opened(), 1, "A must never open a prompt");
+    }
+
+    /// CP2 BLOQUEIO 3: the deadline is absolute - a click approval after it
+    /// is refused, not honored.
+    #[tokio::test]
+    async fn expired_click_approval_is_refused() {
+        let h = Harness::unlocked(FakeVerifier::unavailable()).await;
+        let (id, task) = spawn_agent_request(&h).await;
+        h.state()
+            .approvals
+            .pending
+            .lock()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .deadline = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            h.state().approvals.respond(id, true, None).await,
+            Err("approval request expired".into())
+        );
+        assert_eq!(task.await.unwrap(), Err("access denied by user".into()));
+    }
+
+    /// CP2 BLOQUEIO 4: supersede and timeout are decisions too - each leaves
+    /// a Denied record correlated by its operation id (D5).
+    #[tokio::test]
+    async fn supersede_and_timeout_are_audited_as_denied() {
+        let h = Harness::unlocked(FakeVerifier::unavailable()).await;
+
+        // Supersede: an identical retry removes the old entry.
+        let approvals = h.state().approvals.clone();
+        let old_task = tokio::spawn(async move {
+            approvals
+                .request(container_request(SecurityMode::Approval, "ctx-old"))
+                .await
+        });
+        let old_id = h.next_pending_id().await;
+        let approvals = h.state().approvals.clone();
+        let _new_task = tokio::spawn(async move {
+            approvals
+                .request(container_request(SecurityMode::Approval, "ctx-old"))
+                .await
+        });
+        for _ in 0..100 {
+            if h.state()
+                .approvals
+                .pending
+                .lock()
+                .await
+                .get(&old_id)
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !h.state()
+                .approvals
+                .pending
+                .lock()
+                .await
+                .contains_key(&old_id),
+            "the retry must have replaced the old entry"
+        );
+        let rec = h
+            .audit_events()
+            .into_iter()
+            .find(|e| {
+                e["presence"]["operation_id"] == format!("approval-{old_id}")
+                    && e["decision"] == "denied"
+            })
+            .expect("a superseded request must leave a Denied record");
+        assert_eq!(rec["error"], "superseded");
+        assert_eq!(rec["presence"]["protected"], false);
+        assert_eq!(old_task.await.unwrap(), Err("access denied by user".into()));
+
+        // Timeout: reap the same routine the timeout branch uses (no 120 s
+        // wait in tests).
+        let approvals = h.state().approvals.clone();
+        let timed_task = tokio::spawn(async move {
+            approvals
+                .request(container_request(SecurityMode::Approval, "ctx-timeout"))
+                .await
+        });
+        let before: Vec<u64> = h
+            .state()
+            .approvals
+            .pending
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .collect();
+        let t_id = loop {
+            let ids: Vec<u64> = h
+                .state()
+                .approvals
+                .pending
+                .lock()
+                .await
+                .keys()
+                .copied()
+                .collect();
+            if let Some(id) = ids.into_iter().find(|k| !before.contains(k)) {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        h.state().approvals.reap_timeout(t_id).await;
+        let rec = h
+            .audit_events()
+            .into_iter()
+            .find(|e| {
+                e["presence"]["operation_id"] == format!("approval-{t_id}")
+                    && e["decision"] == "denied"
+            })
+            .expect("a timed-out request must leave a Denied record");
+        assert_eq!(rec["error"], "timed out");
+        assert!(
+            timed_task.await.unwrap().is_err(),
+            "the caller learns the request died"
+        );
     }
 
     /// The regression this change exists for.
