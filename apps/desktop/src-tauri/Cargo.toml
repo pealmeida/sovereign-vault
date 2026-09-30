@@ -54,6 +54,7 @@ sv-presence-windows = { workspace = true }
 [dev-dependencies]
 sv-presence = { workspace = true, features = ["test-util"] }
 tauri       = { version = "2", features = ["tray-icon", "test"] }
+tokio       = { workspace = true, features = ["test-util"] }
 
 # Without `custom-protocol`, a release binary loads `devUrl` (localhost:1420)
 # instead of the embedded UI and shows a connection error. `cargo tauri build`
