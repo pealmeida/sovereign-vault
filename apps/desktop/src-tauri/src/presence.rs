@@ -156,6 +156,12 @@ impl DesktopOps {
     pub async fn is_empty(&self) -> bool {
         self.ops.lock().await.is_empty()
     }
+
+    /// Test-only: the deadline the operation was registered with.
+    #[cfg(test)]
+    pub async fn deadline(&self, digest: OpDigest) -> Option<Instant> {
+        self.ops.lock().await.get(&digest).map(|o| o.deadline)
+    }
 }
 
 /// ADR-0024 contract (spec §7.4; plan D12). `submit_secret` and
