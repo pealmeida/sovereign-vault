@@ -20,6 +20,7 @@
   import { wakeStore } from './stores/wake.svelte';
   import { toastStore } from './stores/toast.svelte';
   import type { ApprovalPrompt, WakePrompt, PresenceStatus } from './lib/types';
+  import { usesOtpModal } from './lib/approvalRouting';
   import { invoke } from './lib/tauri';
 
   // ADR-0025 §6.2: permanent, non-dismissable notice when the system cannot
@@ -140,10 +141,12 @@
 <!-- Global approval surface: any incoming MCP approval/OTP request is shown
      regardless of the active page, so an agent call never hangs invisibly. -->
 {#each approvalStore.queue.slice(0, 1) as prompt (prompt.id)}
-  {#if prompt.otp_code !== null}
+  {#if usesOtpModal(prompt)}
     <!-- OTP is display-only: the code is entered on the agent side, so closing
          the modal just dismisses it (the challenge lives server-side until the
-         agent resends with the code or it expires). -->
+         agent resends with the code or it expires). A protected-system OTP
+         arrives with no code at all — `otp_reveal_required` routes it here too,
+         where OtpModal reveals it behind a presence check. -->
     <OtpModal {prompt} onClose={() => approvalStore.remove(prompt.id)} />
   {:else}
     <ApprovalModal {prompt} onClose={() => denyById(prompt.id)} />
