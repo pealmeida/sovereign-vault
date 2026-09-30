@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { X } from '@lucide/svelte';
+  import { X, Copy, Check } from '@lucide/svelte';
   import { invoke } from '../lib/tauri';
   import type { ApprovalPrompt } from '../lib/types';
   import { toastStore } from '../stores/toast.svelte';
@@ -11,6 +11,7 @@
   let revealed = $state<string | null>(null);
   let code = $derived(prompt.otp_code ?? revealed);
   let revealing = $state(false);
+  let copied = $state(false);
 
   async function reveal() {
     revealing = true;
@@ -20,6 +21,18 @@
       toastStore.setError(e);
     } finally {
       revealing = false;
+    }
+  }
+
+  // Copy is explicit: only on click, and only once the code is visible.
+  async function copyCode() {
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      copied = true;
+      setTimeout(() => { copied = false; }, 2000);
+    } catch (e) {
+      toastStore.setError(e);
     }
   }
 </script>
@@ -34,9 +47,25 @@
       <button class="ghost-button" onclick={onClose}><X size={16} /></button>
     </div>
 
+    <dl style="font-size:0.88rem;display:grid;grid-template-columns:auto 1fr;gap:0.4rem 1rem">
+      <dt style="color:var(--muted)">Action</dt><dd>{prompt.action}</dd>
+      {#if prompt.container}
+        <dt style="color:var(--muted)">Container</dt><dd><code>{prompt.container}</code></dd>
+      {/if}
+      {#if prompt.file_name}
+        <dt style="color:var(--muted)">File</dt><dd><code>{prompt.file_name}</code></dd>
+      {/if}
+    </dl>
+
     {#if code}
-      <div class="notice-banner" style="font-family:var(--font-mono);font-size:1.6rem;letter-spacing:0.3em;text-align:center">
-        {code}
+      <div style="display:flex;align-items:center;gap:0.5rem">
+        <div class="notice-banner" style="flex:1;font-family:var(--font-mono);font-size:1.6rem;letter-spacing:0.3em;text-align:center">
+          {code}
+        </div>
+        <button class="ghost-button" aria-label="Copy code" onclick={copyCode}>
+          {#if copied}<Check size={14} />{:else}<Copy size={14} />{/if}
+          {copied ? 'Copied' : 'Copy'}
+        </button>
       </div>
     {:else if prompt.otp_reveal_required}
       <div class="notice-banner">
