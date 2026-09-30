@@ -20,41 +20,56 @@ count as a human decision.
 
 The approval machinery concentrates the decision in one place, which is what
 makes this tractable. `ApprovalState::respond`
-(apps/desktop/src-tauri/src/lib.rs:674) removes the pending entry under a
-mutex and sends the boolean over a oneshot channel; `request_click`
-(:580-672) arms it with a 120 s timeout (`APPROVAL_TIMEOUT_SECS`, :75); the
-Tauri command `approval_respond` (:4355) and the tray path `respond_from_tray`
-(:1779-1832) both land there, and so do the desktop-originated gates
-`require_desktop_consent` (:2147-2179) and `request_click_only` (:551-560).
-The OTP flow generates a six-digit code (`generate_otp_code`, :295-299),
-delivers it in the `ApprovalPrompt.otp_code` event field (:517-526, issued by
-`handle_otp_fresh` :486-538), and expects the agent to resend the request
-carrying it (`handle_otp` :356-483, `process_otp_request` :224-275), with the
-same 120 s TTL. Tauri commands are only invocable from the app's own webview,
-so the surfaces that decide are exactly: modal, tray, and the OTP resend.
+(apps/desktop/src-tauri/src/lib.rs:1168) is that place: the click path removes
+the pending entry under a mutex and sends the boolean over a oneshot channel,
+and the protected path first runs the spec §6.1 state machine — begin attempt,
+native prompt, then finish and send under the handle guard; `request_click`
+(:931) arms it with a 120 s timeout (`APPROVAL_TIMEOUT_SECS`, :79); the
+Tauri command `approval_respond` (:6121) lands there. The tray path
+`respond_from_tray` (:2524) no longer decides approvals from the menu: it
+opens the request's modal and routes refusals to `refuse_from` (:1128) — the
+ADR-0022 revision this ADR specifies. The desktop-originated gate
+`require_desktop_consent` (:3151) also no longer lands in a bare click modal:
+the old `request_click_only` helper was removed when desktop consent migrated
+through `desktop_presence_gate` (:2945).
+The OTP flow generates a six-digit code (`generate_otp_code`, :328). On a
+declared system it is delivered in the `ApprovalPrompt.otp_code` event field
+(struct :2276; set by `handle_otp_fresh`, :708, at :758). On a protected
+system the event carries no code: it is revealed only by `reveal_otp` (:779),
+after a presence verification bound to that request (spec §7.3). The agent
+must resend carrying it (`handle_otp` :482, `process_otp_request` :257), with
+the same 120 s TTL. Tauri commands are only invocable from the app's own
+webview, so the surfaces that decide are exactly: modal (approve), tray
+(refuse only), and the OTP resend.
 
 One premise needs to be stated precisely: `respond()` is the single decision
-point for MCP request approvals — modal, tray, and the desktop consent gate —
-not for every human action the app takes. Remediation originates entirely
+point for MCP request approvals — modal approval and tray refusal;
+desktop-originated gated commands decide in `desktop_presence_gate` — not for
+every human action the app takes. Remediation originates entirely
 from human UI actions (`scan_run` then `remediate_plan_file`, executed by
 `remediate_execute` under a digest confirmation), and wake requests are
-created only by the `wake_request` Tauri command (lib.rs:4369);
+created only by the `wake_request` Tauri command (lib.rs:6142);
 agent-originated wake entry depends on ADR-0021, which is Proposed and not
 implemented. When this ADR gates those flows, the reason is not their origin
 — it is UI automation: whatever a synthetic click can drive must release no
 more than the agent already has.
 
 There was also an existing gap, in three distinct layers. (a) Historically,
-in an ANONYMIZED container, the desktop commands `vault_read_file`
-(lib.rs:4014; gate only at :4040) and `vault_export_file` (:4140; gate at
-:4151) returned or wrote PLAINTEXT without any consent, because
-`desktop_consent_required` treated Anonymized as ungated (:2139) and the
+in the evaluated artifact, the desktop commands `vault_read_file` and
+`vault_export_file` (today at lib.rs:5557 and :5760) returned or wrote
+PLAINTEXT without any consent: `desktop_consent_required` (today :2901)
+treated Anonymized as ungated and the
 desktop did not apply `sv-privacy`; the MCP path returns the same content
-masked (crates/sv-mcp/src/lib.rs:1431-1460). (b) That specific gap is now
-closed by PR #120, which added `desktop_consent_required_for` and put
-ANONYMIZED reads and exports behind a desktop consent click. (c) What
-remains for THIS ADR is the increment: presence in place of that click,
-wherever the platform can attest it. Until (b) landed, driving the desktop
+masked (`apply_privacy_filter`, crates/sv-mcp/src/lib.rs:1431-1466). (b) That
+specific gap is now
+closed by PR #120, which added `desktop_consent_required_for` (today :2929)
+and put
+ANONYMIZED reads and exports behind a desktop consent click. (c) THIS ADR's
+increment — presence in place of that click, wherever the platform can attest
+it — is now implemented: both commands consent through `require_desktop_consent`
+(calls at lib.rs:5597 and :5802), which runs `desktop_presence_gate` on
+protected systems and keeps the declared click only where no verifier exists.
+Until (b) landed, driving the desktop
 UI was worth more than the MCP channel — the opposite of the intended
 design.
 
@@ -354,6 +369,125 @@ reuses the trait defined here.
   (`desktop_consent_required_for`); (c) this ADR's increment is presence in
   place of that click wherever the platform can attest it.
 
+## Implementation notes
+
+Filled in by the implementation pass. The execution plan is
+`docs/development/plans/2026-09-28-presence-verified-approvals.md` (5311
+lines), whose "Implementation decisions beyond the spec" section defines **D1
+through D15**; those decisions are binding for the code that implements this
+ADR and are summarised below. **Status stays `Proposed` — the author decides
+the status.**
+
+**Decisions D1–D15 (plan, "Implementation decisions beyond the spec")**
+
+- **D1** — macOS `availability()` is always `Protected { modalities:
+  [Unknown] }` (robius 0.3.1 has no prompt-free probe), and modality is
+  recorded only as the backend reports it: `unknown` on macOS and for a Hello
+  PIN on Windows.
+- **D2** — each gated desktop operation is registered by its `op_digest` with
+  its own id, deadline, classification and gate state; classification is
+  sticky, a concurrent call for an operation already `Verifying` is refused
+  with `AlreadyVerifying`, and a lock clears the registry.
+- **D3** — two surfaces, one coordinator: agent approvals keep the modal;
+  desktop-gated commands go straight to the OS prompt on a protected system
+  and to the declared consent click on a declared one.
+- **D4** — vault-state changes are checked from the prompt to the moment of
+  consumption: handle and epoch move together, only under the handle guard,
+  through `publish_unlocked` / `publish_locked`; gates capture the epoch before
+  and re-check it after, and consumption runs inside the gated helpers.
+  **Declared residual:** between `DesktopAccessController::authorize` returning
+  and sv-mcp taking the handle, a lock **plus a re-unlock** could let the
+  approved request run in the new unlock; closing this needs an sv-mcp change
+  and is out of scope. It is bounded because a re-unlock needs the device
+  owner (keychain unlock is presence-gated; passphrase/recovery unlock needs
+  knowledge), and a lock alone still makes the request fail, because there is
+  no handle.
+- **D5** — audit coverage: every presence decision carries a `presence` field
+  and an `operation_id` (`approval-<id>`, `otp-<modal id>`,
+  `op-<desktop op id>`), and **Allowed records are written with the handle
+  held, before the decision takes effect** (in `respond`, before OTP `Accepted`
+  returns, inside `with_gated_handle`, and before unlock/init publication), so
+  a lock cannot drop an Allowed record whose effect survives. **Declared audit
+  exception (author decision): a denial that happens while the vault is locked
+  or not yet created cannot be HMAC-audited, because there is no key** — this
+  covers the denials of `vault_unlock` (keychain), `vault_init`, and any
+  request refused because the vault locked mid-prompt. In all of these nothing
+  is released, and the tests assert state plus the absence of an Allowed
+  record.
+- **D6** — `ApprovalState::respond` writes its own `desktop-ui` record with
+  the `presence` field; sv-mcp's record and the `AccessController` signature
+  are unchanged.
+- **D7** — `vault_unlock` is gated whenever the requested custody is
+  `OsKeychain`, including the passphrase→keychain migration path.
+- **D8** — command classification: every registered command is classified, and
+  some are recorded as **justified exceptions** with a reason —
+  `vault_list_containers` (plaintext directory names and plaintext
+  `manifest.json` modes; MCP still asks for a click — author decision),
+  `agent_list`, key/secret creation (`transit_create_key`,
+  `signing_create_key`, `broker_create_secret`), `vault_change_passphrase`,
+  `notifications_set_enabled`, `scan_triage_set`. `session_set_limits` is not
+  an exception: an increase is gated (D15).
+- **D9** — `remediate_restore` has no real restore today; the gate runs before
+  the plan removal, so a denied restore does not consume the plan.
+- **D10** — the export save dialog moves **before** the gate, so the
+  destination is part of `op_digest`.
+- **D11** — wake binding: `wake_prepare_access` keeps its derived
+  authorization (signature, agent, session, 300 s expiry); the session is
+  `session-<epoch>` of the approving unlock (D4).
+- **D12** — ADR-0024 is a contract and **stays open**: see the open dependency
+  below.
+- **D13** — cancellation is per attempt and owned by the backend; a queued
+  attempt leaves the queue without prompting, a backend that has not opened
+  its prompt never opens it, and an open prompt is cancelled only by its own
+  backend. **Declared residual (macOS):** robius 0.3.1 cannot cancel an open
+  LocalAuthentication prompt — including one that lands between the adapter's
+  check and `start()`. Such a prompt stays until the user or the system ends
+  it, keeps its slot, and its result is discarded; the adapter pins this in
+  `cancellation_after_start_waits_for_the_prompt_to_end`.
+- **D14** — `GatePass` is consumed under the handle lock: gated commands
+  release or mutate only through `with_gated_handle` / `with_gated_handle_mut`,
+  which re-check the epoch while holding the guard and record the Allowed
+  event before unlocking.
+- **D15** — session limits: an increase needs presence (current and requested
+  values bound, consumed through `with_gated_handle`); a decrease needs none.
+
+**Open dependency (not fulfilled by this implementation)**
+
+- **Spec §7.4 — the ADR-0024 secret-entry submits.** `submit_secret` /
+  `submit_secret_direct` do not exist yet, so the explicit exception of §7.4
+  (the submits calling the same presence coordinator with the same queue and
+  `op_digest` rules) is **not** exercised. The plan adds only the contract —
+  `secret_submit_op(request_id, container, env_var, expected_revision,
+  expected_generation)` — and documents that the ADR-0024 implementation must
+  call `desktop_presence_gate` with it and write through
+  `with_gated_handle_mut`. **Spec §7.4 remains an open dependency**, tracked
+  here, until those submits exist and their §9.2 tests pass (plan D12).
+
+**Pre-existing pendencies (present before this ADR's implementation; out of
+scope, recorded so they are not mistaken for new behaviour)**
+
+- **`blocking_lock()` inside async code in `scan_run`.** The in-memory scan
+  report is inserted with `state.active_scans.blocking_lock()`
+  (`apps/desktop/src-tauri/src/lib.rs:4343-4344`, inside `scan_run`,
+  `apps/desktop/src-tauri/src/lib.rs:4297`). Blocking a tokio mutex from
+  inside async code is documented by tokio as a panic risk; it predates this
+  ADR and is deferred to its own PR.
+- **The lock holds the handle guard while it awaits the servers.**
+  `perform_vault_lock` acquires `state.handle.lock().await`
+  (`apps/desktop/src-tauri/src/lib.rs:3543`), publishes the lock at `:3544`,
+  and then awaits the gateway tasks (`:3570-3585`) **still holding that
+  guard**; the monitor path does the same (`:3632`, awaits at `:3642-3657`).
+  Pre-existing; it widens the critical section across `.await` points.
+- **The `VaultLock` event never reaches the audit log.** Both lock paths build
+  an `AuditAction::VaultLock` event (`apps/desktop/src-tauri/src/lib.rs:3589`
+  and `:3659`) and record it through helpers that first `try_lock()` the handle
+  — `record_desktop_event` (`:2572`) and `record_monitor_lock_event` (`:3675`).
+  The caller still holds that lock, so `try_lock` fails and the record is
+  skipped; even if it succeeded, the handle is already `None` after publication
+  (`:2582`, `:3633`). The result is a silently unrecorded lock event.
+  Pre-existing; fixing it needs the record written with the handle held, as
+  the Allowed records of D5 already are.
+
 ## Alternatives considered
 
 - **robius-authentication on every platform.** Rejected: on Windows it
@@ -410,8 +544,14 @@ reuses the trait defined here.
   (`submit_secret`, `submit_secret_direct`) require presence verification
   before the commit — integrated explicitly, not through `respond()`.
 - `docs/threat-model.md` §3.A–B: the same-user boundary this ADR narrows in
-  practice — the new guarantee and the declared limits (Linux, Windows below
-  Build 22000, `unknown` modality) are to be recorded there, including a new
-  §3 row: an agent driving the Sovereign Vault desktop UI with synthetic
-  input to obtain data or authority beyond MCP — Yes for the gated commands
-  of item 14 on a protected system, with the declared limits otherwise.
+  practice. The new guarantee, the declared limits (Linux, Windows below
+  Build 22000, `unknown` modality) and the `unsafe` exception of
+  `crates/sv-presence-windows` are recorded in
+  [ADR-0025 — Security addendum](0025-presence-verified-approvals-security.md),
+  which records the threat-model row this ADR adds — an agent
+  driving the Sovereign Vault desktop UI with synthetic input to obtain data
+  or authority beyond MCP — Yes for the gated commands of item 14 on a
+  protected system, with the declared limits otherwise — together with the
+  security-review entry. That addendum is a separate file precisely because
+  `docs/threat-model.md` and `docs/SECURITY-REVIEW.md` are cited by the
+  monograph and therefore must not change.
