@@ -1,5 +1,6 @@
 <script lang="ts">
   import { ShieldCheck } from '@lucide/svelte';
+  import { keychainUnlockOffered } from '../lib/keychainDisplay';
   import type { Custody } from '../lib/types';
   import { vaultStore } from '../stores/vault.svelte';
   import { containerStore } from '../stores/containers.svelte';
@@ -16,7 +17,9 @@
   const MIN_PASSPHRASE_CHARS = 16;
 
   let isInit = $derived(!vaultStore.status?.initialized);
-  let keychainAvailable = $derived(vaultStore.status?.keychain_available ?? true);
+  let keychainAvailable = $derived(
+    keychainUnlockOffered(vaultStore.status?.keychain_available ?? null)
+  );
   let passphraseVault = $derived(!isInit && !!vaultStore.status?.has_passphrase_salt);
   let availableTabs = $derived(
     ([

@@ -53,6 +53,7 @@ sv-presence-windows = { workspace = true }
 
 [dev-dependencies]
 sv-presence = { workspace = true, features = ["test-util"] }
+sv-keychain = { workspace = true, features = ["test-fake"] }
 tauri       = { version = "2", features = ["tray-icon", "test"] }
 tokio       = { workspace = true, features = ["test-util"] }
 

@@ -4,6 +4,7 @@
   import CopyButton from '../components/CopyButton.svelte';
   import { vaultStore } from '../stores/vault.svelte';
   import { mcpStore } from '../stores/mcp.svelte';
+  import { keychainBackendLabel, keychainEntryLabel } from '../lib/keychainDisplay';
   import { agentsStore } from '../stores/agents.svelte';
   import { brokerStore } from '../stores/broker.svelte';
   import { approvalStore } from '../stores/approvals.svelte';
@@ -270,14 +271,16 @@
         </div>
         <div class="detail-row">
           <span>OS Keychain entry</span>
-          <strong>{vaultStore.status?.has_keychain_entry ? 'Present' : 'None'}</strong>
+          <strong>{keychainEntryLabel(vaultStore.status?.has_keychain_entry ?? null)}</strong>
         </div>
         <div class="detail-row">
           <span>OS Keychain backend</span>
           <strong>
-            {vaultStore.status?.keychain_available
-              ? vaultStore.status?.keychain_backend
-              : vaultStore.status?.keychain_error ?? 'Unavailable'}
+            {keychainBackendLabel(
+              vaultStore.status?.keychain_available ?? null,
+              vaultStore.status?.keychain_backend ?? 'OS Keychain',
+              vaultStore.status?.keychain_error ?? null
+            )}
           </strong>
         </div>
         <div class="detail-row">

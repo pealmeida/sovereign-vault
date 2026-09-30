@@ -2032,6 +2032,18 @@ impl SessionTimer {
     }
 }
 
+/// What this process has observed about OS keychain custody
+/// (perf/keychain-reads). Every field is `Option`: `None` is genuinely
+/// UNKNOWN — status polling never reads a secret, so absence may only be
+/// reported when a real keychain operation proved it. Recovery unlocks and
+/// custody changes invalidate the observations so a transient failure is
+/// never perpetuated; the next real operation refills them.
+#[derive(Debug, Default)]
+struct KeychainObservation {
+    has_entry: Option<bool>,
+    availability: Option<sv_core::sv_keychain::KeychainAvailability>,
+}
+
 /// In-memory vault state held inside Tauri's managed state.
 struct VaultState<R: Runtime = tauri::Wry> {
     app: AppHandle<R>,
@@ -2073,9 +2085,19 @@ struct VaultState<R: Runtime = tauri::Wry> {
     /// duplicate monitors on every unlock (a leaked second monitor is harmless
     /// but noisy; we drop the old JoinHandle before spawning a new one).
     session_monitor: Mutex<Option<JoinHandle<()>>>,
+    /// What this process has actually OBSERVED about OS keychain custody,
+    /// filled by real keychain operations (init/unlock) and invalidated by
+    /// custody changes and recovery (perf/keychain-reads). Status polling
+    /// never reads a keychain secret: a cold field means UNKNOWN — it must
+    /// not be rendered as absence.
+    keychain_obs: std::sync::Mutex<KeychainObservation>,
     /// Tests only: keeps a MockRuntime harness out of the real app-data
     /// directory.
     root_override: Option<PathBuf>,
+    /// Tests only: port for the gateway listeners (0 = ephemeral), so a
+    /// concurrent dev app holding `RPC_PORT` cannot make unlock tests fail
+    /// or bind real traffic. `None` keeps the production port.
+    rpc_port_override: Option<u16>,
 }
 
 impl<R: Runtime> VaultState<R> {
@@ -2103,7 +2125,9 @@ impl<R: Runtime> VaultState<R> {
             leases: Arc::new(LeaseStore::new()),
             pending_plans: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_monitor: Mutex::new(None),
+            keychain_obs: std::sync::Mutex::new(KeychainObservation::default()),
             root_override,
+            rpc_port_override: None,
         }
     }
 
@@ -2143,6 +2167,32 @@ impl<R: Runtime> VaultState<R> {
         *guard = Some(spawn_session_monitor(self.monitor_state()));
     }
 
+    /// Record a PROVEN fact: a real keychain credential just opened this
+    /// vault. Nothing about absence is ever recorded — passphrase or
+    /// recovery custody proves nothing about what the keychain holds, so
+    /// those flows leave the observation untouched (review: no inferred
+    /// absence).
+    fn note_keychain_credential(&self) {
+        let mut obs = self
+            .keychain_obs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        obs.has_entry = Some(true);
+        obs.availability = Some(sv_core::sv_keychain::KeychainAvailability {
+            backend: sv_core::sv_keychain::platform_backend(),
+            available: true,
+            error: None,
+        });
+    }
+
+    /// Custody changed (recovery repair, migrations): drop the observations.
+    fn invalidate_keychain_observation(&self) {
+        *self
+            .keychain_obs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = KeychainObservation::default();
+    }
+
     /// Refresh the human-activity timestamp.
     fn touch_human_activity(&self) {
         self.session_timer.touch_human_activity();
@@ -2173,9 +2223,11 @@ struct VaultStatus {
     initialized: bool,
     unlocked: bool,
     custody: Option<String>,
-    has_keychain_entry: bool,
+    /// None = this process has not observed the keychain yet (unknown, not
+    /// absent) — perf/keychain-reads.
+    has_keychain_entry: Option<bool>,
     keychain_backend: String,
-    keychain_available: bool,
+    keychain_available: Option<bool>,
     keychain_error: Option<String>,
     has_passphrase_salt: bool,
     has_recovery_bundle: bool,
@@ -3266,21 +3318,53 @@ fn app_version() -> String {
 async fn vault_status(app: AppHandle, state: State<'_, VaultState>) -> Result<VaultStatus, String> {
     // Polling command: do NOT touch_human_activity here.
     let root = vault_root(&app)?;
-    let probe = sv_core::probe(&root).map_err(estr)?;
+    vault_status_impl(state.inner(), &root).await
+}
+
+async fn vault_status_impl<R: Runtime>(
+    state: &VaultState<R>,
+    root: &std::path::Path,
+) -> Result<VaultStatus, String> {
+    // Polling: filesystem facts ONLY (perf/keychain-reads). Every keychain
+    // secret read on an unsigned build costs the user a password prompt, so
+    // the keychain fields report what this process has OBSERVED — None is
+    // unknown, never absence.
+    let probe = sv_core::probe_files(root).map_err(estr)?;
     let guard = state.handle.lock().await;
+    let os_keychain_custody = matches!(
+        guard.as_ref().map(|handle| handle.custody()),
+        Some(CustodyMode::OsKeychain)
+    );
     let custody = guard.as_ref().map(|handle| match handle.custody() {
         CustodyMode::OsKeychain => "OsKeychain".to_string(),
         CustodyMode::Passphrase => "Passphrase".to_string(),
         CustodyMode::Recovery => "Recovery".to_string(),
     });
+    let obs = state
+        .keychain_obs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Only OsKeychain custody is PROOF of a keychain credential; opening
+    // the vault with passphrase or recovery says nothing about what the
+    // keychain holds, so the (possibly still unknown) observation stands.
+    let has_keychain_entry = if os_keychain_custody {
+        Some(true)
+    } else {
+        obs.has_entry
+    };
+    let (keychain_available, keychain_error) = match &obs.availability {
+        Some(availability) => (Some(availability.available), availability.error.clone()),
+        None if os_keychain_custody => (Some(true), None),
+        None => (None, None),
+    };
     Ok(VaultStatus {
         initialized: probe.initialized,
         unlocked: guard.is_some(),
         custody,
-        has_keychain_entry: probe.has_keychain_entry,
-        keychain_backend: probe.keychain_backend.to_string(),
-        keychain_available: probe.keychain_available,
-        keychain_error: probe.keychain_error,
+        has_keychain_entry,
+        keychain_backend: sv_core::sv_keychain::platform_backend().to_string(),
+        keychain_available,
+        keychain_error,
         has_passphrase_salt: probe.has_passphrase_salt,
         has_recovery_bundle: probe.has_recovery_bundle,
         has_keyring: probe.has_keyring,
@@ -3298,8 +3382,8 @@ async fn vault_init(
     vault_init_impl(state.inner(), &root, custody, passphrase).await
 }
 
-/// Creating a vault consumes presence FIRST — before any `sv_core::probe`,
-/// which touches the OS keychain: the gate's declared click is the consent
+/// Creating a vault consumes presence FIRST — before any filesystem probe
+/// or keychain write: the gate's declared click is the consent
 /// that must be approvable before a vault exists at all (spec §7.5 item 10,
 /// plan D5). The initialised-check, the bootstrap, the Allowed records and
 /// the publication then run under one handle guard.
@@ -3331,7 +3415,7 @@ async fn vault_init_impl<R: Runtime>(
         if guard.is_some() || state.session_timer.epoch() != pass.epoch {
             return Err("vault state changed during verification".into());
         }
-        let probe = sv_core::probe(root).map_err(estr)?;
+        let probe = sv_core::probe_files(root).map_err(estr)?;
         if probe.initialized {
             return Err("vault already initialised".into());
         }
@@ -3381,6 +3465,12 @@ async fn vault_init_impl<R: Runtime>(
     let gateway_warning = start_servers(state).await.err().map(|_| {
         "vault initialized, but the local MCP/HTTP gateway could not start; the recovery phrase below is valid and the gateway can be retried after resolving the local error".to_string()
     });
+
+    if mode == CustodyMode::OsKeychain {
+        // Bootstrap proved it: the keychain served this vault and holds its
+        // scoped credential.
+        state.note_keychain_credential();
+    }
 
     Ok(VaultInitResponse {
         recovery_phrase,
@@ -3474,7 +3564,7 @@ async fn vault_unlock_impl<R: Runtime>(
                 return Err("vault state changed during verification".into());
             }
         }
-        let probe = sv_core::probe(root).map_err(estr)?;
+        let probe = sv_core::probe_files(root).map_err(estr)?;
         let handle_result = if mode == CustodyMode::OsKeychain && probe.has_passphrase_salt {
             let pass_phrase = passphrase.as_deref().ok_or_else(|| {
                 "current passphrase is required to move this vault to OS Keychain".to_string()
@@ -3507,10 +3597,19 @@ async fn vault_unlock_impl<R: Runtime>(
         );
         event.presence = pass.as_ref().map(|p| p.presence.clone());
         record_with_handle(state, &handle, event);
+        let keychain_served = handle.custody() == CustodyMode::OsKeychain;
         state.publish_unlocked(&mut guard, handle);
+        // OsKeychain custody — including the passphrase->keychain migration
+        // that just ran — proves the credential and the working backend.
+        // Other custodies prove nothing about the keychain: observation
+        // untouched.
+        if keychain_served {
+            state.note_keychain_credential();
+        }
     }
     if let Err(error) = start_servers(state).await {
         let mut guard = state.handle.lock().await;
+        state.invalidate_keychain_observation();
         rollback_unlock(state, &mut guard, AuditAction::VaultUnlock, &error);
         return Err(error);
     }
@@ -3525,11 +3624,19 @@ async fn vault_unlock_recovery(
     phrase: String,
 ) -> Result<(), String> {
     let root = vault_root(&app)?;
-    let handle = match VaultHandle::unlock_with_recovery(&root, &phrase) {
+    vault_unlock_recovery_impl(state.inner(), &root, &phrase).await
+}
+
+async fn vault_unlock_recovery_impl<R: Runtime>(
+    state: &VaultState<R>,
+    root: &std::path::Path,
+    phrase: &str,
+) -> Result<(), String> {
+    let handle = match VaultHandle::unlock_with_recovery(root, phrase) {
         Ok(handle) => handle,
         Err(error) => {
             record_desktop_event(
-                &state,
+                state,
                 desktop_event(
                     AuditAction::VaultUnlockRecovery,
                     AuditDecision::Error,
@@ -3543,14 +3650,24 @@ async fn vault_unlock_recovery(
             return Err(error.to_string());
         }
     };
+    let repaired_keychain = handle.custody() == CustodyMode::OsKeychain;
     {
         let mut guard = state.handle.lock().await;
         state.publish_unlocked(&mut guard, handle);
     }
-    if let Err(error) = start_servers(&state).await {
+    // Recovery may have repaired the keychain credential: every previous
+    // observation is stale, and polling will not re-derive it. Only the
+    // repair itself — which reports custody back as OsKeychain after a
+    // SUCCESSFUL scoped write — is allowed to record a credential again.
+    state.invalidate_keychain_observation();
+    if repaired_keychain {
+        state.note_keychain_credential();
+    }
+    if let Err(error) = start_servers(state).await {
         let mut guard = state.handle.lock().await;
+        state.invalidate_keychain_observation();
         rollback_unlock(
-            state.inner(),
+            state,
             &mut guard,
             AuditAction::VaultUnlockRecovery,
             &error.to_string(),
@@ -3559,7 +3676,7 @@ async fn vault_unlock_recovery(
     }
     state.restart_session_monitor().await;
     record_desktop_event(
-        &state,
+        state,
         desktop_event(
             AuditAction::VaultUnlockRecovery,
             AuditDecision::Allowed,
@@ -6859,17 +6976,24 @@ async fn start_servers<R: Runtime>(state: &VaultState<R>) -> Result<(), String> 
     stop_servers(state).await;
 
     let secret = sv_core::fresh_pairing_secret().map_err(estr)?;
-    let ws_addr: SocketAddr = format!("127.0.0.1:{RPC_PORT}").parse().map_err(estr)?;
-    let http_addr: SocketAddr = format!("127.0.0.1:{}", RPC_PORT - 1)
-        .parse()
-        .map_err(estr)?;
+    let ws_port = state.rpc_port_override.unwrap_or(RPC_PORT);
+    let http_port = if state.rpc_port_override.is_some() {
+        ws_port
+    } else {
+        RPC_PORT - 1
+    };
+    let ws_addr: SocketAddr = format!("127.0.0.1:{ws_port}").parse().map_err(estr)?;
+    let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().map_err(estr)?;
     let ws_listener = tokio::net::TcpListener::bind(ws_addr).await.map_err(estr)?;
     let http_listener = tokio::net::TcpListener::bind(http_addr)
         .await
         .map_err(estr)?;
 
     let audit_root = audit_root(state)?;
-    let vault_dir = vault_root(&state.app)?;
+    // Honor the harness root override (see VaultState::root_override): the
+    // gateway and its agent registry belong to the SAME vault root the
+    // state opened, never to the default app-data path.
+    let vault_dir = state_root(state)?;
     let (audit_hmac_key, agent_token_key) = {
         let guard = state.handle.lock().await;
         let handle = guard
@@ -7302,11 +7426,11 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().join("sovereign-vault");
             let presence = Arc::new(sv_presence::PresenceCoordinator::new(fake.clone()));
-            app.manage(VaultState::new_with(
-                app.handle().clone(),
-                presence,
-                Some(root.clone()),
-            ));
+            let mut vault =
+                VaultState::new_with(app.handle().clone(), presence, Some(root.clone()));
+            // Gateway listeners bind ephemeral ports in tests.
+            vault.rpc_port_override = Some(0);
+            app.manage(vault);
             Self {
                 app,
                 _dir: dir,
@@ -8662,6 +8786,142 @@ mod tests {
                 .await,
             "the approving session's authorization never crosses into a new one"
         );
+    }
+
+    /// perf/keychain-reads: `vault_status` is a polling command. On this
+    /// unsigned dev binary every secret read of a foreign item prompts for
+    /// the macOS password, so polling must never touch the keychain at all.
+    #[tokio::test]
+    async fn vault_status_polling_reads_no_keychain_secrets() {
+        let _serialized = sv_core::sv_keychain::fake::lock_for_test_async().await;
+        let h = Harness::new(FakeVerifier::unavailable());
+        let _ = vault_status_impl(h.state(), &h.root).await.unwrap();
+
+        sv_core::sv_keychain::fake::reset_reads();
+        let status = vault_status_impl(h.state(), &h.root).await.unwrap();
+        let reads = sv_core::sv_keychain::fake::reads();
+        assert!(
+            reads.is_empty(),
+            "status polling read keychain secrets: {reads:?}"
+        );
+        assert!(!status.initialized);
+        // Cold cache and locked: absence may not be invented.
+        assert_eq!(status.has_keychain_entry, None);
+        assert_eq!(status.keychain_available, None);
+    }
+
+    /// (a) Passphrase custody proves nothing about what the keychain holds:
+    /// an unlocked-by-passphrase vault must report UNKNOWN, never an
+    /// inferred absence — and locking must not change that.
+    #[tokio::test]
+    async fn passphrase_custody_never_infers_keychain_absence() {
+        let _serialized = sv_core::sv_keychain::fake::lock_for_test_async().await;
+        let h = Harness::unlocked(FakeVerifier::unavailable()).await;
+        sv_core::sv_keychain::fake::reset_reads();
+        let status = vault_status_impl(h.state(), &h.root).await.unwrap();
+        assert!(sv_core::sv_keychain::fake::reads().is_empty());
+        assert!(status.unlocked);
+        assert_eq!(status.has_keychain_entry, None);
+        assert_eq!(status.keychain_available, None);
+
+        perform_vault_lock(h.state(), "manual").await;
+        let status = vault_status_impl(h.state(), &h.root).await.unwrap();
+        assert!(!status.unlocked);
+        assert_eq!(status.has_keychain_entry, None);
+        assert_eq!(status.keychain_available, None);
+        assert!(sv_core::sv_keychain::fake::reads().is_empty());
+    }
+
+    /// (b) A successful OS-keychain unlock PROVES the credential: report
+    /// Some(true), keep it after lock, and let polling observe it without
+    /// any keychain read.
+    #[tokio::test]
+    async fn keychain_unlock_observes_credential_and_lock_keeps_it() {
+        let _serialized = sv_core::sv_keychain::fake::lock_for_test_async().await;
+        let h = Harness::new(FakeVerifier::protected());
+        let boot = VaultHandle::bootstrap(&h.root, CustodyMode::OsKeychain, None).unwrap();
+        drop(boot);
+        h.fake.approve_next();
+        vault_unlock_impl(h.state(), &h.root, "OsKeychain".into(), None)
+            .await
+            .unwrap();
+        let status = vault_status_impl(h.state(), &h.root).await.unwrap();
+        assert_eq!(status.has_keychain_entry, Some(true));
+        assert_eq!(status.keychain_available, Some(true));
+
+        perform_vault_lock(h.state(), "manual").await;
+        sv_core::sv_keychain::fake::reset_reads();
+        let status = vault_status_impl(h.state(), &h.root).await.unwrap();
+        let again = vault_status_impl(h.state(), &h.root).await.unwrap();
+        assert_eq!(
+            status.has_keychain_entry,
+            Some(true),
+            "lock is not a custody change"
+        );
+        assert_eq!(again.has_keychain_entry, Some(true));
+        assert!(
+            sv_core::sv_keychain::fake::reads().is_empty(),
+            "polling must serve the observation from cache: {:?}",
+            sv_core::sv_keychain::fake::reads()
+        );
+    }
+
+    /// (c) Recovery may rewrite custody: everything observed before is
+    /// stale after it, and a plain (unrepaired) recovery unlock records
+    /// nothing new.
+    #[tokio::test]
+    async fn recovery_unlock_invalidates_observations() {
+        let _serialized = sv_core::sv_keychain::fake::lock_for_test_async().await;
+        let h = Harness::new(FakeVerifier::protected());
+        let boot = VaultHandle::bootstrap(&h.root, CustodyMode::Passphrase, Some(TEST_PASSPHRASE))
+            .unwrap();
+        let phrase = boot.recovery_phrase.clone();
+        drop(boot);
+        // A vault that had been opened by keychain at some point: the
+        // observation cache says Present. Recovery must drop that claim.
+        h.state().note_keychain_credential();
+        assert_eq!(
+            vault_status_impl(h.state(), &h.root)
+                .await
+                .unwrap()
+                .has_keychain_entry,
+            Some(true),
+            "the cache accepted a proven observation"
+        );
+
+        vault_unlock_recovery_impl(h.state(), &h.root, &phrase)
+            .await
+            .unwrap();
+        let status = vault_status_impl(h.state(), &h.root).await.unwrap();
+        assert_eq!(status.custody.as_deref(), Some("Recovery"));
+        assert_eq!(
+            status.has_keychain_entry, None,
+            "recovery invalidates prior observations and proves nothing"
+        );
+    }
+
+    /// (d) The passphrase->keychain migration unlock is a proven
+    /// credential: record Some(true) after success.
+    #[tokio::test]
+    async fn migration_to_keychain_records_credential() {
+        let _serialized = sv_core::sv_keychain::fake::lock_for_test_async().await;
+        let h = Harness::new(FakeVerifier::protected());
+        let boot = VaultHandle::bootstrap(&h.root, CustodyMode::Passphrase, Some(TEST_PASSPHRASE))
+            .unwrap();
+        drop(boot);
+        h.fake.approve_next();
+        vault_unlock_impl(
+            h.state(),
+            &h.root,
+            "OsKeychain".into(),
+            Some(TEST_PASSPHRASE.into()),
+        )
+        .await
+        .unwrap();
+        let status = vault_status_impl(h.state(), &h.root).await.unwrap();
+        assert_eq!(status.custody.as_deref(), Some("OsKeychain"));
+        assert_eq!(status.has_keychain_entry, Some(true));
+        assert_eq!(status.keychain_available, Some(true));
     }
 
     #[tokio::test]
