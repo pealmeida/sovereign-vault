@@ -413,9 +413,7 @@ impl ClickRequest {
 
     /// The declared consent click of `vault_unlock` (keychain) and
     /// `vault_init`: the only clicks that can be approved without a vault.
-    /// Their audit happens at commit, under the handle guard (Task 13);
-    /// exercised in tests meanwhile.
-    #[allow(dead_code)] // production callers land with Task 13
+    /// Their audit happens at commit, under the handle guard (Task 13).
     fn desktop_pre_unlock(
         label: &str,
         audit_action: AuditAction,
@@ -1675,6 +1673,17 @@ impl<E: WakeEmitter> WakeQueue<E> {
             None
         }
     }
+
+    /// Look a pending request up WITHOUT consuming it, so an approval can
+    /// gate on presence before the removal (verify before mutation).
+    async fn peek(&self, id: u64) -> Option<WakeRequest> {
+        self.requests
+            .lock()
+            .await
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+    }
 }
 
 /// Authorization granted by a human when responding to a wake request. A lease
@@ -1975,8 +1984,11 @@ struct VaultState<R: Runtime = tauri::Wry> {
     leases: Arc<LeaseStore>,
     /// Backend-held pending remediation plans (ADR-0020 §2). The renderer only
     /// sees opaque `plan_id`s; the real path lives here, resolved from the
-    /// stored scan report.
-    pending_plans: Arc<Mutex<HashMap<String, PendingPlan>>>,
+    /// stored scan report. A `std` mutex: gated commands consult it while
+    /// already holding the handle, and tokio's `blocking_lock` panics inside
+    /// async contexts (lock order is always handle → plans, never across an
+    /// await).
+    pending_plans: Arc<std::sync::Mutex<HashMap<String, PendingPlan>>>,
     /// Handle to the session monitor task. Stored so we can avoid spawning
     /// duplicate monitors on every unlock (a leaked second monitor is harmless
     /// but noisy; we drop the old JoinHandle before spawning a new one).
@@ -2008,7 +2020,7 @@ impl<R: Runtime> VaultState<R> {
             session_timer: SessionTimer::new(),
             wake_queue: Arc::new(WakeQueue::new(app.clone())),
             leases: Arc::new(LeaseStore::new()),
-            pending_plans: Arc::new(Mutex::new(HashMap::new())),
+            pending_plans: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_monitor: Mutex::new(None),
             root_override,
         }
@@ -3142,54 +3154,59 @@ async fn vault_init(
     custody: String,
     passphrase: Option<String>,
 ) -> Result<VaultInitResponse, String> {
-    let mode = parse_custody(&custody)?;
     let root = vault_root(&app)?;
-    let probe = sv_core::probe(&root).map_err(estr)?;
-    if probe.initialized {
-        return Err("vault already initialised".into());
-    }
-    state.touch_human_activity();
+    vault_init_impl(state.inner(), &root, custody, passphrase).await
+}
 
-    let BootstrapResult {
-        handle,
-        recovery_phrase,
-    } = match VaultHandle::bootstrap(&root, mode, passphrase.as_deref()) {
-        Ok(result) => result,
-        Err(error) => {
-            record_desktop_event(
-                &state,
-                desktop_event(
-                    AuditAction::VaultInit,
-                    AuditDecision::Error,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(error.to_string()),
-                ),
-            );
-            return Err(error.to_string());
+/// Creating a vault consumes presence FIRST — before any `sv_core::probe`,
+/// which touches the OS keychain: the gate's declared click is the consent
+/// that must be approvable before a vault exists at all (spec §7.5 item 10,
+/// plan D5). The initialised-check, the bootstrap, the Allowed records and
+/// the publication then run under one handle guard.
+async fn vault_init_impl<R: Runtime>(
+    state: &VaultState<R>,
+    root: &std::path::Path,
+    custody: String,
+    passphrase: Option<String>,
+) -> Result<VaultInitResponse, String> {
+    let mode = parse_custody(&custody)?;
+    state.touch_human_activity();
+    let op =
+        sv_presence::OpDescriptor::new("vault_init").field("vault", root.display().to_string());
+    let pass = match desktop_presence_gate(
+        state,
+        ClickRequest::desktop_pre_unlock("Create vault", AuditAction::VaultInit, op),
+    )
+    .await
+    {
+        Ok(pass) => pass,
+        Err(denied) => {
+            // A not-yet-existing vault has no audit key: this denial is the
+            // declared D5 exception, recorded nowhere.
+            return Err(denied.message);
         }
     };
-
-    {
+    let recovery_phrase = {
         let mut guard = state.handle.lock().await;
-        state.publish_unlocked(&mut guard, handle);
-    }
-    state.restart_session_monitor().await;
-
-    // Initialization is already durably committed at this point, and the
-    // recovery phrase exists only in this response. A gateway bind failure
-    // must never turn that successful bootstrap into an error that discards
-    // the phrase and strands the vault. Keep the handle available for the
-    // desktop UI and return a non-secret warning instead.
-    let gateway_warning = start_servers(&state).await.err().map(|_| {
-        "vault initialized, but the local MCP/HTTP gateway could not start; the recovery phrase below is valid and the gateway can be retried after resolving the local error".to_string()
-    });
-
-    record_desktop_event(
-        &state,
-        desktop_event(
+        if guard.is_some() || state.session_timer.epoch() != pass.epoch {
+            return Err("vault state changed during verification".into());
+        }
+        let probe = sv_core::probe(root).map_err(estr)?;
+        if probe.initialized {
+            return Err("vault already initialised".into());
+        }
+        let BootstrapResult {
+            handle,
+            recovery_phrase,
+        } = match VaultHandle::bootstrap(root, mode, passphrase.as_deref()) {
+            Ok(result) => result,
+            Err(error) => {
+                // Still no vault, still no key: the old Error record could
+                // never be authenticated on this path either.
+                return Err(error.to_string());
+            }
+        };
+        let mut init = desktop_event(
             AuditAction::VaultInit,
             AuditDecision::Allowed,
             None,
@@ -3197,11 +3214,10 @@ async fn vault_init(
             None,
             None,
             None,
-        ),
-    );
-    record_desktop_event(
-        &state,
-        desktop_event(
+        );
+        init.presence = Some(pass.presence.clone());
+        record_with_handle(state, &handle, init);
+        let mut issued = desktop_event(
             AuditAction::RecoveryIssued,
             AuditDecision::Allowed,
             None,
@@ -3209,12 +3225,32 @@ async fn vault_init(
             None,
             None,
             None,
-        ),
-    );
+        );
+        issued.presence = Some(pass.presence.clone());
+        record_with_handle(state, &handle, issued);
+        state.publish_unlocked(&mut guard, handle);
+        recovery_phrase
+    };
+    state.restart_session_monitor().await;
+
+    // Initialization is already durably committed at this point, and the
+    // recovery phrase exists only in this response. A gateway bind failure
+    // must never turn that successful bootstrap into an error that discards
+    // the phrase and strands the vault. Keep the handle available for the
+    // desktop UI and return a non-secret warning instead.
+    let gateway_warning = start_servers(state).await.err().map(|_| {
+        "vault initialized, but the local MCP/HTTP gateway could not start; the recovery phrase below is valid and the gateway can be retried after resolving the local error".to_string()
+    });
+
     Ok(VaultInitResponse {
         recovery_phrase,
         gateway_warning,
     })
+}
+
+/// ADR-0025 §7.5 item 9 / plan D7: the knowledge-free unlock is the gated one.
+fn unlock_requires_presence(mode: CustodyMode) -> bool {
+    mode == CustodyMode::OsKeychain
 }
 
 #[tauri::command]
@@ -3224,47 +3260,91 @@ async fn vault_unlock(
     custody: String,
     passphrase: Option<String>,
 ) -> Result<(), String> {
-    let mode = parse_custody(&custody)?;
     let root = vault_root(&app)?;
-    let probe = sv_core::probe(&root).map_err(estr)?;
-    let handle_result = if mode == CustodyMode::OsKeychain && probe.has_passphrase_salt {
-        let pass = passphrase.as_deref().ok_or_else(|| {
-            "current passphrase is required to move this vault to OS Keychain".to_string()
-        })?;
-        VaultHandle::unlock(&root, CustodyMode::Passphrase, Some(pass)).and_then(|mut handle| {
-            handle.move_to_os_keychain(&root, pass)?;
-            Ok(handle)
-        })
-    } else {
-        VaultHandle::unlock(&root, mode, passphrase.as_deref())
-    };
-    let handle = match handle_result {
-        Ok(handle) => handle,
-        Err(error) => {
-            record_desktop_event(
-                &state,
-                desktop_event(
+    vault_unlock_impl(state.inner(), &root, custody, passphrase).await
+}
+
+/// The keychain unlock checks, unlocks, records and publishes under ONE
+/// handle guard (D4/D5): a lock or another unlock completing during the
+/// prompt invalidates this attempt, and nothing reaches the KEK afterwards.
+async fn vault_unlock_impl<R: Runtime>(
+    state: &VaultState<R>,
+    root: &std::path::Path,
+    custody: String,
+    passphrase: Option<String>,
+) -> Result<(), String> {
+    let mode = parse_custody(&custody)?;
+    let pass = if unlock_requires_presence(mode) {
+        // ADR-0025 §7.5 item 9 (plan D7): the one unlock that needs no
+        // knowledge. Presence comes first; denials here are not auditable
+        // (locked vault, declared D5 exception).
+        let op = sv_presence::OpDescriptor::new("vault_unlock")
+            .field("vault", root.display().to_string())
+            .bind("custody", "os_keychain");
+        Some(
+            desktop_presence_gate(
+                state,
+                ClickRequest::desktop_pre_unlock(
+                    "Unlock vault with OS keychain",
                     AuditAction::VaultUnlock,
-                    AuditDecision::Error,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(error.to_string()),
+                    op,
                 ),
-            );
-            return Err(error.to_string());
-        }
+            )
+            .await
+            .map_err(|denied| denied.message)?,
+        )
+    } else {
+        None
     };
     {
         let mut guard = state.handle.lock().await;
+        // Revalidate under the lock: still locked, same epoch (no unlock or
+        // lock completed while the prompt was open).
+        if let Some(pass) = &pass {
+            if guard.is_some() || state.session_timer.epoch() != pass.epoch {
+                return Err("vault state changed during verification".into());
+            }
+        }
+        let probe = sv_core::probe(root).map_err(estr)?;
+        let handle_result = if mode == CustodyMode::OsKeychain && probe.has_passphrase_salt {
+            let pass_phrase = passphrase.as_deref().ok_or_else(|| {
+                "current passphrase is required to move this vault to OS Keychain".to_string()
+            })?;
+            VaultHandle::unlock(root, CustodyMode::Passphrase, Some(pass_phrase)).and_then(
+                |mut handle| {
+                    handle.move_to_os_keychain(root, pass_phrase)?;
+                    Ok(handle)
+                },
+            )
+        } else {
+            VaultHandle::unlock(root, mode, passphrase.as_deref())
+        };
+        let handle = match handle_result {
+            Ok(handle) => handle,
+            Err(error) => {
+                // A failed unlock leaves the vault locked: no key, so no
+                // authenticated record is possible on this path (D5).
+                return Err(error.to_string());
+            }
+        };
+        let mut event = desktop_event(
+            AuditAction::VaultUnlock,
+            AuditDecision::Allowed,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        event.presence = pass.as_ref().map(|p| p.presence.clone());
+        record_with_handle(state, &handle, event);
         state.publish_unlocked(&mut guard, handle);
     }
-    if let Err(error) = start_servers(&state).await {
+    if let Err(error) = start_servers(state).await {
         let mut guard = state.handle.lock().await;
         state.publish_locked(&mut guard);
-        record_desktop_event(
-            &state,
+        record_desktop_event_locked(
+            state,
             desktop_event(
                 AuditAction::VaultUnlock,
                 AuditDecision::Error,
@@ -3274,22 +3354,11 @@ async fn vault_unlock(
                 None,
                 Some(error.clone()),
             ),
-        );
+        )
+        .await;
         return Err(error);
     }
     state.restart_session_monitor().await;
-    record_desktop_event(
-        &state,
-        desktop_event(
-            AuditAction::VaultUnlock,
-            AuditDecision::Allowed,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
-    );
     Ok(())
 }
 
@@ -3394,7 +3463,11 @@ async fn perform_vault_lock<R: Runtime>(state: &VaultState<R>, reason: &str) {
     // after the user deliberately ended their access. Re-planning after
     // unlock is cheap and re-reads the file, which is the behaviour we want
     // anyway.
-    state.pending_plans.lock().await.clear();
+    state
+        .pending_plans
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
     // Same reasoning for the tray menu: a pending Approve row is a live
     // authorization, and it must not survive the user ending their session.
     if let Some(tray_state) = state.app.try_state::<tray::TrayApprovals>() {
@@ -4388,7 +4461,8 @@ async fn remediate_plan_file(
         // keeps the registry consistent with the handle lifetime.
         state
             .pending_plans
-            .blocking_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(pending.id.clone(), pending);
 
         Ok(view)
@@ -4427,7 +4501,10 @@ async fn remediate_plan_file(
 #[tauri::command]
 async fn remediate_plan_list(state: State<'_, VaultState>) -> Result<Vec<PlanView>, String> {
     // Polling command: do NOT touch_human_activity here.
-    let plans = state.pending_plans.lock().await;
+    let plans = state
+        .pending_plans
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     Ok(plans
         .values()
         .map(|p| PlanView {
@@ -4442,29 +4519,105 @@ async fn remediate_plan_list(state: State<'_, VaultState>) -> Result<Vec<PlanVie
         .collect())
 }
 
+/// The complete description of one remediation operation (§6.3): the plan
+/// identity, the snapshot digest it was built against, the manifest, the
+/// adapter and the file path.
+fn remediation_op(kind: &'static str, plan_id: &str, p: &PendingPlan) -> sv_presence::OpDescriptor {
+    sv_presence::OpDescriptor::new(kind)
+        .field("file", p.plan.path.to_string_lossy())
+        .bind("plan", plan_id)
+        .bind("snapshot", hex::encode(p.snapshot_digest.as_bytes()))
+        .bind("manifest", p.plan.manifest_path.to_string_lossy())
+        .bind("adapter", p.plan.adapter.as_str())
+}
+
+/// Lock order is handle → plans everywhere; the guard is never held across
+/// an await.
+fn plans_lock<R: Runtime>(
+    state: &VaultState<R>,
+) -> std::sync::MutexGuard<'_, HashMap<String, PendingPlan>> {
+    state
+        .pending_plans
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// TTL-pruned lookup, exactly as `remediate_execute` does today: an expired
+/// plan is indistinguishable from one that never existed.
+fn live_plan(
+    plans: &mut HashMap<String, PendingPlan>,
+    plan_id: &str,
+) -> Result<PendingPlan, String> {
+    let now = chrono::Utc::now();
+    plans.retain(|_, p| (now - p.created_at).num_seconds() < PLAN_TTL_SECS);
+    plans
+        .get(plan_id)
+        .cloned()
+        .ok_or_else(|| "unknown plan id".to_string())
+}
+
 #[tauri::command]
 async fn remediate_execute(
     state: State<'_, VaultState>,
     plan_id: String,
     confirm_digest: String,
 ) -> Result<IngestView, String> {
-    state.touch_human_activity();
+    remediate_execute_impl(state.inner(), plan_id, confirm_digest).await
+}
 
-    let result = with_handle(&state, |handle| {
+/// Presence FIRST, then the ingest only through `with_gated_handle`: the
+/// `confirm_digest` binds which plan runs but is not a presence proof
+/// (spec §7.5 item 4), and a denied or stale gate ingests nothing.
+async fn remediate_execute_impl<R: Runtime>(
+    state: &VaultState<R>,
+    plan_id: String,
+    confirm_digest: String,
+) -> Result<IngestView, String> {
+    state.touch_human_activity();
+    let snapshot = {
+        let mut plans = plans_lock(state);
+        live_plan(&mut plans, &plan_id)?
+    };
+    let pass = match desktop_presence_gate(
+        state,
+        ClickRequest::desktop(
+            "Move secret file into the vault",
+            AuditAction::PlanApprove,
+            remediation_op("remediate_execute", &plan_id, &snapshot),
+        ),
+    )
+    .await
+    {
+        Ok(pass) => pass,
+        Err(denied) => {
+            return Err(record_gate_denial(
+                state,
+                denied,
+                desktop_event(
+                    AuditAction::PlanApprove,
+                    AuditDecision::Denied,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await);
+        }
+    };
+    let result = with_gated_handle(state, &pass, |handle| {
         let vault_root = vault_root(&state.app).map_err(estr)?;
         let key = sv_remediate::PlanKey::from_bytes(&handle.remediation_plan_key())
             .map_err(|error| format!("invalid plan key: {error}"))?;
 
         let plan = {
-            let mut plans = state.pending_plans.blocking_lock();
-            // Drop everything past its TTL first, so an expired plan is
-            // indistinguishable from one that never existed.
-            let now = chrono::Utc::now();
-            plans.retain(|_, p| (now - p.created_at).num_seconds() < PLAN_TTL_SECS);
-            let pending = plans
-                .get(&plan_id)
-                .ok_or_else(|| "unknown plan id".to_string())?
-                .clone();
+            let mut plans = plans_lock(state);
+            let pending = live_plan(&mut plans, &plan_id)?;
+            // §6.3/§7.5: the plan must not have moved while the prompt was
+            // open, and it must still be the operation that was approved.
+            pass.ensure_same(&remediation_op("remediate_execute", &plan_id, &pending))
+                .map_err(|denied| denied.message)?;
             let expected = hex::encode(pending.snapshot_digest.as_bytes());
             // `ct_eq` is only constant-time across equal-length slices, and
             // on unequal lengths it does not compare at all. Reject a
@@ -4476,7 +4629,7 @@ async fn remediate_execute(
                 return Err("plan digest mismatch".to_string());
             }
             pending
-        };
+        }; // the plans guard is dropped before the synchronous ingest runs
 
         let assurance = if cfg!(unix) {
             IdentityAssurance::Enforced
@@ -4497,7 +4650,7 @@ async fn remediate_execute(
 
         // Terminal outcome: remove the plan from the registry regardless of
         // success, so a retry requires rebuilding and re-approving.
-        state.pending_plans.blocking_lock().remove(&plan_id);
+        plans_lock(state).remove(&plan_id);
 
         let view = match ingest_status {
             ManagedIngestStatus::Ingested { manifest } => IngestView {
@@ -4526,30 +4679,58 @@ async fn remediate_execute(
             },
         };
 
-        Ok(view)
+        Ok((
+            view,
+            desktop_event(
+                AuditAction::PlanApprove,
+                AuditDecision::Allowed,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ))
     })
     .await;
 
-    // The approval moment is its own audited event, separate from the
-    // execution that follows it: a refused confirmation must leave a record
-    // even though nothing was executed. It is emitted here rather than inside
-    // the closure because `record_desktop_event` takes the handle mutex that
-    // `with_handle` still holds in there, and would silently drop the event.
-    record_desktop_event(
-        &state,
-        desktop_event(
-            AuditAction::PlanApprove,
-            match &result {
-                Err(error) if error == "plan digest mismatch" => AuditDecision::Denied,
-                _ => AuditDecision::Allowed,
-            },
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
-    );
+    // The approval moment keeps today's record shape after the helper
+    // returns: a successful run recorded its Allowed under the handle (with
+    // presence); a `"plan digest mismatch"` is a Denied; other post-gate
+    // failures keep the Allowed record they emitted before this refactor.
+    match &result {
+        Ok(_) => {}
+        Err(error) if error == "plan digest mismatch" => {
+            record_desktop_event_locked(
+                state,
+                desktop_event(
+                    AuditAction::PlanApprove,
+                    AuditDecision::Denied,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(error.clone()),
+                ),
+            )
+            .await;
+        }
+        Err(_) => {
+            record_desktop_event_locked(
+                state,
+                desktop_event(
+                    AuditAction::PlanApprove,
+                    AuditDecision::Allowed,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await;
+        }
+    }
 
     match &result {
         Ok(view) => {
@@ -4558,8 +4739,8 @@ async fn remediate_execute(
             } else {
                 AuditDecision::Error
             };
-            record_desktop_event(
-                &state,
+            record_desktop_event_locked(
+                state,
                 desktop_event(
                     AuditAction::PlanExecute,
                     decision,
@@ -4569,20 +4750,24 @@ async fn remediate_execute(
                     None,
                     view.reason.clone(),
                 ),
-            );
+            )
+            .await;
         }
-        Err(error) => record_desktop_event(
-            &state,
-            desktop_event(
-                AuditAction::PlanExecute,
-                AuditDecision::Error,
-                None,
-                None,
-                None,
-                None,
-                Some(error.clone()),
-            ),
-        ),
+        Err(error) => {
+            record_desktop_event_locked(
+                state,
+                desktop_event(
+                    AuditAction::PlanExecute,
+                    AuditDecision::Error,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(error.clone()),
+                ),
+            )
+            .await;
+        }
     }
     result
 }
@@ -4592,68 +4777,115 @@ async fn remediate_restore(
     state: State<'_, VaultState>,
     plan_id_or_ref: String,
 ) -> Result<RestoreView, String> {
-    state.touch_human_activity();
+    remediate_restore_impl(state.inner(), plan_id_or_ref).await
+}
 
-    let result = with_handle(&state, |handle| {
+/// Presence FIRST; the plan is consumed only after the gate and the
+/// revalidation under the handle guard — a denied restore consumes nothing
+/// (plan D9).
+async fn remediate_restore_impl<R: Runtime>(
+    state: &VaultState<R>,
+    plan_id_or_ref: String,
+) -> Result<RestoreView, String> {
+    state.touch_human_activity();
+    let snapshot = {
+        let mut plans = plans_lock(state);
+        live_plan(&mut plans, &plan_id_or_ref)?
+    };
+    let pass = match desktop_presence_gate(
+        state,
+        ClickRequest::desktop(
+            "Restore file from vault",
+            AuditAction::PlanExecute,
+            remediation_op("remediate_restore", &plan_id_or_ref, &snapshot),
+        ),
+    )
+    .await
+    {
+        Ok(pass) => pass,
+        Err(denied) => {
+            return Err(record_gate_denial(
+                state,
+                denied,
+                desktop_event(
+                    AuditAction::PlanExecute,
+                    AuditDecision::Denied,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await);
+        }
+    };
+    let result = with_gated_handle(state, &pass, |handle| {
         let vault_root = vault_root(&state.app).map_err(estr)?;
         let mut sink = HandleSink::new(handle, vault_root.clone());
 
         // If the argument matches a known plan id, prefer the stored plan
-        // so the renderer cannot point restore at an arbitrary path.
-        let (record, root) =
-            if let Some(pending) = state.pending_plans.blocking_lock().remove(&plan_id_or_ref) {
-                (
-                    sv_remediate::RecoveryRecord {
-                        plan_digest: pending.snapshot_digest,
-                        project_id: pending.plan.project_id,
-                        path: pending.plan.path.clone(),
-                        identity: pending.plan.identity,
-                        snapshot_digest: pending.snapshot_digest,
-                        snapshot_ref: "".to_string(), // unused for spanless restore; ingest has not run
-                        discovery: DiscoveryPolicy::Opaque,
-                        locator: None,
-                        span: None,
-                        replacement: None,
-                        created_at: pending.created_at,
-                    },
-                    pending.project_root,
-                )
-            } else {
-                return Err("unknown plan id".to_string());
-            };
+        // so the renderer cannot point restore at an arbitrary path. The
+        // consumption happens only here, after the gate (D9).
+        let pending = {
+            let mut plans = plans_lock(state);
+            let pending = live_plan(&mut plans, &plan_id_or_ref)?;
+            pass.ensure_same(&remediation_op(
+                "remediate_restore",
+                &plan_id_or_ref,
+                &pending,
+            ))
+            .map_err(|denied| denied.message)?;
+            plans.remove(&plan_id_or_ref).expect("just looked up")
+        };
+        let (record, root) = (
+            sv_remediate::RecoveryRecord {
+                plan_digest: pending.snapshot_digest,
+                project_id: pending.plan.project_id,
+                path: pending.plan.path.clone(),
+                identity: pending.plan.identity,
+                snapshot_digest: pending.snapshot_digest,
+                snapshot_ref: "".to_string(), // unused for spanless restore; ingest has not run
+                discovery: DiscoveryPolicy::Opaque,
+                locator: None,
+                span: None,
+                replacement: None,
+                created_at: pending.created_at,
+            },
+            pending.project_root,
+        );
 
         // Managed-file restore is a full-file rollback. For pending plans we
         // have not yet ingested, there is nothing to restore; report that.
         if record.snapshot_ref.is_empty() {
-            return Ok(RestoreView {
-                restored: false,
-                reason: Some("plan has not been executed yet".to_string()),
-            });
+            let reason = Some("plan has not been executed yet".to_string());
+            return Ok((
+                RestoreView {
+                    restored: false,
+                    reason: reason.clone(),
+                },
+                desktop_event(
+                    AuditAction::PlanExecute,
+                    AuditDecision::Error,
+                    None,
+                    None,
+                    None,
+                    None,
+                    reason,
+                ),
+            ));
         }
 
         // Restore expects a recovery record written by the sink. Pending
         // plans do not have one, so this command cannot run against them.
         // Real restore requires loading the recovery record from the vault.
         let _ = (&record, &root, &mut sink);
-        Err("pending plan cannot be restored before execution".to_string())
-    })
-    .await;
-
-    match &result {
-        Ok(RestoreView { restored: true, .. }) => record_desktop_event(
-            &state,
-            desktop_event(
-                AuditAction::PlanExecute,
-                AuditDecision::Allowed,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-        ),
-        _ => record_desktop_event(
-            &state,
+        let message = "pending plan cannot be restored before execution".to_string();
+        Ok((
+            RestoreView {
+                restored: false,
+                reason: Some(message.clone()),
+            },
             desktop_event(
                 AuditAction::PlanExecute,
                 AuditDecision::Error,
@@ -4661,9 +4893,28 @@ async fn remediate_restore(
                 None,
                 None,
                 None,
-                result.as_ref().err().cloned(),
+                Some(message),
             ),
-        ),
+        ))
+    })
+    .await;
+    if let Err(error) = &result {
+        // Today the outer block records every failed restore as a PlanExecute
+        // Error; under the gate that record was impossible once the lock
+        // raced the run, so it is written here instead.
+        record_desktop_event_locked(
+            state,
+            desktop_event(
+                AuditAction::PlanExecute,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.clone()),
+            ),
+        )
+        .await;
     }
     result
 }
@@ -5638,35 +5889,29 @@ async fn wake_list(state: State<'_, VaultState>) -> Result<Vec<WakePrompt>, Stri
 /// the specific operation (ADR-0020 §10).
 #[tauri::command]
 async fn wake_respond(state: State<'_, VaultState>, id: u64, approved: bool) -> Result<(), String> {
+    wake_respond_impl(state.inner(), id, approved).await
+}
+
+/// Approving a wake grants agent authority, so it verifies presence first
+/// (spec §7.5 item 5); refusing stays immediate. The whole check-record
+/// sequence for an approval runs under ONE handle guard: vault-state
+/// transitions only happen under that guard (Task 7), so no lock or re-unlock
+/// can interleave between the epoch check, the consumption and the record.
+async fn wake_respond_impl<R: Runtime>(
+    state: &VaultState<R>,
+    id: u64,
+    approved: bool,
+) -> Result<(), String> {
     state.touch_human_activity();
-    let Some(request) = state.wake_queue.respond(id, approved).await else {
-        return Err("wake request not found".into());
-    };
-    if approved {
-        // Record an authorized wake for this agent/resource. The lease itself
-        // is issued later, bound to the exact operation and arguments.
-        state
-            .leases
-            .record_authorized_wake(&request.signature, &request.agent_id, &state.session_id())
-            .await;
+    if !approved {
+        // Refusal needs no gate and no vault: peek to answer "not found"
+        // truthfully, then consume.
+        let Some(request) = state.wake_queue.peek(id).await else {
+            return Err("wake request not found".into());
+        };
+        state.wake_queue.respond(id, false).await;
         record_desktop_event(
-            &state,
-            desktop_event(
-                AuditAction::VaultInfo,
-                AuditDecision::Allowed,
-                None,
-                None,
-                None,
-                None,
-                Some(format!(
-                    "wake-approved agent={} resource={}",
-                    request.agent_id, request.opaque_resource_ref
-                )),
-            ),
-        );
-    } else {
-        record_desktop_event(
-            &state,
+            state,
             desktop_event(
                 AuditAction::VaultInfo,
                 AuditDecision::Denied,
@@ -5680,7 +5925,75 @@ async fn wake_respond(state: State<'_, VaultState>, id: u64, approved: bool) -> 
                 )),
             ),
         );
+        return Ok(());
     }
+    let Some(request) = state.wake_queue.peek(id).await else {
+        return Err("wake request not found".into());
+    };
+    let op = sv_presence::OpDescriptor::new("wake_respond")
+        .field("agent", request.agent_id.clone())
+        .field("resource", request.opaque_resource_ref.clone())
+        .bind("wake_id", id.to_string())
+        .bind("signature", request.signature.clone())
+        .bind("session", state.session_id());
+    let pass = match desktop_presence_gate(
+        state,
+        ClickRequest::desktop("Approve wake request", AuditAction::VaultInfo, op),
+    )
+    .await
+    {
+        Ok(pass) => pass,
+        Err(denied) => {
+            return Err(record_gate_denial(
+                state,
+                denied,
+                desktop_event(
+                    AuditAction::VaultInfo,
+                    AuditDecision::Denied,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await);
+        }
+    };
+    let guard = state.handle.lock().await;
+    let Some(handle) = guard.as_ref() else {
+        return Err("vault is locked".into());
+    };
+    if state.session_timer.epoch() != pass.epoch {
+        return Err("vault state changed after verification; try again".into());
+    }
+    // The session the human approved in, derived from the pass, not re-read.
+    let session = format!("session-{}", pass.epoch);
+    let Some(request) = state.wake_queue.respond(id, true).await else {
+        return Err("wake request not found".into());
+    };
+    // Record an authorized wake for this agent/resource, bound to the
+    // approving session (D11). The lease itself is issued later, bound to the
+    // exact operation and arguments.
+    state
+        .leases
+        .record_authorized_wake(&request.signature, &request.agent_id, &session)
+        .await;
+    let mut event = desktop_event(
+        AuditAction::VaultInfo,
+        AuditDecision::Allowed,
+        None,
+        None,
+        None,
+        None,
+        Some(format!(
+            "wake-approved agent={} resource={}",
+            request.agent_id, request.opaque_resource_ref
+        )),
+    );
+    event.presence = Some(pass.presence.clone());
+    record_with_handle(state, handle, event);
+    drop(guard);
     Ok(())
 }
 
@@ -6072,7 +6385,7 @@ fn cli_binary_path() -> Result<String, String> {
     }
 }
 
-async fn start_servers<R: Runtime>(state: &State<'_, VaultState<R>>) -> Result<(), String> {
+async fn start_servers<R: Runtime>(state: &VaultState<R>) -> Result<(), String> {
     stop_servers(state).await;
 
     let secret = sv_core::fresh_pairing_secret().map_err(estr)?;
@@ -6147,7 +6460,7 @@ async fn start_servers<R: Runtime>(state: &State<'_, VaultState<R>>) -> Result<(
     Ok(())
 }
 
-async fn stop_servers<R: Runtime>(state: &State<'_, VaultState<R>>) {
+async fn stop_servers<R: Runtime>(state: &VaultState<R>) {
     let mut guard = state.servers.lock().await;
     if let Some(mut servers) = guard.take() {
         if let Some(tx) = servers.ws_tx.take() {
@@ -7337,6 +7650,259 @@ mod tests {
         assert!(
             h.state().approvals.pending.lock().await.is_empty(),
             "no modal on a protected system (D3)"
+        );
+    }
+
+    /// Test-only extension of `LeaseStore`, kept inside the tests module so
+    /// the production file keeps a single `#[cfg(test)]` boundary for the
+    /// source-scan splits: a back-dated wake authorization makes expiry
+    /// testable without waiting.
+    impl LeaseStore {
+        async fn record_authorized_wake_at(
+            &self,
+            resource_signature: &str,
+            agent_id: &str,
+            session_id: &str,
+            at: Instant,
+        ) {
+            let auth = WakeAuthorization {
+                agent_id: agent_id.to_string(),
+                session_id: session_id.to_string(),
+                authorized_at: at,
+            };
+            self.authorized_wakes
+                .lock()
+                .await
+                .insert(resource_signature.to_string(), auth);
+        }
+    }
+
+    async fn plan_fixture(h: &Harness) -> (String, PathBuf) {
+        let project = h.root.parent().unwrap().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".env"), "API_KEY=sk-test-123\n").unwrap();
+        let project = project.canonicalize().unwrap();
+        let plan = {
+            let guard = h.state().handle.lock().await;
+            let handle = guard.as_ref().unwrap();
+            let key = sv_remediate::PlanKey::from_bytes(&handle.remediation_plan_key()).unwrap();
+            ManagedFilePlan::build(
+                "proj",
+                std::path::Path::new(".env"),
+                &project,
+                ConsumerAdapter::EnvInjection,
+                std::path::Path::new(".env.vault-manifest.json"),
+                sv_remediate::managed::SharedBinding::Independent,
+                &key,
+            )
+            .unwrap()
+        };
+        let id = mint_plan_id();
+        let snapshot_digest = plan.snapshot_digest;
+        h.state().pending_plans.lock().unwrap().insert(
+            id.clone(),
+            PendingPlan {
+                id: id.clone(),
+                project_root: project.clone(),
+                plan,
+                snapshot_digest,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        (id, project.join(".env"))
+    }
+
+    #[tokio::test]
+    async fn remediate_execute_leaves_project_unchanged_without_presence() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let (plan_id, file) = plan_fixture(&h).await;
+        let before = std::fs::read(&file).unwrap();
+        let digest = {
+            let plans = h.state().pending_plans.lock().unwrap();
+            hex::encode(plans[&plan_id].snapshot_digest.as_bytes())
+        };
+        h.fake
+            .push(FakeStep::Return(Err(sv_presence::PresenceError::Cancelled)));
+        let got = remediate_execute_impl(h.state(), plan_id.clone(), digest).await;
+        assert!(got.is_err(), "a digest match alone is not enough");
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        assert!(
+            h.state()
+                .pending_plans
+                .lock()
+                .unwrap()
+                .contains_key(&plan_id),
+            "plan not consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn remediate_restore_consumes_nothing_without_presence() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let (plan_id, _) = plan_fixture(&h).await;
+        h.fake
+            .push(FakeStep::Return(Err(sv_presence::PresenceError::Cancelled)));
+        assert!(remediate_restore_impl(h.state(), plan_id.clone())
+            .await
+            .is_err());
+        assert!(h
+            .state()
+            .pending_plans
+            .lock()
+            .unwrap()
+            .contains_key(&plan_id));
+    }
+
+    #[tokio::test]
+    async fn wake_approval_records_no_authorization_without_presence() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.state()
+            .wake_queue
+            .request("agent-1".into(), "res".into())
+            .await;
+        let id = h.state().wake_queue.list().await[0].id;
+        h.fake
+            .push(FakeStep::Return(Err(sv_presence::PresenceError::Cancelled)));
+        assert!(wake_respond_impl(h.state(), id, true).await.is_err());
+        let sig = wake_signature("agent-1", "res");
+        assert!(
+            !h.state()
+                .leases
+                .has_authorized_wake(&sig, "agent-1", &h.state().session_id())
+                .await
+        );
+        assert_eq!(
+            h.state().wake_queue.list().await.len(),
+            1,
+            "request still pending: verify before mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_refusal_needs_no_presence() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.state()
+            .wake_queue
+            .request("agent-1".into(), "res".into())
+            .await;
+        let id = h.state().wake_queue.list().await[0].id;
+        wake_respond_impl(h.state(), id, false).await.unwrap();
+        assert_eq!(h.fake.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn wake_prepare_access_refuses_without_current_authorization() {
+        let store = LeaseStore::new();
+        // Direct call with no approval.
+        assert!(!store.has_authorized_wake("sig", "agent-1", "s1").await);
+        // Expired authorization.
+        store
+            .record_authorized_wake_at(
+                "sig",
+                "agent-1",
+                "s1",
+                Instant::now() - Duration::from_secs(WAKE_REQUEST_TTL_SECS + 1),
+            )
+            .await;
+        assert!(!store.has_authorized_wake("sig", "agent-1", "s1").await);
+        // Session switch and scope (resource/agent) switch.
+        store.record_authorized_wake("sig", "agent-1", "s1").await;
+        assert!(!store.has_authorized_wake("sig", "agent-1", "s2").await);
+        assert!(
+            !store
+                .has_authorized_wake("other-sig", "agent-1", "s1")
+                .await
+        );
+        assert!(!store.has_authorized_wake("sig", "agent-2", "s1").await);
+    }
+
+    /// D11/D4: the authorization lives and dies with the session that
+    /// approved it.
+    #[tokio::test]
+    async fn wake_authorization_is_bound_to_the_approving_session() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        h.state()
+            .wake_queue
+            .request("agent-1".into(), "res".into())
+            .await;
+        let id = h.state().wake_queue.list().await[0].id;
+        h.fake.approve_next();
+        let old_epoch = h.state().session_timer.epoch();
+        wake_respond_impl(h.state(), id, true).await.unwrap();
+        let sig = wake_signature("agent-1", "res");
+        assert!(
+            h.state()
+                .leases
+                .has_authorized_wake(&sig, "agent-1", &format!("session-{old_epoch}"))
+                .await
+        );
+        // Lock and unlock: a new session must not inherit the authorization.
+        let handle = {
+            let mut g = h.state().handle.lock().await;
+            let handle = g.take().unwrap();
+            h.state().publish_locked(&mut g);
+            handle
+        };
+        drop(handle);
+        let re =
+            VaultHandle::unlock(&h.root, CustodyMode::Passphrase, Some(TEST_PASSPHRASE)).unwrap();
+        {
+            let mut g = h.state().handle.lock().await;
+            h.state().publish_unlocked(&mut g, re);
+        }
+        assert!(
+            !h.state()
+                .leases
+                .has_authorized_wake(&sig, "agent-1", &h.state().session_id())
+                .await,
+            "the approving session's authorization never crosses into a new one"
+        );
+    }
+
+    #[tokio::test]
+    async fn keychain_unlock_does_not_unlock_without_presence() {
+        let h = Harness::new(FakeVerifier::protected());
+        h.fake
+            .push(FakeStep::Return(Err(sv_presence::PresenceError::Cancelled)));
+        let got = vault_unlock_impl(h.state(), &h.root, "OsKeychain".into(), None).await;
+        assert!(got.is_err());
+        assert!(h.state().handle.lock().await.is_none());
+        assert_eq!(
+            h.fake.calls(),
+            1,
+            "gate runs before any keychain or probe access"
+        );
+    }
+
+    /// Declared exception (spec §7.5): only keychain custody needs presence.
+    /// A pure predicate, so the test never reaches `sv_core::probe`, which
+    /// touches the real OS keychain.
+    #[test]
+    fn only_keychain_unlock_requires_presence() {
+        assert!(unlock_requires_presence(CustodyMode::OsKeychain));
+        assert!(!unlock_requires_presence(CustodyMode::Passphrase));
+        assert!(!unlock_requires_presence(CustodyMode::Recovery));
+    }
+
+    #[tokio::test]
+    async fn vault_init_creates_no_vault_without_presence() {
+        let h = Harness::new(FakeVerifier::protected());
+        h.fake
+            .push(FakeStep::Return(Err(sv_presence::PresenceError::Cancelled)));
+        let got = vault_init_impl(
+            h.state(),
+            &h.root,
+            "Passphrase".into(),
+            Some(TEST_PASSPHRASE.into()),
+        )
+        .await;
+        assert!(got.is_err());
+        // A plain filesystem check instead of `sv_core::probe`: tests must
+        // never touch the OS keychain, and the gate denies before the impl
+        // would probe.
+        assert!(
+            !h.root.join("manifest.json").exists(),
+            "no vault was created"
         );
     }
 
