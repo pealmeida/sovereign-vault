@@ -1824,22 +1824,54 @@ fn should_repair_keychain_after_recovery(root: &Path) -> bool {
 }
 
 fn load_keychain_unwrapped(root: &Path) -> Result<(MasterKey, keyring::Unwrapped)> {
-    let candidates = load_keychain_kek_candidates(root)?;
-    if candidates.is_empty() {
+    // Scoped first, legacy only when the scoped credential cannot serve this
+    // vault (perf/keychain-reads): the scoped entry is the one this root owns,
+    // and consulting the legacy `master-key` eagerly would cost a keychain
+    // authorization on every unlock for a credential healthy installs no
+    // longer have. A scoped READ that fails outright — denial or backend
+    // error — propagates; it must not degrade into a legacy fallback, which
+    // would silently unlock under a different credential.
+    let scoped = load_scoped_keychain_b64(root)?;
+    let mut decode_error: Option<CoreError> = None;
+    if let Some(b64) = scoped.as_deref() {
+        match decode_keychain_kek(b64) {
+            Ok(kek) => {
+                if let Ok(unwrapped) = keyring::load(root, &kek) {
+                    return Ok((kek, unwrapped));
+                }
+            }
+            Err(error) => decode_error = Some(error),
+        }
+    }
+
+    // Absent, undecodable, or unable to open the keyring: the legacy
+    // credential is the only other candidate.
+    let legacy = sv_keychain::load_master_key()?;
+    if scoped.is_none() && legacy.is_none() {
         return Err(CoreError::Misuse(
             "no key in OS keychain - bootstrap the vault first".into(),
         ));
     }
-
-    for candidate in candidates {
-        if let Ok(unwrapped) = keyring::load(root, &candidate.kek) {
-            if candidate.source == KeychainKekSource::Legacy {
-                store_scoped_keychain_kek(root, &candidate.kek)?;
+    if let Some(b64) = legacy.as_deref() {
+        if scoped.as_deref() != Some(b64) {
+            match decode_keychain_kek(b64) {
+                Ok(kek) => {
+                    if let Ok(unwrapped) = keyring::load(root, &kek) {
+                        // Preserve the legacy->scoped migration. If storing
+                        // the scoped credential fails, the legacy entry is
+                        // untouched and the vault stays recoverable.
+                        store_scoped_keychain_kek(root, &kek)?;
+                        return Ok((kek, unwrapped));
+                    }
+                }
+                Err(error) => decode_error = Some(error),
             }
-            return Ok((candidate.kek, unwrapped));
         }
     }
 
+    if let Some(error) = decode_error {
+        return Err(error);
+    }
     Err(CoreError::Misuse(
         "OS keychain key could not unwrap this vault's keyring; use recovery unlock or restore the original OS keychain credential".into(),
     ))
@@ -2333,6 +2365,40 @@ pub fn probe(root: &Path) -> Result<InitState> {
         has_recovery_bundle: sv_recovery::has_recovery_bundle(root),
         has_keyring: keyring::exists(root),
     })
+}
+
+/// On-disk facts about a vault root, gathered WITHOUT touching the OS
+/// keychain. Polling surfaces (the desktop's `vault_status`) use this: a
+/// keychain round trip or secret read on every poll would demand the
+/// macOS keychain password from the user for no reason. [`probe`] remains
+/// for callers that explicitly want the live keychain view.
+pub struct FileState {
+    /// True if the vault root has a `manifest.json`.
+    pub initialized: bool,
+    /// True if `master.salt` is present (passphrase custody).
+    pub has_passphrase_salt: bool,
+    /// True if the recovery bundle exists.
+    pub has_recovery_bundle: bool,
+    /// True if the keyring (`keyring.svault`) is present. False for legacy
+    /// vaults that have not yet been migrated on first unlock.
+    pub has_keyring: bool,
+}
+
+/// Inspect only the filesystem state of a vault root (see [`FileState`]).
+pub fn probe_files(root: &Path) -> Result<FileState> {
+    Ok(FileState {
+        initialized: path_entry_exists(&root.join("manifest.json")),
+        has_passphrase_salt: path_entry_exists(&root.join(SALT_FILENAME)),
+        has_recovery_bundle: sv_recovery::has_recovery_bundle(root),
+        has_keyring: keyring::exists(root),
+    })
+}
+
+/// Explicit, live keychain presence check — this READS keychain entries and
+/// must only be called from user-initiated custody operations, never from
+/// status polling.
+pub fn keychain_entry_present(root: &Path) -> Result<bool> {
+    has_keychain_kek(root)
 }
 
 /// Resolve a candidate vault root path, creating any missing parents.

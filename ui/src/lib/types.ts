@@ -20,9 +20,11 @@ export interface VaultStatus {
   initialized: boolean;
   unlocked: boolean;
   custody: Custody | null;
-  has_keychain_entry: boolean;
+  /** null = not observed by the app yet (unknown, NOT absence). */
+  has_keychain_entry: boolean | null;
   keychain_backend: string;
-  keychain_available: boolean;
+  /** null = not observed by the app yet (unknown, NOT unavailable). */
+  keychain_available: boolean | null;
   keychain_error: string | null;
   has_passphrase_salt: boolean;
   has_recovery_bundle: boolean;
