@@ -8664,26 +8664,47 @@ mod tests {
         );
     }
 
-    /// CP3 BLOQUEIO 3: the declared gate's modal must carry the OPERATION's
-    /// classification and deadline — not re-classify and re-arm a fresh one.
+    /// CP3 BLOQUEIO 3 (Codex caveat, strengthened): the availability flips
+    /// BETWEEN the operation's classification and the creation of the
+    /// PendingApproval — so a re-classification inside `request_click` is
+    /// detected, not just a race around the gate. The declared gate's modal
+    /// must carry the OPERATION's classification and deadline.
     #[tokio::test]
     async fn declared_gate_keeps_the_operation_classification_and_deadline() {
         let h = Harness::unlocked(FakeVerifier::unavailable()).await;
         let op = sv_presence::OpDescriptor::new("probe").field("x", "1");
         let digest = op.digest();
-        let gate = async {
-            desktop_presence_gate(
-                h.state(),
-                ClickRequest::desktop("probe", AuditAction::ReadFile, op.clone()),
+        // 1. The operation is classified while the system is DECLARED.
+        let attempt = h.state().presence.begin_attempt();
+        let op_registered = h
+            .state()
+            .desktop_ops
+            .begin(
+                digest,
+                Instant::now() + Duration::from_secs(APPROVAL_TIMEOUT_SECS),
+                || h.state().presence.classify().is_protected(),
+                attempt.id(),
             )
             .await
+            .expect("the operation registers fresh");
+        assert!(!op_registered.protected, "born on a declared system");
+        let op_protected = op_registered.protected;
+        let op_deadline = op_registered.deadline;
+        // 2. BEFORE the modal exists, the environment turns protected.
+        h.fake
+            .set_availability(sv_presence::Availability::Protected { modalities: vec![] });
+        // 3. The gate path opens the declared modal with the operation's
+        //    identity — exactly what desktop_presence_gate does in its
+        //    unprotected branch.
+        let click = ClickRequest::desktop("probe", AuditAction::ReadFile, op);
+        let approvals = h.state().approvals.clone();
+        let gate = async move {
+            approvals
+                .request_click(click, TrayMirror::No, Some(op_protected), Some(op_deadline))
+                .await
         };
         let inspect = async {
             let id = h.next_pending_id().await;
-            // A protected system appearing MID-prompt must not reclassify:
-            // the operation was born unprotected (D2 fixes it at creation).
-            h.fake
-                .set_availability(sv_presence::Availability::Protected { modalities: vec![] });
             let (entry_protected, entry_deadline) = {
                 let pending = h.state().approvals.pending.lock().await;
                 let e = pending.get(&id).expect("the modal is pending");
@@ -8691,18 +8712,20 @@ mod tests {
             };
             assert!(
                 !entry_protected,
-                "the modal inherits the operation's classification"
+                "the modal inherits the operation's classification, not a re-read of availability"
             );
-            let ops_deadline = h
-                .state()
-                .desktop_ops
-                .deadline(digest)
-                .await
-                .expect("the operation is registered");
             assert_eq!(
-                entry_deadline, ops_deadline,
+                entry_deadline, op_deadline,
                 "one deadline, not a fresh window re-armed at the modal"
             );
+            assert_eq!(
+                h.state().desktop_ops.deadline(digest).await,
+                Some(op_deadline),
+                "the registry keys the operation by its own digest"
+            );
+            // On a misclassified entry this approve verifies presence through
+            // the now-Protected verifier instead of taking the declared
+            // click — and fails (unscripted).
             h.state().approvals.respond(id, true, None).await.unwrap();
         };
         let (got, ()) = tokio::join!(gate, inspect);
