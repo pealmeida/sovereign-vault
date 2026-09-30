@@ -42,6 +42,12 @@ export interface VaultInitResponse {
   gateway_warning?: string;
 }
 
+/// Whether approvals on this system are presence-protected (ADR-0025 §6.2).
+export interface PresenceStatus {
+  protected: boolean;
+  reason: string | null;
+}
+
 export interface ApprovalPrompt {
   id: number;
   action: string;

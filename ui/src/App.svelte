@@ -19,7 +19,12 @@
   import { approvalStore } from './stores/approvals.svelte';
   import { wakeStore } from './stores/wake.svelte';
   import { toastStore } from './stores/toast.svelte';
-  import type { ApprovalPrompt, WakePrompt } from './lib/types';
+  import type { ApprovalPrompt, WakePrompt, PresenceStatus } from './lib/types';
+  import { invoke } from './lib/tauri';
+
+  // ADR-0025 §6.2: permanent, non-dismissable notice when the system cannot
+  // attest presence — approvals fall back to the declared consent click.
+  let presenceNotice = $state<{ reason: string } | null>(null);
 
   $effect(() => {
     if (vaultStore.status?.unlocked) {
@@ -51,6 +56,11 @@
           await containerStore.refresh();
           await mcpStore.refresh();
           await wakeStore.refresh();
+          // ADR-0025 §6.2: permanent notice while presence is unavailable.
+          const status = await invoke<PresenceStatus>('presence_status');
+          if (!status.protected) {
+            presenceNotice = { reason: status.reason ?? '' };
+          }
         }
       } catch (e) {
         toastStore.setError(e);
@@ -105,6 +115,12 @@
 <div class="app-shell">
   <SidebarNav />
   <main class="main-shell">
+    {#if presenceNotice}
+      <div class="notice-banner error" role="alert">
+        Unprotected approvals on this system — approvals are confirmed with a
+        click because no OS presence check is available ({presenceNotice.reason}).
+      </div>
+    {/if}
     <TopBar />
     {#if vaultStore.status === null}
       <div class="boot-state">
