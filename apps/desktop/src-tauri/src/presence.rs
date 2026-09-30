@@ -157,3 +157,48 @@ impl DesktopOps {
         self.ops.lock().await.is_empty()
     }
 }
+
+/// ADR-0024 contract (spec §7.4; plan D12). `submit_secret` and
+/// `submit_secret_direct` do not exist yet. When implemented they MUST:
+/// call `desktop_presence_gate` with this descriptor BEFORE the write;
+/// perform the write inside `with_gated_handle_mut`; take no click
+/// fallback on a protected system; deny on mid-attempt unavailability.
+/// The digest binds the request, container, env var, the expected
+/// revision (`None` for a new key, ADR-0024 spec §6) and the container
+/// generation id (§4.3), so a verification can never commit a different
+/// revision or a recreated namesake container.
+/// Spec §7.4 stays OPEN until those submits exist and pass §9.2.
+#[allow(dead_code)] // wired by the ADR-0024 implementation
+pub(crate) fn secret_submit_op(
+    request_id: &str,
+    container: &str,
+    env_var: &str,
+    expected_revision: Option<u64>,
+    expected_generation: &str,
+) -> sv_presence::OpDescriptor {
+    sv_presence::OpDescriptor::new("secret_submit")
+        .field("container", container)
+        .field("variable", env_var)
+        .bind("request_id", request_id)
+        .bind(
+            "expected_revision",
+            expected_revision
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "none".into()),
+        )
+        .bind("expected_generation", expected_generation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::secret_submit_op as op;
+
+    #[test]
+    fn secret_submit_digest_binds_revision_and_generation() {
+        let base = op("r1", "c", "API_KEY", Some(7), "gen-a").digest();
+        assert_ne!(base, op("r1", "c", "API_KEY", Some(8), "gen-a").digest());
+        assert_ne!(base, op("r1", "c", "API_KEY", None, "gen-a").digest());
+        assert_ne!(base, op("r1", "c", "API_KEY", Some(7), "gen-b").digest());
+        assert_ne!(base, op("r2", "c", "API_KEY", Some(7), "gen-a").digest());
+    }
+}

@@ -1930,7 +1930,6 @@ impl SessionTimer {
 
     /// The two session limits as they currently are. Never silently skipped:
     /// plain atomic loads and stores (plan D15 reads them for its comparison).
-    #[allow(dead_code)] // consumed by the D15 comparison in Task 14
     fn limits(&self) -> (u64, u64) {
         (
             self.idle_timeout_secs.load(Ordering::SeqCst),
@@ -1982,6 +1981,10 @@ struct VaultState<R: Runtime = tauri::Wry> {
     /// Short-lived, single-use leases issued after human approval of a wake
     /// request (ADR-0020 §10).
     leases: Arc<LeaseStore>,
+    /// Serializes session-limit changes (plan D15): the widening check reads
+    /// the real atomics under this lock, so concurrent changes never
+    /// interleave and a shrink cannot turn a widening into a free change.
+    limits_change: tokio::sync::Mutex<()>,
     /// Backend-held pending remediation plans (ADR-0020 §2). The renderer only
     /// sees opaque `plan_id`s; the real path lives here, resolved from the
     /// stored scan report. A `std` mutex: gated commands consult it while
@@ -2018,6 +2021,7 @@ impl<R: Runtime> VaultState<R> {
             servers: Arc::new(Mutex::new(None)),
             active_scans: Mutex::new(HashMap::new()),
             session_timer: SessionTimer::new(),
+            limits_change: tokio::sync::Mutex::new(()),
             wake_queue: Arc::new(WakeQueue::new(app.clone())),
             leases: Arc::new(LeaseStore::new()),
             pending_plans: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -6139,14 +6143,93 @@ async fn session_status(state: State<'_, VaultState>) -> Result<SessionStatus, S
 /// Update the session limits. This is a deliberate human action in the settings
 /// page, so it counts as human activity.
 #[tauri::command]
+async fn session_set_limits_impl<R: Runtime>(
+    state: &VaultState<R>,
+    idle_secs: u64,
+    absolute_secs: u64,
+) -> Result<(), String> {
+    state.touch_human_activity();
+    // Held across the gate: concurrent changes wait, they never interleave.
+    let _serial = state.limits_change.lock().await;
+    let (idle_now, absolute_now) = state.session_timer.limits();
+    let widens = idle_secs.max(1) > idle_now || absolute_secs.max(1) > absolute_now;
+    if !widens {
+        state.set_limits(idle_secs, absolute_secs);
+        return Ok(());
+    }
+    // Keeping the vault unlocked longer widens exposure: presence first,
+    // and the pass is CONSUMED under the handle lock with the epoch check.
+    let op = sv_presence::OpDescriptor::new("session_limits")
+        .field("idle_secs", idle_secs.to_string())
+        .field("absolute_secs", absolute_secs.to_string())
+        .bind("from", format!("{idle_now}/{absolute_now}"));
+    let pass = match desktop_presence_gate(
+        state,
+        ClickRequest::desktop("Extend session limits", AuditAction::VaultInfo, op),
+    )
+    .await
+    {
+        Ok(pass) => pass,
+        Err(denied) => {
+            let mut event = desktop_event(
+                AuditAction::VaultInfo,
+                AuditDecision::Denied,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            event.detail = Some("session-limits-increase".into());
+            return Err(record_gate_denial(state, denied, event).await);
+        }
+    };
+    with_gated_handle(state, &pass, |_handle| {
+        state.set_limits(idle_secs, absolute_secs);
+        let mut event = desktop_event(
+            AuditAction::VaultInfo,
+            AuditDecision::Allowed,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        event.detail = Some("session-limits-increase".into());
+        Ok(((), event))
+    })
+    .await
+}
+
+#[tauri::command]
 async fn session_set_limits(
     state: State<'_, VaultState>,
     idle_secs: u64,
     absolute_secs: u64,
 ) -> Result<(), String> {
-    state.touch_human_activity();
-    state.set_limits(idle_secs, absolute_secs);
-    Ok(())
+    session_set_limits_impl(state.inner(), idle_secs, absolute_secs).await
+}
+
+#[derive(Debug, Serialize)]
+struct PresenceStatus {
+    protected: bool,
+    reason: Option<String>,
+}
+
+/// Whether approvals on this system are presence-protected, for the
+/// permanent notice (ADR-0025 §6.2). Polling: no idle refresh.
+#[tauri::command]
+async fn presence_status(state: State<'_, VaultState>) -> Result<PresenceStatus, String> {
+    Ok(match state.presence.classify() {
+        sv_presence::Classification::Protected => PresenceStatus {
+            protected: true,
+            reason: None,
+        },
+        sv_presence::Classification::Unprotected(reason) => PresenceStatus {
+            protected: false,
+            reason: Some(reason.message().to_string()),
+        },
+    })
 }
 
 /// Enable or disable OS notifications. A deliberate human action in the
@@ -6562,6 +6645,7 @@ pub fn run() {
             remediate_execute,
             remediate_restore,
             cli_binary_path,
+            presence_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Sovereign Vault");
@@ -6574,6 +6658,249 @@ mod tests {
     use tauri::test::MockRuntime;
 
     const TEST_PASSPHRASE: &str = "correct horse battery staple";
+
+    /// ADR-0025 §9.2 classification of every registered command (plan D8).
+    #[derive(Debug, Clone, Copy)]
+    enum Gate {
+        /// The command body calls the presence gate itself.
+        Own(&'static str),
+        /// Authorization derived from an earlier gated decision.
+        Derived(&'static str),
+        /// Justified exception (plan D8, spec §7.5 declared list).
+        Exception(&'static str),
+    }
+
+    /// ADR-0025 §9.2: every registered command is classified; a new command
+    /// without a classification fails here.
+    const COMMAND_GATES: &[(&str, Gate)] = &[
+        ("app_version", Gate::Exception("no vault data")),
+        ("vault_status", Gate::Exception("status metadata; polling")),
+        ("vault_init", Gate::Own("desktop_presence_gate")),
+        ("vault_unlock", Gate::Own("desktop_presence_gate")), // keychain only; passphrase declared
+        (
+            "vault_unlock_recovery",
+            Gate::Exception("needs the recovery phrase; keylogging is a non-goal"),
+        ),
+        ("vault_lock", Gate::Exception("reduces authority")),
+        (
+            "vault_change_passphrase",
+            Gate::Exception("needs the current passphrase"),
+        ),
+        ("vault_rotate_key", Gate::Own("desktop_presence_gate")),
+        (
+            "vault_list_containers",
+            Gate::Exception(
+                "names are plaintext dirs, modes in plaintext manifest.json (D8; author decision)",
+            ),
+        ),
+        (
+            "vault_create_container",
+            Gate::Exception("creates, releases nothing"),
+        ),
+        (
+            "vault_delete_container",
+            Gate::Own("require_desktop_consent"),
+        ),
+        (
+            "audit_tail",
+            Gate::Exception("audit stores HMAC'd names; polling"),
+        ),
+        ("audit_verify", Gate::Exception("integrity report only")),
+        (
+            "scan_run",
+            Gate::Exception("scans a user-chosen path; findings are masked"),
+        ),
+        ("scan_store", Gate::Exception("persists a masked report")),
+        (
+            "scan_history_list",
+            Gate::Exception("masked report metadata; polling"),
+        ),
+        (
+            "scan_report_get",
+            Gate::Exception("masked findings; the reveal is gated"),
+        ),
+        ("scan_reveal", Gate::Own("desktop_presence_gate")),
+        (
+            "scan_triage_set",
+            Gate::Exception("changes what the user notices; grants no approval or release (D8)"),
+        ),
+        (
+            "vault_list_files",
+            Gate::Exception("metadata class, spec §7.5 declared"),
+        ),
+        ("vault_write_file", Gate::Own("require_desktop_consent")),
+        ("vault_read_file", Gate::Own("require_desktop_consent")),
+        ("vault_export_file", Gate::Own("require_desktop_consent")),
+        (
+            "open_audit_folder",
+            Gate::Exception("reveals a location, not content"),
+        ),
+        ("vault_delete_file", Gate::Own("require_desktop_consent")),
+        ("approval_respond", Gate::Own("approvals.respond")),
+        ("approval_reveal_otp", Gate::Own("reveal_otp")),
+        (
+            "wake_request",
+            Gate::Exception("creates a request; releases nothing"),
+        ),
+        (
+            "wake_list",
+            Gate::Exception("pending wake metadata; polling"),
+        ),
+        ("wake_respond", Gate::Own("desktop_presence_gate")),
+        ("wake_prepare_access", Gate::Derived("has_authorized_wake")),
+        (
+            "mcp_status",
+            Gate::Exception(
+                "pairing secret already public via /.well-known/mcp-pairing, spec §7.5",
+            ),
+        ),
+        ("session_status", Gate::Exception("timer metadata; polling")),
+        ("session_set_limits", Gate::Own("desktop_presence_gate")), // increases only (D15)
+        (
+            "notifications_set_enabled",
+            Gate::Exception("changes what the user notices; approvals still need presence (D8)"),
+        ),
+        ("agent_create", Gate::Own("desktop_presence_gate")),
+        ("agent_list", Gate::Exception("metadata, no tokens (D8)")),
+        ("agent_revoke", Gate::Exception("reduces authority")),
+        (
+            "transit_create_key",
+            Gate::Exception("creates material; every use is MCP-gated (D8)"),
+        ),
+        ("transit_list_keys", Gate::Exception("key names; polling")),
+        (
+            "signing_create_key",
+            Gate::Exception("creates material; every use is MCP-gated (D8)"),
+        ),
+        ("signing_list_keys", Gate::Exception("key names; polling")),
+        (
+            "broker_create_secret",
+            Gate::Exception("stores a secret; every use is MCP-gated (D8)"),
+        ),
+        (
+            "broker_list_secrets",
+            Gate::Exception("secret names; polling"),
+        ),
+        ("broker_enabled", Gate::Exception("feature flag")),
+        (
+            "remediate_plan_file",
+            Gate::Exception("plans only; execution is gated"),
+        ),
+        (
+            "remediate_plan_list",
+            Gate::Exception("plan metadata; polling"),
+        ),
+        ("remediate_execute", Gate::Own("desktop_presence_gate")),
+        ("remediate_restore", Gate::Own("desktop_presence_gate")),
+        ("cli_binary_path", Gate::Exception("install path")),
+        ("presence_status", Gate::Exception("availability metadata")),
+    ];
+
+    #[test]
+    fn every_registered_command_has_a_presence_classification() {
+        let src = include_str!("lib.rs");
+        let start = src.find("tauri::generate_handler![").unwrap();
+        let end = start + src[start..].find(']').unwrap();
+        let registered: Vec<&str> = src[start + "tauri::generate_handler![".len()..end]
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let body = src.split("#[cfg(test)]").next().unwrap();
+        for name in &registered {
+            let (_, gate) = COMMAND_GATES
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| {
+                    panic!("{name} is registered but has no ADR-0025 classification")
+                });
+            let marker = match gate {
+                Gate::Own(m) | Gate::Derived(m) => *m,
+                Gate::Exception(reason) => {
+                    assert!(!reason.is_empty());
+                    continue;
+                }
+            };
+            // The marker must appear in the command or in its `_impl`.
+            let found = [format!("fn {name}("), format!("fn {name}_impl")]
+                .iter()
+                .any(|sig| {
+                    body.find(sig.as_str()).is_some_and(|pos| {
+                        let rest = &body[pos..];
+                        let end = rest[1..]
+                            .find("\n#[tauri::command]")
+                            .map(|i| i + 1)
+                            .unwrap_or(rest.len());
+                        rest[..end].contains(marker)
+                    })
+                });
+            assert!(
+                found,
+                "{name} is classified {gate:?} but its body does not call {marker}"
+            );
+        }
+        for (name, _) in COMMAND_GATES {
+            assert!(
+                registered.contains(name),
+                "{name} is classified but not registered"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raising_session_limits_needs_presence() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let before = h.state().session_timer.limits();
+        h.fake
+            .push(FakeStep::Return(Err(sv_presence::PresenceError::Cancelled)));
+        assert!(session_set_limits_impl(h.state(), before.0 * 10, before.1)
+            .await
+            .is_err());
+        assert_eq!(
+            h.state().session_timer.limits(),
+            before,
+            "no presence, no wider exposure"
+        );
+    }
+
+    /// B2: a concurrent reduction cannot turn a widening into a free change.
+    #[tokio::test]
+    async fn widening_is_judged_against_the_serialized_current_value() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let (idle, abs) = h.state().session_timer.limits();
+        h.fake
+            .push(FakeStep::Hold(Err(sv_presence::PresenceError::Cancelled)));
+        let state = h.state();
+        let widen = async { session_set_limits_impl(state, idle * 10, abs).await };
+        let shrink = async {
+            while h.fake.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Waits behind the widening's gate; never interleaves with it.
+            session_set_limits_impl(state, idle / 2, abs).await
+        };
+        let release = async {
+            while h.fake.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            h.fake.release();
+        };
+        let (w, s2, ()) = tokio::join!(widen, shrink, release);
+        assert!(w.is_err(), "the widening was never verified");
+        assert!(s2.is_ok());
+        assert_eq!(h.state().session_timer.limits(), (idle / 2, abs));
+    }
+
+    #[tokio::test]
+    async fn lowering_session_limits_is_free() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let before = h.state().session_timer.limits();
+        session_set_limits_impl(h.state(), before.0 / 2, before.1 / 2)
+            .await
+            .unwrap();
+        assert_eq!(h.fake.calls(), 0);
+    }
 
     struct Harness {
         app: tauri::App<MockRuntime>,
@@ -8843,6 +9170,7 @@ mod tests {
         "transit_list_keys",
         "signing_list_keys",
         "broker_list_secrets",
+        "presence_status",
     ];
 
     /// Regression guard: polling/status commands must not contain a call to
