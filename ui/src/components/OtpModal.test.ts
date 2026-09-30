@@ -94,4 +94,36 @@ describe('OtpModal', () => {
     expect(getByTextNot('654321')).toBe(true);
     expect(invokeMock).not.toHaveBeenCalled();
   });
+
+  it('names the request the code belongs to', () => {
+    render(OtpModal, { props: { prompt: prompt(), onClose: () => {} } });
+    expect(getByTextNot('ReadFile')).toBe(true);
+    expect(getByTextNot('notes')).toBe(true);
+    expect(getByTextNot('a.txt')).toBe(true);
+  });
+
+  it('offers no copy button while the code is still hidden', () => {
+    const { queryByRole } = render(OtpModal, {
+      props: { prompt: prompt(), onClose: () => {} },
+    });
+    expect(queryByRole('button', { name: 'Copy code' })).toBeNull();
+  });
+
+  it('copies the visible code to the clipboard when the copy button is clicked', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText },
+      configurable: true,
+    });
+
+    const { getByRole } = render(OtpModal, {
+      props: {
+        prompt: prompt({ otp_code: '654321', protected: false, otp_reveal_required: false }),
+        onClose: () => {},
+      },
+    });
+    getByRole('button', { name: 'Copy code' }).click();
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('654321'));
+  });
 });
