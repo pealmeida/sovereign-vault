@@ -767,6 +767,65 @@ impl<R: Runtime> ApprovalState<R> {
             NotificationKind::Approval,
             NOTIFICATION_APPROVAL_BODY,
         );
+
+        // A challenge nobody answers must still close its card: pruning runs
+        // only lazily on the next request, and a silent prune leaves the
+        // desktop holding a code slot that can never be used again. One-shot
+        // timer at TTL plus a small margin (`is_expired` compares strictly).
+        // `tokio::spawn` rather than `tauri::async_runtime::spawn` because
+        // this path is always inside a runtime context: the app's own tokio
+        // runtime in production, the test harness's paused clock in tests.
+        // The task holds only a cheap `AppHandle` clone and resolves state
+        // at wake, so it retains nothing and cannot outlive shutdown.
+        let app = self.app.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(OTP_TTL_SECS) + Duration::from_millis(250))
+                .await;
+            let approvals = app
+                .try_state::<VaultState<R>>()
+                .map(|vault| vault.approvals.clone());
+            let Some(approvals) = approvals else {
+                // App state is gone (shutdown): the card is dead anyway, and
+                // a cancel for a gone card is harmless.
+                let _ = app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id });
+                return;
+            };
+            let mut store = approvals.otp_pending.lock().await;
+            let found = store.iter().find(|(_, c)| c.modal_id == id).map(|(k, c)| {
+                let attempt = match &c.gate {
+                    sv_presence::GateState::Verifying { attempt, .. } => Some(*attempt),
+                    _ => None,
+                };
+                (k.clone(), c.is_expired(), c.is_locked_out(), attempt)
+            });
+            let Some((key, expired, lockout_open, attempt)) = found else {
+                // Removed by a silent prune or consumed by the resend —
+                // cancel anyway so no stale card can linger for this id.
+                drop(store);
+                let _ = app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id });
+                return;
+            };
+            if !expired {
+                // Still valid (only possible if the clock jumped): leave the
+                // challenge and its card untouched.
+                return;
+            }
+            // D13, the rule a fresh challenge applies when it replaces an
+            // old one: a reveal prompt in flight dies with the challenge.
+            if let Some(attempt) = attempt {
+                approvals.presence.invalidate(attempt);
+            }
+            // Respect the prune rule: an expired challenge whose lockout
+            // window is still open stays behind to enforce rate limiting.
+            // Its code is dead either way, so the card closes regardless.
+            if !lockout_open {
+                store.remove(&key);
+            }
+            drop(store);
+            let _ = app.emit(APPROVAL_CANCEL_EVENT, ApprovalCancel { id });
+        });
+        // One-shot by design: no handle is kept; the task detaches cleanly.
+
         Err(
             "otp_required: a one-time code is shown on the Sovereign Vault desktop. \
              Resend this exact request with the `otp` argument set to that code."
@@ -7911,6 +7970,90 @@ mod tests {
             && p["protected"] == true
             && p["outcome"] == "device_owner_authenticated"
             && p["modality"] == "unknown"));
+    }
+
+    /// Pruning is lazy: without a scheduled close, an expired OTP card sits
+    /// on the desktop forever holding a code slot that can never be used
+    /// (the next request prunes silently and never emits a cancel).
+    #[tokio::test(start_paused = true)]
+    async fn expired_otp_card_cancels_itself_when_ttl_elapses() {
+        use tauri::Listener;
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let cancelled: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
+        {
+            let cancelled = cancelled.clone();
+            h.app
+                .handle()
+                .clone()
+                .listen(APPROVAL_CANCEL_EVENT, move |event| {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(event.payload()) {
+                        if let Some(id) = value.get("id").and_then(|v| v.as_u64()) {
+                            cancelled.lock().unwrap().push(id);
+                        }
+                    }
+                });
+        }
+        let err = h
+            .state()
+            .approvals
+            .request(container_request(SecurityMode::Otp, "ctx"))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("otp_required"));
+        let (key, modal_id) = {
+            let store = h.state().approvals.otp_pending.lock().await;
+            let (k, c) = store.iter().next().unwrap();
+            (k.clone(), c.modal_id)
+        };
+
+        // Before the TTL: nothing may be cancelled; the card is still valid.
+        tokio::time::advance(Duration::from_secs(OTP_TTL_SECS - 5)).await;
+        assert!(
+            cancelled.lock().unwrap().is_empty(),
+            "a still-valid card must not be cancelled"
+        );
+        assert!(h
+            .state()
+            .approvals
+            .otp_pending
+            .lock()
+            .await
+            .contains_key(&key));
+
+        // Expire it the way the rest of this suite does — rewind issued_at
+        // (std Instant is not virtualized by paused tokio time) — then let
+        // the virtual clock cross the TTL the scheduled task sleeps for.
+        // The task's sleep only starts when the current-thread runtime first
+        // polls it (at the previous advance), so jump a full TTL past that.
+        h.state()
+            .approvals
+            .otp_pending
+            .lock()
+            .await
+            .get_mut(&key)
+            .unwrap()
+            .issued_at = Instant::now() - Duration::from_secs(OTP_TTL_SECS + 1);
+        tokio::time::advance(Duration::from_secs(OTP_TTL_SECS + 10)).await;
+        for _ in 0..100 {
+            if !cancelled.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            *cancelled.lock().unwrap(),
+            vec![modal_id],
+            "the expired card must receive exactly its own cancel"
+        );
+        assert!(
+            !h.state()
+                .approvals
+                .otp_pending
+                .lock()
+                .await
+                .contains_key(&key),
+            "the expired challenge leaves the store, not just the screen"
+        );
     }
 
     #[tokio::test]
