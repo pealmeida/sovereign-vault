@@ -906,8 +906,13 @@ impl<R: Runtime> ApprovalState<R> {
         }
         // An agent's request: the user may be in another application, which is
         // the whole reason the tray menu exists (ADR-0022).
-        self.request_click(ClickRequest::from_access(&request), TrayMirror::Yes)
-            .await
+        self.request_click(
+            ClickRequest::from_access(&request),
+            TrayMirror::Yes,
+            None,
+            None,
+        )
+        .await
     }
 
     /// The click-approval flow: emit a modal, optionally mirror it to the tray,
@@ -917,14 +922,27 @@ impl<R: Runtime> ApprovalState<R> {
     /// is a parameter rather than an inference from the request, because the
     /// distinction is about WHO IS WAITING -- an absent user or one already at
     /// the modal -- which the request itself does not record.
-    async fn request_click(&self, click: ClickRequest, mirror: TrayMirror) -> Result<(), String> {
+    ///
+    /// `classification`/`deadline_at` carry the desktop OPERATION's fixed
+    /// classification and window into the modal (CP3 BLOQUEIO 3): an entry
+    /// opened by `desktop_presence_gate` inherits them instead of
+    /// re-classifying and re-arming a fresh 120 s. Agent requests pass
+    /// `None` and keep the classify-at-creation / now+120 s behaviour.
+    async fn request_click(
+        &self,
+        click: ClickRequest,
+        mirror: TrayMirror,
+        classification: Option<bool>,
+        deadline_at: Option<Instant>,
+    ) -> Result<(), String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let signature = click.signature;
         // The protected classification is fixed when the request is created
         // (§6.2) — before any lock, and never re-evaluated for this request.
-        let protected = self.presence.classify().is_protected();
+        let protected = classification.unwrap_or_else(|| self.presence.classify().is_protected());
         let op = click.op.bind("request_id", id.to_string());
-        let deadline = Instant::now() + Duration::from_secs(APPROVAL_TIMEOUT_SECS);
+        let deadline = deadline_at
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(APPROVAL_TIMEOUT_SECS));
         let pre_unlock = click.pre_unlock;
         let audit_action = click.audit_action;
         let (tx, rx) = oneshot::channel();
@@ -2953,7 +2971,13 @@ async fn desktop_presence_gate<R: Runtime>(
     };
 
     if !op.protected {
-        let outcome = state.approvals.request_click(click, TrayMirror::No).await;
+        // CP3 BLOQUEIO 3: the modal inherits the OPERATION's classification
+        // and deadline — the declared click is this operation's consent, not
+        // a new request that re-classifies and re-arms its own window.
+        let outcome = state
+            .approvals
+            .request_click(click, TrayMirror::No, Some(op.protected), Some(op.deadline))
+            .await;
         state.desktop_ops.finish(digest, op.id).await;
         outcome.map_err(|message| denied(false, message))?;
         if state.session_timer.epoch() != epoch {
@@ -3030,17 +3054,19 @@ async fn with_gated_handle<R, T, F>(
     state: &VaultState<R>,
     pass: &presence::GatePass,
     f: F,
-) -> Result<T, String>
+) -> Result<T, GatedError>
 where
     R: Runtime,
-    F: FnOnce(&VaultHandle) -> Result<(T, AuditEvent), String>,
+    F: FnOnce(&VaultHandle) -> Result<(T, AuditEvent), GatedError>,
 {
     let guard = state.handle.lock().await;
     let handle = guard
         .as_ref()
-        .ok_or_else(|| "vault is locked".to_string())?;
+        .ok_or_else(|| GatedError::Rejected("vault is locked".to_string()))?;
     if state.session_timer.epoch() != pass.epoch {
-        return Err("vault state changed after verification; try again".into());
+        return Err(GatedError::Rejected(
+            "vault state changed after verification; try again".into(),
+        ));
     }
     let (value, mut event) = f(handle)?;
     event.presence = Some(pass.presence.clone());
@@ -3053,22 +3079,73 @@ async fn with_gated_handle_mut<R, T, F>(
     state: &VaultState<R>,
     pass: &presence::GatePass,
     f: F,
-) -> Result<T, String>
+) -> Result<T, GatedError>
 where
     R: Runtime,
-    F: FnOnce(&mut VaultHandle) -> Result<(T, AuditEvent), String>,
+    F: FnOnce(&mut VaultHandle) -> Result<(T, AuditEvent), GatedError>,
 {
     let mut guard = state.handle.lock().await;
     let handle = guard
         .as_mut()
-        .ok_or_else(|| "vault is locked".to_string())?;
+        .ok_or_else(|| GatedError::Rejected("vault is locked".to_string()))?;
     if state.session_timer.epoch() != pass.epoch {
-        return Err("vault state changed after verification; try again".into());
+        return Err(GatedError::Rejected(
+            "vault state changed after verification; try again".into(),
+        ));
     }
     let (value, mut event) = f(handle)?;
     event.presence = Some(pass.presence.clone());
     record_with_handle(state, handle, event);
     Ok(value)
+}
+
+/// Typed failure of consuming a `GatePass` (CP3 BLOQUEIO 2). `Rejected` is
+/// the pass itself no longer applying at consumption time (the vault state
+/// or the operation moved): a presence decision that must be recorded as a
+/// correlated DENIED, never an uncorrelated Error. `Failed` is the
+/// operation behind the gate failing, which keeps the record shape it had
+/// before the gate existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GatedError {
+    Rejected(String),
+    Failed(String),
+}
+
+impl GatedError {
+    fn message(&self) -> String {
+        match self {
+            Self::Rejected(m) | Self::Failed(m) => m.clone(),
+        }
+    }
+}
+
+/// Record the outcome of a gated call: a consumption rejection becomes a
+/// correlated Denied carrying the pass's classification (CP3 BLOQUEIO 2);
+/// any other failure keeps the Error record it had before the gate. Called
+/// only AFTER `with_gated_handle` returned, so no handle guard is held and
+/// `record_desktop_event_locked` cannot deadlock.
+async fn record_gated_outcome<R: Runtime, T>(
+    state: &VaultState<R>,
+    pass: &presence::GatePass,
+    outcome: &Result<T, GatedError>,
+    denied_event: impl FnOnce() -> AuditEvent,
+    error_event: impl FnOnce(&str) -> AuditEvent,
+) {
+    match outcome {
+        Err(GatedError::Rejected(message)) => {
+            let mut event = denied_event();
+            event.presence = Some(
+                sv_audit::PresenceAudit::denied(pass.presence.protected)
+                    .with_operation(pass.operation_id.clone()),
+            );
+            event.error = Some(message.clone());
+            record_desktop_event_locked(state, event).await;
+        }
+        Err(GatedError::Failed(error)) => {
+            record_desktop_event_locked(state, error_event(error)).await;
+        }
+        Ok(_) => {}
+    }
 }
 
 async fn require_desktop_consent<R: Runtime>(
@@ -3257,6 +3334,35 @@ fn unlock_requires_presence(mode: CustodyMode) -> bool {
     mode == CustodyMode::OsKeychain
 }
 
+/// Rollback of an unlock whose gateway failed. Callers hold the handle
+/// guard; the Error record is written with the STILL-PRESENT handle under
+/// that same guard (`record_with_handle`), then the lock is published.
+/// Never `record_desktop_event_locked` here: it waits for the handle this
+/// guard already holds, which is a deadlock (CP3 BLOQUEIO 1).
+fn rollback_unlock<R: Runtime>(
+    state: &VaultState<R>,
+    guard: &mut Option<VaultHandle>,
+    action: AuditAction,
+    error: &str,
+) {
+    if let Some(handle) = guard.as_ref() {
+        record_with_handle(
+            state,
+            handle,
+            desktop_event(
+                action,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.to_string()),
+            ),
+        );
+    }
+    state.publish_locked(guard);
+}
+
 #[tauri::command]
 async fn vault_unlock(
     app: AppHandle,
@@ -3346,20 +3452,7 @@ async fn vault_unlock_impl<R: Runtime>(
     }
     if let Err(error) = start_servers(state).await {
         let mut guard = state.handle.lock().await;
-        state.publish_locked(&mut guard);
-        record_desktop_event_locked(
-            state,
-            desktop_event(
-                AuditAction::VaultUnlock,
-                AuditDecision::Error,
-                None,
-                None,
-                None,
-                None,
-                Some(error.clone()),
-            ),
-        )
-        .await;
+        rollback_unlock(state, &mut guard, AuditAction::VaultUnlock, &error);
         return Err(error);
     }
     state.restart_session_monitor().await;
@@ -3397,18 +3490,11 @@ async fn vault_unlock_recovery(
     }
     if let Err(error) = start_servers(&state).await {
         let mut guard = state.handle.lock().await;
-        state.publish_locked(&mut guard);
-        record_desktop_event(
-            &state,
-            desktop_event(
-                AuditAction::VaultUnlockRecovery,
-                AuditDecision::Error,
-                None,
-                None,
-                None,
-                None,
-                Some(error.clone()),
-            ),
+        rollback_unlock(
+            state.inner(),
+            &mut guard,
+            AuditAction::VaultUnlockRecovery,
+            &error.to_string(),
         );
         return Err(error);
     }
@@ -3676,11 +3762,12 @@ async fn vault_rotate_key_impl<R: Runtime>(
     let result = with_gated_handle_mut(state, &pass, |handle| {
         // Re-derived under the handle lock: the DEK cannot move between this
         // check and the rotation (D14).
-        pass.ensure_same(&dek_op(root)?)
-            .map_err(|denied| denied.message)?;
+        let op_now = dek_op(root).map_err(GatedError::Failed)?;
+        pass.ensure_same(&op_now)
+            .map_err(|denied| GatedError::Rejected(denied.message))?;
         let recovery_phrase = handle
             .rotate_key(root, passphrase.as_deref())
-            .map_err(estr)?;
+            .map_err(|error| GatedError::Failed(error.to_string()))?;
         let event = desktop_event(
             AuditAction::KeyRotated,
             AuditDecision::Allowed,
@@ -3693,22 +3780,42 @@ async fn vault_rotate_key_impl<R: Runtime>(
         Ok((recovery_phrase, event))
     })
     .await;
-    if let Err(error) = &result {
-        let event = desktop_event(
-            AuditAction::KeyRotated,
-            AuditDecision::Error,
-            None,
-            None,
-            None,
-            None,
-            Some(error.clone()),
-        );
-        record_desktop_event_locked(state, event).await;
-    }
-    result.map(|recovery_phrase| VaultInitResponse {
-        recovery_phrase,
-        gateway_warning: None,
-    })
+    // CP3 BLOQUEIO 2: a pass rejected at consumption (DEK or epoch moved)
+    // is a correlated Denied; the rotation itself failing keeps its Error.
+    record_gated_outcome(
+        state,
+        &pass,
+        &result,
+        || {
+            desktop_event(
+                AuditAction::KeyRotated,
+                AuditDecision::Denied,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        },
+        |error| {
+            desktop_event(
+                AuditAction::KeyRotated,
+                AuditDecision::Error,
+                None,
+                None,
+                None,
+                None,
+                Some(error.to_string()),
+            )
+        },
+    )
+    .await;
+    result
+        .map(|recovery_phrase| VaultInitResponse {
+            recovery_phrase,
+            gateway_warning: None,
+        })
+        .map_err(|error| error.message())
 }
 
 #[tauri::command]
@@ -3844,7 +3951,9 @@ async fn vault_delete_container(state: State<'_, VaultState>, name: String) -> R
     let result = match pass {
         Some(pass) => {
             let outcome = with_gated_handle(state.inner(), &pass, |handle| {
-                handle.delete_container(&name).map_err(estr)?;
+                handle
+                    .delete_container(&name)
+                    .map_err(|error| GatedError::Failed(estr(error)))?;
                 Ok((
                     (),
                     desktop_event(
@@ -3859,9 +3968,24 @@ async fn vault_delete_container(state: State<'_, VaultState>, name: String) -> R
                 ))
             })
             .await;
-            if let Err(error) = &outcome {
-                record_desktop_event_locked(
-                    state.inner(),
+            // CP3 BLOQUEIO 2: a rejected pass at consumption is a correlated
+            // Denied; a failing operation keeps its Error record.
+            record_gated_outcome(
+                state.inner(),
+                &pass,
+                &outcome,
+                || {
+                    desktop_event(
+                        AuditAction::DeleteContainer,
+                        AuditDecision::Denied,
+                        Some(name.clone()),
+                        None,
+                        mode,
+                        None,
+                        None,
+                    )
+                },
+                |error| {
                     desktop_event(
                         AuditAction::DeleteContainer,
                         AuditDecision::Error,
@@ -3869,12 +3993,12 @@ async fn vault_delete_container(state: State<'_, VaultState>, name: String) -> R
                         None,
                         mode,
                         None,
-                        Some(error.clone()),
-                    ),
-                )
-                .await;
-            }
-            outcome
+                        Some(error.to_string()),
+                    )
+                },
+            )
+            .await;
+            outcome.map_err(|error| error.message())
         }
         None => {
             let result = with_handle(&state, |handle| {
@@ -4611,17 +4735,18 @@ async fn remediate_execute_impl<R: Runtime>(
         }
     };
     let result = with_gated_handle(state, &pass, |handle| {
-        let vault_root = vault_root(&state.app).map_err(estr)?;
+        let vault_root =
+            vault_root(&state.app).map_err(|error| GatedError::Failed(error.to_string()))?;
         let key = sv_remediate::PlanKey::from_bytes(&handle.remediation_plan_key())
-            .map_err(|error| format!("invalid plan key: {error}"))?;
+            .map_err(|error| GatedError::Failed(format!("invalid plan key: {error}")))?;
 
         let plan = {
             let mut plans = plans_lock(state);
-            let pending = live_plan(&mut plans, &plan_id)?;
+            let pending = live_plan(&mut plans, &plan_id).map_err(GatedError::Failed)?;
             // §6.3/§7.5: the plan must not have moved while the prompt was
             // open, and it must still be the operation that was approved.
             pass.ensure_same(&remediation_op("remediate_execute", &plan_id, &pending))
-                .map_err(|denied| denied.message)?;
+                .map_err(|denied| GatedError::Rejected(denied.message))?;
             let expected = hex::encode(pending.snapshot_digest.as_bytes());
             // `ct_eq` is only constant-time across equal-length slices, and
             // on unequal lengths it does not compare at all. Reject a
@@ -4630,7 +4755,7 @@ async fn remediate_execute_impl<R: Runtime>(
             if confirm_digest.len() != expected.len()
                 || !bool::from(confirm_digest.as_bytes().ct_eq(expected.as_bytes()))
             {
-                return Err("plan digest mismatch".to_string());
+                return Err(GatedError::Failed("plan digest mismatch".to_string()));
             }
             pending
         }; // the plans guard is dropped before the synchronous ingest runs
@@ -4650,7 +4775,7 @@ async fn remediate_execute_impl<R: Runtime>(
             assurance,
             &mut sink,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| GatedError::Failed(error.to_string()))?;
 
         // Terminal outcome: remove the plan from the registry regardless of
         // success, so a retry requires rebuilding and re-approving.
@@ -4699,12 +4824,31 @@ async fn remediate_execute_impl<R: Runtime>(
     .await;
 
     // The approval moment keeps today's record shape after the helper
-    // returns: a successful run recorded its Allowed under the handle (with
-    // presence); a `"plan digest mismatch"` is a Denied; other post-gate
-    // failures keep the Allowed record they emitted before this refactor.
-    match &result {
-        Ok(_) => {}
-        Err(error) if error == "plan digest mismatch" => {
+    // returns, with one CP3 addition: a pass REJECTED at consumption is a
+    // correlated Denied (never an Allowed). A successful run recorded its
+    // Allowed under the handle (with presence); a `"plan digest mismatch"`
+    // is a Denied; other post-gate failures keep the Allowed record they
+    // emitted before this refactor.
+    let outcome: Result<IngestView, String> = match result {
+        Ok(view) => Ok(view),
+        Err(GatedError::Rejected(message)) => {
+            let mut event = desktop_event(
+                AuditAction::PlanApprove,
+                AuditDecision::Denied,
+                None,
+                None,
+                None,
+                None,
+                Some(message.clone()),
+            );
+            event.presence = Some(
+                sv_audit::PresenceAudit::denied(pass.presence.protected)
+                    .with_operation(pass.operation_id.clone()),
+            );
+            record_desktop_event_locked(state, event).await;
+            Err(message)
+        }
+        Err(GatedError::Failed(error)) if error == "plan digest mismatch" => {
             record_desktop_event_locked(
                 state,
                 desktop_event(
@@ -4718,8 +4862,9 @@ async fn remediate_execute_impl<R: Runtime>(
                 ),
             )
             .await;
+            Err(error)
         }
-        Err(_) => {
+        Err(GatedError::Failed(error)) => {
             record_desktop_event_locked(
                 state,
                 desktop_event(
@@ -4733,10 +4878,11 @@ async fn remediate_execute_impl<R: Runtime>(
                 ),
             )
             .await;
+            Err(error)
         }
-    }
+    };
 
-    match &result {
+    match &outcome {
         Ok(view) => {
             let decision = if view.status == "ingested" {
                 AuditDecision::Allowed
@@ -4773,7 +4919,7 @@ async fn remediate_execute_impl<R: Runtime>(
             .await;
         }
     }
-    result
+    outcome
 }
 
 #[tauri::command]
@@ -4825,7 +4971,8 @@ async fn remediate_restore_impl<R: Runtime>(
         }
     };
     let result = with_gated_handle(state, &pass, |handle| {
-        let vault_root = vault_root(&state.app).map_err(estr)?;
+        let vault_root =
+            vault_root(&state.app).map_err(|error| GatedError::Failed(error.to_string()))?;
         let mut sink = HandleSink::new(handle, vault_root.clone());
 
         // If the argument matches a known plan id, prefer the stored plan
@@ -4833,13 +4980,13 @@ async fn remediate_restore_impl<R: Runtime>(
         // consumption happens only here, after the gate (D9).
         let pending = {
             let mut plans = plans_lock(state);
-            let pending = live_plan(&mut plans, &plan_id_or_ref)?;
+            let pending = live_plan(&mut plans, &plan_id_or_ref).map_err(GatedError::Failed)?;
             pass.ensure_same(&remediation_op(
                 "remediate_restore",
                 &plan_id_or_ref,
                 &pending,
             ))
-            .map_err(|denied| denied.message)?;
+            .map_err(|denied| GatedError::Rejected(denied.message))?;
             plans.remove(&plan_id_or_ref).expect("just looked up")
         };
         let (record, root) = (
@@ -4902,25 +5049,46 @@ async fn remediate_restore_impl<R: Runtime>(
         ))
     })
     .await;
-    if let Err(error) = &result {
-        // Today the outer block records every failed restore as a PlanExecute
-        // Error; under the gate that record was impossible once the lock
-        // raced the run, so it is written here instead.
-        record_desktop_event_locked(
-            state,
-            desktop_event(
+    // Today the outer block records every failed restore as a PlanExecute
+    // Error; a pass REJECTED at consumption is instead a correlated Denied
+    // (CP3 BLOQUEIO 2).
+    let outcome: Result<RestoreView, String> = match result {
+        Ok(view) => Ok(view),
+        Err(GatedError::Rejected(message)) => {
+            let mut event = desktop_event(
                 AuditAction::PlanExecute,
-                AuditDecision::Error,
+                AuditDecision::Denied,
                 None,
                 None,
                 None,
                 None,
-                Some(error.clone()),
-            ),
-        )
-        .await;
-    }
-    result
+                Some(message.clone()),
+            );
+            event.presence = Some(
+                sv_audit::PresenceAudit::denied(pass.presence.protected)
+                    .with_operation(pass.operation_id.clone()),
+            );
+            record_desktop_event_locked(state, event).await;
+            Err(message)
+        }
+        Err(GatedError::Failed(error)) => {
+            record_desktop_event_locked(
+                state,
+                desktop_event(
+                    AuditAction::PlanExecute,
+                    AuditDecision::Error,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(error.clone()),
+                ),
+            )
+            .await;
+            Err(error)
+        }
+    };
+    outcome
 }
 
 #[tauri::command]
@@ -5009,89 +5177,116 @@ async fn scan_reveal_impl<R: Runtime>(
         }
     };
     let result = with_gated_handle(state, &pass, |_handle| {
-        // Reveal requires the in-memory report: the fingerprint salt never
-        // left the process, and the fingerprints themselves are skipped on
-        // serialization, so a loaded report cannot satisfy this check.
-        let live_report = {
-            let guard = state
-                .active_scans
-                .try_lock()
-                .map_err(|_| "scan state unavailable; try again")?;
-            guard
-                .get(&report_id)
-                .cloned()
-                .ok_or("report loaded from disk; re-scan to reveal")?
-        };
-        let finding = live_report
-            .findings
-            .get(finding_index)
-            .ok_or_else(|| format!("finding {finding_index} not found"))?;
-        let vault_root = state_root(state)?;
-        let stored_path = scan_report_path(&vault_root, &report_id)?;
-        let stored: StoredScanReport =
-            serde_json::from_str(&std::fs::read_to_string(&stored_path).map_err(estr)?)
-                .map_err(estr)?;
-        let scanned_root = std::path::Path::new(&stored.scanned_path);
-        let file_path = scanned_root.join(&finding.path);
-        let content = std::fs::read_to_string(&file_path).map_err(estr)?;
+        // Plain-failure body: every error here is the OPERATION failing
+        // (`Failed`); gate rejections can only come from the helper itself
+        // (`Rejected`).
+        (|| {
+            // Reveal requires the in-memory report: the fingerprint salt never
+            // left the process, and the fingerprints themselves are skipped on
+            // serialization, so a loaded report cannot satisfy this check.
+            let live_report = {
+                let guard = state
+                    .active_scans
+                    .try_lock()
+                    .map_err(|_| "scan state unavailable; try again")?;
+                guard
+                    .get(&report_id)
+                    .cloned()
+                    .ok_or("report loaded from disk; re-scan to reveal")?
+            };
+            let finding = live_report
+                .findings
+                .get(finding_index)
+                .ok_or_else(|| format!("finding {finding_index} not found"))?;
+            let vault_root = state_root(state)?;
+            let stored_path = scan_report_path(&vault_root, &report_id)?;
+            let stored: StoredScanReport =
+                serde_json::from_str(&std::fs::read_to_string(&stored_path).map_err(estr)?)
+                    .map_err(estr)?;
+            let scanned_root = std::path::Path::new(&stored.scanned_path);
+            let file_path = scanned_root.join(&finding.path);
+            let content = std::fs::read_to_string(&file_path).map_err(estr)?;
 
-        if finding.end > content.len()
-            || !content.is_char_boundary(finding.start)
-            || !content.is_char_boundary(finding.end)
-        {
-            return Err("file changed since scan; re-scan to reveal".to_string());
-        }
-        let value = &content[finding.start..finding.end];
+            if finding.end > content.len()
+                || !content.is_char_boundary(finding.start)
+                || !content.is_char_boundary(finding.end)
+            {
+                return Err("file changed since scan; re-scan to reveal".to_string());
+            }
+            let value = &content[finding.start..finding.end];
 
-        // Session-only fingerprint check. The salt is per-process and never
-        // persisted, so this cannot be used to link values across scans.
-        let current = matched_fingerprint(value, live_report.config_salt);
-        if current
-            .as_bytes()
-            .ct_ne(finding.matched_fingerprint.as_bytes())
-            .into()
-        {
-            return Err("file changed since scan; re-scan to reveal".to_string());
-        }
+            // Session-only fingerprint check. The salt is per-process and never
+            // persisted, so this cannot be used to link values across scans.
+            let current = matched_fingerprint(value, live_report.config_salt);
+            if current
+                .as_bytes()
+                .ct_ne(finding.matched_fingerprint.as_bytes())
+                .into()
+            {
+                return Err("file changed since scan; re-scan to reveal".to_string());
+            }
 
-        let masked = sv_scan::mask(value);
-        let mut event = desktop_event(
-            AuditAction::ScanReveal,
-            AuditDecision::Allowed,
-            Some(report_id.clone()),
-            None,
-            None,
-            None,
-            None,
-        );
-        event.detail = Some(format!("finding_index={finding_index}"));
-        if let Ok(report_path) = scan_report_path(&vault_root, &report_id) {
-            if let Ok(text) = std::fs::read_to_string(&report_path) {
-                if let Ok(stored) = serde_json::from_str::<StoredScanReport>(&text) {
-                    if let Some(finding) = stored.report.findings.get(finding_index) {
-                        event.file_name = Some(finding.path.to_string_lossy().to_string());
+            let masked = sv_scan::mask(value);
+            let mut event = desktop_event(
+                AuditAction::ScanReveal,
+                AuditDecision::Allowed,
+                Some(report_id.clone()),
+                None,
+                None,
+                None,
+                None,
+            );
+            event.detail = Some(format!("finding_index={finding_index}"));
+            if let Ok(report_path) = scan_report_path(&vault_root, &report_id) {
+                if let Ok(text) = std::fs::read_to_string(&report_path) {
+                    if let Ok(stored) = serde_json::from_str::<StoredScanReport>(&text) {
+                        if let Some(finding) = stored.report.findings.get(finding_index) {
+                            event.file_name = Some(finding.path.to_string_lossy().to_string());
+                        }
                     }
                 }
             }
-        }
-        Ok((masked, event))
+            Ok((masked, event))
+        })()
+        .map_err(GatedError::Failed)
     })
     .await;
 
-    if let Err(error) = &result {
-        let mut event = desktop_event(
-            AuditAction::ScanReveal,
-            AuditDecision::Error,
-            Some(report_id.clone()),
-            None,
-            None,
-            None,
-            Some(error.clone()),
-        );
-        event.detail = Some(format!("finding_index={finding_index}"));
-        record_desktop_event_locked(state, event).await;
-    }
-    result
+    // CP3 BLOQUEIO 2: a rejected pass at consumption is a correlated
+    // Denied; a reveal that simply failed keeps its Error record.
+    record_gated_outcome(
+        state,
+        &pass,
+        &result,
+        || {
+            let mut event = desktop_event(
+                AuditAction::ScanReveal,
+                AuditDecision::Denied,
+                Some(report_id.clone()),
+                None,
+                None,
+                None,
+                None,
+            );
+            event.detail = Some(format!("finding_index={finding_index}"));
+            event
+        },
+        |error| {
+            let mut event = desktop_event(
+                AuditAction::ScanReveal,
+                AuditDecision::Error,
+                Some(report_id.clone()),
+                None,
+                None,
+                None,
+                Some(error.to_string()),
+            );
+            event.detail = Some(format!("finding_index={finding_index}"));
+            event
+        },
+    )
+    .await;
+    result.map_err(|error| error.message())
 }
 
 #[tauri::command]
@@ -5272,7 +5467,7 @@ async fn vault_write_file(
             let outcome = with_gated_handle(state.inner(), &pass, |handle| {
                 handle
                     .write_file(&container, &file_name, &content)
-                    .map_err(estr)?;
+                    .map_err(|error| GatedError::Failed(estr(error)))?;
                 Ok((
                     (),
                     desktop_event(
@@ -5287,9 +5482,24 @@ async fn vault_write_file(
                 ))
             })
             .await;
-            if let Err(error) = &outcome {
-                record_desktop_event_locked(
-                    state.inner(),
+            // CP3 BLOQUEIO 2: rejection at consumption is a correlated
+            // Denied; a failing write keeps its Error record.
+            record_gated_outcome(
+                state.inner(),
+                &pass,
+                &outcome,
+                || {
+                    desktop_event(
+                        AuditAction::WriteFile,
+                        AuditDecision::Denied,
+                        Some(container.clone()),
+                        Some(file_name.clone()),
+                        mode,
+                        Some(byte_size),
+                        None,
+                    )
+                },
+                |error| {
                     desktop_event(
                         AuditAction::WriteFile,
                         AuditDecision::Error,
@@ -5297,12 +5507,12 @@ async fn vault_write_file(
                         Some(file_name.clone()),
                         mode,
                         Some(byte_size),
-                        Some(error.clone()),
-                    ),
-                )
-                .await;
-            }
-            outcome
+                        Some(error.to_string()),
+                    )
+                },
+            )
+            .await;
+            outcome.map_err(|error| error.message())
         }
         None => {
             let result = with_handle(&state, |handle| {
@@ -5414,7 +5624,9 @@ async fn vault_read_file_impl<R: Runtime>(
     let result = match pass {
         Some(pass) => {
             let outcome = with_gated_handle(state, &pass, |handle| {
-                let bytes = handle.read_file(&container, &file_name).map_err(estr)?;
+                let bytes = handle
+                    .read_file(&container, &file_name)
+                    .map_err(|error| GatedError::Failed(estr(error)))?;
                 let mut event =
                     AuditEvent::new(AuditAction::ReadFile, AuditDecision::Allowed, "desktop-ui");
                 event.container = Some(container.clone());
@@ -5425,19 +5637,37 @@ async fn vault_read_file_impl<R: Runtime>(
                 Ok((bytes, event))
             })
             .await;
-            if let Err(error) = &outcome {
-                let event = desktop_event(
-                    AuditAction::ReadFile,
-                    AuditDecision::Error,
-                    Some(container.clone()),
-                    Some(file_name.clone()),
-                    mode,
-                    None,
-                    Some(error.clone()),
-                );
-                record_desktop_event_locked(state, event).await;
-            }
-            outcome
+            // CP3 BLOQUEIO 2: a rejected pass is a correlated Denied; a
+            // failing read keeps its Error record.
+            record_gated_outcome(
+                state,
+                &pass,
+                &outcome,
+                || {
+                    desktop_event(
+                        AuditAction::ReadFile,
+                        AuditDecision::Denied,
+                        Some(container.clone()),
+                        Some(file_name.clone()),
+                        mode,
+                        None,
+                        None,
+                    )
+                },
+                |error| {
+                    desktop_event(
+                        AuditAction::ReadFile,
+                        AuditDecision::Error,
+                        Some(container.clone()),
+                        Some(file_name.clone()),
+                        mode,
+                        None,
+                        Some(error.to_string()),
+                    )
+                },
+            )
+            .await;
+            outcome.map_err(|error| error.message())
         }
         None => {
             let result = with_handle_in(state, |handle| {
@@ -5601,7 +5831,9 @@ async fn vault_export_file_impl<R: Runtime>(
         // Decrypt AND write inside `with_gated_handle`: a lock since the
         // gate aborts before any byte is written (D14).
         let outcome = with_gated_handle(state, &pass, |handle| {
-            let bytes = handle.read_file(&container, &file_name).map_err(estr)?;
+            let bytes = handle
+                .read_file(&container, &file_name)
+                .map_err(|error| GatedError::Failed(estr(error)))?;
             let byte_size = bytes.len();
             let result = write_export_bytes(&dest_path, &bytes);
             let mut event = desktop_event(
@@ -5623,23 +5855,44 @@ async fn vault_export_file_impl<R: Runtime>(
             Ok((result, event))
         })
         .await;
-        return match outcome {
-            Ok(Ok(())) => Ok(destination),
-            Ok(Err(error)) => Err(error),
-            Err(error) => {
+        // CP3 BLOQUEIO 2: a rejection at consumption is a correlated
+        // Denied; a decrypt failure keeps its Error record, as today.
+        record_gated_outcome(
+            state,
+            &pass,
+            &outcome,
+            || {
+                let mut event = desktop_event(
+                    AuditAction::ReadFile,
+                    AuditDecision::Denied,
+                    Some(container.clone()),
+                    Some(file_name.clone()),
+                    mode,
+                    None,
+                    None,
+                );
+                event.detail = Some("export to disk".into());
+                event
+            },
+            |error| {
                 let mut event = desktop_event(
                     AuditAction::ReadFile,
                     AuditDecision::Error,
-                    Some(container),
-                    Some(file_name),
+                    Some(container.clone()),
+                    Some(file_name.clone()),
                     mode,
                     None,
-                    Some(error.clone()),
+                    Some(error.to_string()),
                 );
                 event.detail = Some("export to disk".into());
-                record_desktop_event_locked(state, event).await;
-                Err(error)
-            }
+                event
+            },
+        )
+        .await;
+        return match outcome {
+            Ok(Ok(())) => Ok(destination),
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(error.message()),
         };
     }
     // Ungated path (`DIRECT`): today's decrypt-then-write order and events.
@@ -5778,7 +6031,9 @@ async fn vault_delete_file(
     let result = match pass {
         Some(pass) => {
             let outcome = with_gated_handle(state.inner(), &pass, |handle| {
-                handle.delete_file(&container, &file_name).map_err(estr)?;
+                handle
+                    .delete_file(&container, &file_name)
+                    .map_err(|error| GatedError::Failed(estr(error)))?;
                 Ok((
                     (),
                     desktop_event(
@@ -5793,9 +6048,24 @@ async fn vault_delete_file(
                 ))
             })
             .await;
-            if let Err(error) = &outcome {
-                record_desktop_event_locked(
-                    state.inner(),
+            // CP3 BLOQUEIO 2: rejection at consumption is a correlated
+            // Denied; a failing delete keeps its Error record.
+            record_gated_outcome(
+                state.inner(),
+                &pass,
+                &outcome,
+                || {
+                    desktop_event(
+                        AuditAction::DeleteFile,
+                        AuditDecision::Denied,
+                        Some(container.clone()),
+                        Some(file_name.clone()),
+                        mode,
+                        None,
+                        None,
+                    )
+                },
+                |error| {
                     desktop_event(
                         AuditAction::DeleteFile,
                         AuditDecision::Error,
@@ -5803,12 +6073,12 @@ async fn vault_delete_file(
                         Some(file_name.clone()),
                         mode,
                         None,
-                        Some(error.clone()),
-                    ),
-                )
-                .await;
-            }
-            outcome
+                        Some(error.to_string()),
+                    )
+                },
+            )
+            .await;
+            outcome.map_err(|error| error.message())
         }
         None => {
             let result = with_handle(&state, |handle| {
@@ -5969,6 +6239,24 @@ async fn wake_respond_impl<R: Runtime>(
         return Err("vault is locked".into());
     };
     if state.session_timer.epoch() != pass.epoch {
+        // CP3 BLOQUEIO 2: the gate passed but the session moved before the
+        // authorization was recorded. This is a correlated Denied, written
+        // with the handle still held (recording through the LOCKED writer
+        // here would wait for this very guard — deadlock).
+        let mut event = desktop_event(
+            AuditAction::VaultInfo,
+            AuditDecision::Denied,
+            None,
+            None,
+            None,
+            None,
+            Some("vault state changed after verification; try again".to_string()),
+        );
+        event.presence = Some(
+            sv_audit::PresenceAudit::denied(pass.presence.protected)
+                .with_operation(pass.operation_id.clone()),
+        );
+        record_with_handle(state, handle, event);
         return Err("vault state changed after verification; try again".into());
     }
     // The session the human approved in, derived from the pass, not re-read.
@@ -6184,7 +6472,7 @@ async fn session_set_limits_impl<R: Runtime>(
             return Err(record_gate_denial(state, denied, event).await);
         }
     };
-    with_gated_handle(state, &pass, |_handle| {
+    let outcome = with_gated_handle(state, &pass, |_handle| {
         state.set_limits(idle_secs, absolute_secs);
         let mut event = desktop_event(
             AuditAction::VaultInfo,
@@ -6198,7 +6486,27 @@ async fn session_set_limits_impl<R: Runtime>(
         event.detail = Some("session-limits-increase".into());
         Ok(((), event))
     })
-    .await
+    .await;
+    // CP3 BLOQUEIO 2: a pass rejected at consumption is recorded as a
+    // correlated Denied (it used to be silent).
+    if let Err(GatedError::Rejected(message)) = &outcome {
+        let mut event = desktop_event(
+            AuditAction::VaultInfo,
+            AuditDecision::Denied,
+            None,
+            None,
+            None,
+            None,
+            Some(message.clone()),
+        );
+        event.detail = Some("session-limits-increase".into());
+        event.presence = Some(
+            sv_audit::PresenceAudit::denied(pass.presence.protected)
+                .with_operation(pass.operation_id.clone()),
+        );
+        record_desktop_event_locked(state, event).await;
+    }
+    outcome.map_err(|error| error.message())
 }
 
 #[tauri::command]
@@ -6274,10 +6582,10 @@ async fn agent_create_impl<R: Runtime>(
             return Err(record_gate_denial(state, denied, event).await);
         }
     };
-    with_gated_handle(state, &pass, |handle| {
+    let outcome = with_gated_handle(state, &pass, |handle| {
         let (agent_id, token) = handle
             .create_agent(&name, scopes.unwrap_or_default())
-            .map_err(estr)?;
+            .map_err(|error| GatedError::Failed(estr(error)))?;
         // New Allowed record: the agent id only, never the token.
         let mut event = desktop_event(
             AuditAction::AgentCreate,
@@ -6291,7 +6599,27 @@ async fn agent_create_impl<R: Runtime>(
         event.agent_id = Some(agent_id.clone());
         Ok((AgentCreated { agent_id, token }, event))
     })
-    .await
+    .await;
+    // CP3 BLOQUEIO 2: a pass rejected at consumption is a correlated
+    // Denied. A failed creation stays exactly as record-less as before —
+    // no state exists to describe.
+    if let Err(GatedError::Rejected(message)) = &outcome {
+        let mut event = desktop_event(
+            AuditAction::AgentCreate,
+            AuditDecision::Denied,
+            None,
+            None,
+            None,
+            None,
+            Some(message.clone()),
+        );
+        event.presence = Some(
+            sv_audit::PresenceAudit::denied(pass.presence.protected)
+                .with_operation(pass.operation_id.clone()),
+        );
+        record_desktop_event_locked(state, event).await;
+    }
+    outcome.map_err(|error| error.message())
 }
 
 #[tauri::command]
@@ -7454,6 +7782,8 @@ mod tests {
                 .request_click(
                     ClickRequest::desktop_pre_unlock("Unlock", AuditAction::VaultUnlock, op),
                     TrayMirror::No,
+                    None,
+                    None,
                 )
                 .await
         });
@@ -7953,14 +8283,19 @@ mod tests {
             h.state().publish_unlocked(&mut guard, handle);
         }
         let got = with_gated_handle(h.state(), &pass, |handle| {
-            let bytes = handle.read_file("anon", "a.txt").map_err(estr)?;
+            let bytes = handle
+                .read_file("anon", "a.txt")
+                .map_err(|error| GatedError::Failed(estr(error)))?;
             Ok((
                 bytes,
                 AuditEvent::new(AuditAction::ReadFile, AuditDecision::Allowed, "desktop-ui"),
             ))
         })
         .await;
-        assert!(got.unwrap_err().contains("vault state changed"));
+        assert!(matches!(
+            got.unwrap_err(),
+            GatedError::Rejected(message) if message.contains("vault state changed")
+        ));
     }
 
     #[tokio::test]
@@ -8231,6 +8566,157 @@ mod tests {
             !h.root.join("manifest.json").exists(),
             "no vault was created"
         );
+    }
+
+    /// CP3 BLOQUEIO 1: the gateway-failure rollback must record its Error
+    /// while the handle is still present under the SAME guard — never by
+    /// waiting for the handle it already holds.
+    #[tokio::test]
+    async fn unlock_rollback_does_not_deadlock() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let state = h.state();
+        let start = state.session_timer.epoch();
+        let got = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut guard = state.handle.lock().await;
+            rollback_unlock(
+                state,
+                &mut guard,
+                AuditAction::VaultUnlock,
+                "gateway failed",
+            );
+        })
+        .await;
+        assert!(got.is_ok(), "rollback under the guard must not deadlock");
+        assert!(
+            state.handle.lock().await.is_none(),
+            "the vault ended locked"
+        );
+        assert_eq!(
+            state.session_timer.epoch(),
+            start + 1,
+            "the rollback advanced the epoch once"
+        );
+        assert!(
+            h.audit_events().iter().any(|e| {
+                e["action"] == "vault_unlock"
+                    && e["decision"] == "error"
+                    && e["error"] == "gateway failed"
+            }),
+            "the Error record was written with the handle, not dropped"
+        );
+    }
+
+    /// CP3 BLOQUEIO 2: when the pass is rejected at CONSUMPTION (epoch
+    /// moved), the outcome must be a correlated Denied — never an Allowed
+    /// or an Error without presence.
+    #[tokio::test]
+    async fn consumption_rejection_is_audited_as_denied() {
+        let h = Harness::unlocked(FakeVerifier::protected()).await;
+        let (plan_id, _file) = plan_fixture(&h).await;
+        let digest = {
+            let plans = h.state().pending_plans.lock().unwrap();
+            hex::encode(plans[&plan_id].snapshot_digest.as_bytes())
+        };
+        h.fake.approve_next(); // the gate passes
+        let state = h.state();
+        // Hold the handle so consumption parks on `handle.lock()`; then
+        // move the epoch under that same guard (lock + re-unlock).
+        let mut guard = state.handle.lock().await;
+        let exec = async { remediate_execute_impl(state, plan_id.clone(), digest.clone()).await };
+        let flip = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let handle = guard.take().unwrap();
+            state.publish_locked(&mut guard);
+            state.publish_unlocked(&mut guard, handle);
+            drop(guard);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        };
+        let (got, ()) = tokio::join!(exec, flip);
+        assert!(got.is_err(), "the rejected consumption fails the command");
+        let denied: Vec<_> = h
+            .presence_events()
+            .into_iter()
+            .filter(|(action, decision, presence)| {
+                action.contains("plan_approve")
+                    && decision.trim_matches('"') == "denied"
+                    && presence["operation_id"]
+                        .as_str()
+                        .unwrap_or("")
+                        .starts_with("op-")
+            })
+            .collect();
+        assert_eq!(
+            denied.len(),
+            1,
+            "exactly one correlated Denied for the rejected consumption"
+        );
+        let op_id = denied[0].2["operation_id"].clone();
+        assert_eq!(denied[0].2["protected"], true);
+        assert!(
+            denied[0].2["outcome"].is_null(),
+            "a denial authorizes nothing"
+        );
+        assert!(
+            !h.presence_events().into_iter().any(|(_, decision, p)| {
+                decision.trim_matches('"') == "allowed" && p["operation_id"] == op_id
+            }),
+            "no Allowed may share the rejected operation's id"
+        );
+    }
+
+    /// CP3 BLOQUEIO 3: the declared gate's modal must carry the OPERATION's
+    /// classification and deadline — not re-classify and re-arm a fresh one.
+    #[tokio::test]
+    async fn declared_gate_keeps_the_operation_classification_and_deadline() {
+        let h = Harness::unlocked(FakeVerifier::unavailable()).await;
+        let op = sv_presence::OpDescriptor::new("probe").field("x", "1");
+        let digest = op.digest();
+        let gate = async {
+            desktop_presence_gate(
+                h.state(),
+                ClickRequest::desktop("probe", AuditAction::ReadFile, op.clone()),
+            )
+            .await
+        };
+        let inspect = async {
+            let id = h.next_pending_id().await;
+            // A protected system appearing MID-prompt must not reclassify:
+            // the operation was born unprotected (D2 fixes it at creation).
+            h.fake
+                .set_availability(sv_presence::Availability::Protected { modalities: vec![] });
+            let (entry_protected, entry_deadline) = {
+                let pending = h.state().approvals.pending.lock().await;
+                let e = pending.get(&id).expect("the modal is pending");
+                (e.protected, e.deadline)
+            };
+            assert!(
+                !entry_protected,
+                "the modal inherits the operation's classification"
+            );
+            let ops_deadline = h
+                .state()
+                .desktop_ops
+                .deadline(digest)
+                .await
+                .expect("the operation is registered");
+            assert_eq!(
+                entry_deadline, ops_deadline,
+                "one deadline, not a fresh window re-armed at the modal"
+            );
+            h.state().approvals.respond(id, true, None).await.unwrap();
+        };
+        let (got, ()) = tokio::join!(gate, inspect);
+        assert!(got.is_ok(), "the declared pass completes after the click");
+        assert_eq!(
+            h.fake.calls(),
+            0,
+            "the declared click never reached the verifier"
+        );
+        assert!(h.presence_events().iter().any(|(_, decision, p)| {
+            decision.trim_matches('"') == "allowed"
+                && p["protected"] == false
+                && p["outcome"] == "click"
+        }));
     }
 
     /// CP2 BLOQUEIO 1: a lock publication that lands while the reveal prompt
